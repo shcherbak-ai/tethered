@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tethered"
+version = "0.1.0"
+description = "Runtime network egress control for Python"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Sergii Shcherbak" },
+]
+keywords = ["security", "egress", "network", "audit", "supply-chain"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/shcherbak-ai/tethered"
+Repository = "https://github.com/shcherbak-ai/tethered"
+Issues = "https://github.com/shcherbak-ai/tethered/issues"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9",
+    "pytest>=9.0",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7.0",
+    "ruff>=0.15",
+    "pre-commit>=4.5",
+    "commitizen>=4.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tethered"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "RUF",   # ruff-specific rules
+]
+ignore = [
+    "SIM105",  # try-except-pass is intentional in audit hook callbacks and test helpers
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tethered"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+version_files = [
+    "src/tethered/__init__.py:__version__",
+    "pyproject.toml:version",
+    "CITATION.cff:version",
+]
+tag_format = "v$version"
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.coverage.run]
+source = ["tethered"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
