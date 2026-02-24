@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,11 +49,25 @@ jobs:
         run: uv sync
 
       - name: Run tests with coverage
-        run: uv run pytest tests/ -v --cov --cov-report=xml --cov-report=term-missing
+        run: uv run pytest tests/ -v --cov=src/tethered --cov-report=xml --cov-report=term-missing
 
-      - name: Upload coverage to Codecov
+      - name: Extract coverage percentage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de  # v5
+        id: coverage
+        run: |
+          RATE=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('coverage.xml').getroot().get('line-rate'))")
+          PCT=$(python3 -c "print(round(float('$RATE') * 100))")
+          echo "pct=$PCT" >> "$GITHUB_OUTPUT"
+
+      - name: Update coverage badge
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.ref == 'refs/heads/main'
+        uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483  # v1.7.0
         with:
-          files: coverage.xml
-          fail_ci_if_error: false
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: tethered-coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.pct }}%
+          valColorRange: ${{ steps.coverage.outputs.pct }}
+          minColorRange: 50
+          maxColorRange: 100

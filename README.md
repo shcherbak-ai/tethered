@@ -4,7 +4,7 @@
 [![CodeQL](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml)
 [![PyPI](https://img.shields.io/pypi/v/tethered)](https://pypi.org/project/tethered/)
 [![Python](https://img.shields.io/pypi/pyversions/tethered)](https://pypi.org/project/tethered/)
-[![codecov](https://codecov.io/gh/shcherbak-ai/tethered/graph/badge.svg)](https://codecov.io/gh/shcherbak-ai/tethered)
+[![coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/SergiiShcherbak/20432f86c9102aa2b77ad9e4d4c21aa6/raw/tethered-coverage.json)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/shcherbak-ai/tethered/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
