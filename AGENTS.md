@@ -69,7 +69,7 @@ tests/
 - Lint: `uv run ruff check .` (auto-fix with `--fix`)
 - Format: `uv run ruff format .`
 - Security: `uv run bandit -c pyproject.toml -r src/`
-- Pre-commit hooks run ruff, bandit, markdownlint, and pytest on every commit, and commitizen on commit messages. All hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
+- Pre-commit hooks run ruff, bandit, and markdownlint on every commit, and commitizen on commit messages. Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. All hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
 - CI runs `pre-commit run --all-files` (lint job) and the full test matrix. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow runs on push to main, on PRs, and weekly.
 
 ### What NOT to do

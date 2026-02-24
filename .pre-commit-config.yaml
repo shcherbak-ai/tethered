@@ -31,12 +31,3 @@ repos:
     hooks:
       - id: commitizen
         stages: [commit-msg]
-
-  - repo: local
-    hooks:
-      - id: pytest
-        name: pytest
-        entry: uv run pytest tests/ -x -q
-        language: system
-        types: [python]
-        pass_filenames: false
