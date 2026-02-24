@@ -1,4 +1,4 @@
-# tethered
+# 🪁 tethered
 
 [![CI](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml)
@@ -254,6 +254,16 @@ except tethered.EgressBlocked:
 except ConnectionError:
     handle_network_failure()
 ```
+
+## Badge
+
+Using tethered in your project? Add the badge to your README:
+
+```markdown
+[![egress: 🪁 tethered](https://img.shields.io/badge/egress-%F0%9F%AA%81%20tethered-4B8BBE.svg)](https://github.com/shcherbak-ai/tethered)
+```
+
+[![egress: 🪁 tethered](https://img.shields.io/badge/egress-%F0%9F%AA%81%20tethered-4B8BBE.svg)](https://github.com/shcherbak-ai/tethered)
 
 ## Contributing
 
