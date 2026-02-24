@@ -282,8 +282,16 @@ def _handle_getaddrinfo(cfg: _Config, args: tuple[Any, ...]) -> None:
                 if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
                     _ip_to_hostname.popitem(last=False)
                 _ip_to_hostname[ip] = host_lower
-    except OSError:
-        pass
+    except Exception:
+        # Best-effort: gevent/eventlet monkey-patched resolvers can raise
+        # RuntimeError or other non-OSError exceptions (e.g. thread pool
+        # exhaustion).  The IP map is optional — connect enforcement still
+        # works via hostname matching at the DNS level.
+        logger.debug(
+            "tethered: IP map resolution failed for %s (best-effort, non-fatal)",
+            host,
+            exc_info=True,
+        )
     finally:
         _in_hook.reset(_token)
 

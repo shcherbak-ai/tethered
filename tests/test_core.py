@@ -754,6 +754,20 @@ class TestAuditHookDirect:
         tethered.activate(allow=["nonexistent.invalid"])
         _audit_hook("socket.getaddrinfo", ("nonexistent.invalid", 80, 0, 0, 0))
 
+    def test_getaddrinfo_allowed_handles_non_os_error(self, monkeypatch):
+        """IP map resolution tolerates non-OSError (e.g. gevent RuntimeError)."""
+        tethered.activate(allow=["api.example.com"])
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+        # Should not raise — the IP map population is best-effort
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        # No IP mapping stored (resolution failed), but DNS-level check passed
+        with _ip_map_lock:
+            assert not any(v == "api.example.com" for v in _ip_to_hostname.values())
+
     def test_connect_ex_fires_connect_event(self):
         """connect_ex raises audit event socket.connect in CPython, not socket.connect_ex."""
         tethered.activate(allow=["*.example.com"])
