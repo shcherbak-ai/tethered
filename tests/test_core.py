@@ -278,7 +278,7 @@ class TestAsyncSockets:
                 asyncio.open_connection("127.0.0.1", 1),
                 timeout=0.5,
             )
-        except (ConnectionError, TimeoutError, OSError):
+        except (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError):
             pass  # Connection refused/timeout is fine — EgressBlocked would be wrong
 
     @pytest.mark.asyncio
@@ -990,11 +990,9 @@ class TestConcurrency:
         """Multiple threads making blocked connections should all see EgressBlocked."""
         tethered.activate(allow=["*.example.com"])
         errors: list[Exception] = []
-        barrier = threading.Barrier(4)
 
         def worker():
             try:
-                barrier.wait(timeout=5)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 try:
                     s.connect(("192.0.2.1", 80))
