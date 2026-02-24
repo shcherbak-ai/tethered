@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 from tethered._core import EgressBlocked, TetheredLocked, activate, deactivate
 
