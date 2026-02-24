@@ -66,11 +66,14 @@ tests/
 
 - Ruff handles linting and formatting. Configuration is in `pyproject.toml` under `[tool.ruff]`.
 - Bandit handles security scanning. Configuration is in `pyproject.toml` under `[tool.bandit]`. Tests are excluded. Intentional suppressions use inline `# nosec BXXX` comments.
+- Interrogate enforces docstring coverage on public items in `src/`. Configuration is in `pyproject.toml` under `[tool.interrogate]`. Private/magic/init are excluded (consistent with the "no docstrings on private helpers" convention). `fail-under = 100`.
 - Lint: `uv run ruff check .` (auto-fix with `--fix`)
 - Format: `uv run ruff format .`
+- Type check: `uv run pyright src/`
+- Docstrings: `uv run interrogate src/ -v`
 - Security: `uv run bandit -c pyproject.toml -r src/`
-- Pre-commit hooks run ruff, bandit, and markdownlint on every commit, and commitizen on commit messages. Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. All hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
-- CI runs `pre-commit run --all-files` (lint job) and the full test matrix. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow runs on push to main, on PRs, and weekly.
+- Pre-commit hooks run ruff, bandit, pyright, interrogate, and markdownlint on every commit, and commitizen on commit messages. Pyright and interrogate run as local hooks via `uv run`. Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. Third-party hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
+- CI runs `pre-commit run --all-files` (lint job, includes pyright) and the full test matrix. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow runs on push to main, on PRs, and weekly.
 
 ### What NOT to do
 

@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Run pre-commit checks
+      - name: Run pre-commit checks (includes pyright)
         run: uv run pre-commit run --all-files
 
   test:

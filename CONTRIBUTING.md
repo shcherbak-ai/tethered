@@ -44,6 +44,8 @@ Individual tools:
 uv run ruff check .        # lint
 uv run ruff check --fix .  # lint with auto-fix
 uv run ruff format .       # format
+uv run pyright src/        # type check
+uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 ```
 

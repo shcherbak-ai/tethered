@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
     "Topic :: Security",
     "Topic :: System :: Networking",
     "Typing :: Typed",
@@ -42,6 +43,8 @@ dev = [
     "ruff>=0.15",
     "pre-commit>=4.5",
     "commitizen>=4.13",
+    "pyright>=1.1.408",
+    "interrogate>=1.7",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -87,6 +90,15 @@ tag_format = "v$version"
 
 [tool.bandit]
 exclude_dirs = ["tests"]
+
+[tool.interrogate]
+ignore-init-method = true
+ignore-init-module = true
+ignore-magic = true
+ignore-private = true
+ignore-semiprivate = true
+fail-under = 100
+exclude = ["tests"]
 
 [tool.coverage.run]
 source = ["tethered"]

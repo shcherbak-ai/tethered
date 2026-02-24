@@ -277,7 +277,7 @@ def _handle_getaddrinfo(cfg: _Config, args: tuple[Any, ...]) -> None:
         results = socket.getaddrinfo(host, args[1])
         with _ip_map_lock:
             for _family, _socktype, _proto, _canonname, sockaddr in results:
-                ip = sockaddr[0]
+                ip = str(sockaddr[0])  # always str; cast for pyright
                 # LRU eviction: remove oldest entry when at capacity
                 if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
                     _ip_to_hostname.popitem(last=False)

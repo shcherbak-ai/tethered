@@ -26,6 +26,21 @@ repos:
         args: ["-c", "pyproject.toml"]
         additional_dependencies: ["bandit[toml]"]
 
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        entry: uv run pyright src/
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: interrogate
+        name: interrogate
+        entry: uv run interrogate src/
+        language: system
+        types: [python]
+        pass_filenames: false
+
   - repo: https://github.com/commitizen-tools/commitizen
     rev: 7179a42b3544e953e3683a670056ad385892365d  # v4.13.8
     hooks:
