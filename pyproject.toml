@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tethered"
-version = "0.1.0"
+version = "0.1.1"
 description = "Runtime network egress control for Python"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -77,7 +77,7 @@ required-imports = ["from __future__ import annotations"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.1.1"
 version_files = [
     "src/tethered/__init__.py:__version__",
     "pyproject.toml:version",
