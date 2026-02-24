@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml)
-[![PyPI](https://img.shields.io/pypi/v/tethered)](https://pypi.org/project/tethered/)
-[![Python](https://img.shields.io/pypi/pyversions/tethered)](https://pypi.org/project/tethered/)
+[![PyPI](https://img.shields.io/pypi/v/tethered?v=1)](https://pypi.org/project/tethered/)
+[![Python](https://img.shields.io/pypi/pyversions/tethered?v=1)](https://pypi.org/project/tethered/)
 [![coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/SergiiShcherbak/20432f86c9102aa2b77ad9e4d4c21aa6/raw/tethered-coverage.json)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/shcherbak-ai/tethered/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -209,6 +209,14 @@ For defense-in-depth, combine tethered with:
 - OS-level sandboxing (containers, seccomp-bpf, network namespaces) for hard isolation.
 - Subprocess restrictions (audit hooks on `subprocess.Popen` events, or seccomp filters).
 - Import restrictions to prevent `ctypes`/`cffi` loading in untrusted code paths.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## License
 

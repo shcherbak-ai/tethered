@@ -9,6 +9,15 @@ uv sync
 uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 ```
 
+## Branching
+
+The default branch is `dev`. All pull requests should target `dev`.
+The `main` branch is for releases only.
+
+```text
+feature-branch → dev (PR) → main (release merge)
+```
+
 ## Running tests
 
 ```bash
