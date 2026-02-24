@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "tethered"
 version = "0.1.0"
 description = "Runtime network egress control for Python"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
