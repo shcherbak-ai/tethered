@@ -30,13 +30,13 @@ repos:
     hooks:
       - id: pyright
         name: pyright
-        entry: uv run pyright src/
+        entry: uv run --no-sync pyright src/
         language: system
         types: [python]
         pass_filenames: false
       - id: interrogate
         name: interrogate
-        entry: uv run interrogate src/
+        entry: uv run --no-sync interrogate src/
         language: system
         types: [python]
         pass_filenames: false
