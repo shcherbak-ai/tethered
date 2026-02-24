@@ -39,7 +39,7 @@ tests/
 
 3. **IP-to-hostname mapping via getaddrinfo interception.** When `socket.getaddrinfo("api.stripe.com", 443)` fires, we resolve it ourselves (with a reentrancy guard) and store `{resolved_ip: "api.stripe.com"}`. When `socket.connect(sock, (resolved_ip, 443))` fires later, we look up the hostname and check it against the policy.
 
-4. **Thread safety.** `AllowPolicy` is immutable. The `_Config` bundle is a frozen dataclass swapped atomically (single reference assignment). `_ip_to_hostname` is an `OrderedDict` guarded by `_ip_map_lock` with LRU eviction. Reentrancy guard uses `threading.local()`.
+4. **Thread safety.** `AllowPolicy` is immutable. The `_Config` bundle is a frozen dataclass swapped atomically (single reference assignment). `_ip_to_hostname` is an `OrderedDict` guarded by `_ip_map_lock` with LRU eviction. Reentrancy guard uses `contextvars.ContextVar` (async-safe, faster than `threading.local()`).
 
 5. **Zero dependencies.** Everything uses stdlib only: `sys`, `socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `dataclasses`.
 

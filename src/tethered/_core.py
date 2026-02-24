@@ -95,8 +95,7 @@ _hook_installed: bool = False
 # Events that trigger connection enforcement
 _CONNECT_EVENTS = frozenset(
     (
-        "socket.connect",
-        "socket.connect_ex",
+        "socket.connect",  # also raised by connect_ex() in CPython
         "socket.sendto",
         "socket.sendmsg",
     )

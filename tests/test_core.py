@@ -83,6 +83,7 @@ class TestActivateDeactivate:
         finally:
             s.close()
 
+    @requires_network
     def test_deactivate_allows_everything(self):
         tethered.activate(allow=["*.example.com"])
         tethered.deactivate()
@@ -571,6 +572,7 @@ class TestLockedMode:
         with pytest.raises(tethered.TetheredLocked):
             tethered.deactivate(lock_token=object())
 
+    @requires_network
     def test_locked_deactivate_with_correct_token_succeeds(self):
         secret = object()
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
@@ -752,10 +754,11 @@ class TestAuditHookDirect:
         tethered.activate(allow=["nonexistent.invalid"])
         _audit_hook("socket.getaddrinfo", ("nonexistent.invalid", 80, 0, 0, 0))
 
-    def test_connect_ex_blocks(self):
+    def test_connect_ex_fires_connect_event(self):
+        """connect_ex raises audit event socket.connect in CPython, not socket.connect_ex."""
         tethered.activate(allow=["*.example.com"])
         with pytest.raises(tethered.EgressBlocked):
-            _audit_hook("socket.connect_ex", (None, ("192.0.2.1", 80)))
+            _audit_hook("socket.connect", (None, ("192.0.2.1", 80)))
 
     def test_sendto_blocks(self):
         tethered.activate(allow=["*.example.com"])
@@ -1379,6 +1382,7 @@ class TestConftestEgressGuard:
         with pytest.raises(tethered.EgressBlocked, match=r"evil\.com"):
             socket.getaddrinfo("evil.com", 80)
 
+    @requires_network
     def test_dns_allowed_for_guard_allowlist(self):
         """Guard allows DNS for hosts in conftest allow list."""
         socket.getaddrinfo("dns.google", 80)

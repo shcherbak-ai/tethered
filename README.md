@@ -111,7 +111,7 @@ tethered.activate(
 | `allow_localhost` | Allow loopback addresses (`127.0.0.0/8`, `::1`). Default `True`. |
 | `on_blocked` | Callback `(host, port) -> None` invoked on every blocked connection, including in log-only mode. |
 | `locked` | Prevent `deactivate()` without the correct `lock_token`. Default `False`. |
-| `lock_token` | Opaque token required to `deactivate()` when locked. |
+| `lock_token` | Opaque token required to `deactivate()` when locked. Compared by identity (`is`), not equality. |
 
 Can be called multiple times to replace the active policy — calling `activate()` again does not require `deactivate()` first. Each call creates a completely new policy; no parameters or state carry over from previous calls.
 
@@ -168,14 +168,14 @@ Tethered uses [`sys.addaudithook`](https://docs.python.org/3/library/sys.html#sy
 
 - **`socket.getaddrinfo`** — blocks DNS resolution for disallowed hostnames and records IP-to-hostname mappings for allowed hosts.
 - **`socket.gethostbyname` / `socket.gethostbyaddr`** — intercepts alternative DNS resolution paths.
-- **`socket.connect` / `socket.connect_ex`** — enforces the allow list on TCP connections.
+- **`socket.connect`** (including `connect_ex`, which raises the `socket.connect` audit event in CPython) — enforces the allow list on TCP connections.
 - **`socket.sendto` / `socket.sendmsg`** — enforces the allow list on UDP datagrams.
 
 When `getaddrinfo` resolves a hostname, tethered records the IP-to-hostname mapping in a bounded LRU cache. When a subsequent `connect()` targets that IP, tethered looks up the original hostname and checks it against the allow list. If denied, `EgressBlocked` is raised before any packet leaves the machine.
 
-This works transparently with any Python networking library (requests, httpx, urllib3, aiohttp) and any framework (Django, Flask, FastAPI) — they all call `socket.getaddrinfo` and `socket.connect` under the hood. Async is fully supported: audit hooks fire at the C socket level, so `asyncio`, `aiohttp`, and `httpx` async use the same enforcement path as synchronous code.
+This works with libraries built on CPython sockets (requests, httpx, urllib3, aiohttp) and frameworks like Django, Flask, and FastAPI — they all call `socket.getaddrinfo` and `socket.connect` under the hood. Asyncio and async libraries using CPython sockets are supported: audit hooks fire at the C socket level, so `asyncio`, `aiohttp`, and `httpx` async use the same enforcement path as synchronous code.
 
-The per-connection overhead is a Python function call with a string comparison and dictionary lookup — negligible compared to actual network I/O.
+The per-connection overhead is a Python function call with hostname normalization, a dictionary lookup, and pattern matching — designed to add minimal overhead relative to actual network I/O.
 
 ## Security model
 
@@ -209,6 +209,50 @@ For defense-in-depth, combine tethered with:
 - OS-level sandboxing (containers, seccomp-bpf, network namespaces) for hard isolation.
 - Subprocess restrictions (audit hooks on `subprocess.Popen` events, or seccomp filters).
 - Import restrictions to prevent `ctypes`/`cffi` loading in untrusted code paths.
+
+## Handling blocked connections
+
+`EgressBlocked` is a `RuntimeError`, not an `OSError`. This is intentional — a policy violation is not a network error and should not be silently caught by HTTP libraries or retry logic. You'll want to handle it explicitly at your application boundaries.
+
+### Django / FastAPI middleware
+
+```python
+# middleware.py
+import tethered
+
+class EgressBlockedMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        try:
+            return self.get_response(request)
+        except tethered.EgressBlocked as e:
+            logger.error("Egress blocked: %s:%s (resolved_from=%s)", e.host, e.port, e.resolved_from)
+            return HttpResponse("Service unavailable", status=503)
+```
+
+### Celery tasks
+
+```python
+# EgressBlocked is a RuntimeError, so autoretry_for=(ConnectionError, TimeoutError)
+# already won't retry it — the task fails immediately on a policy violation.
+@app.task(autoretry_for=(ConnectionError, TimeoutError))
+def sync_data():
+    requests.post("https://api.stripe.com/v1/charges", ...)
+```
+
+### Retry decorators
+
+```python
+# Catch EgressBlocked before your retry logic — retrying a policy block is pointless
+try:
+    response = retry_with_backoff(make_request)
+except tethered.EgressBlocked:
+    raise  # don't retry policy violations
+except ConnectionError:
+    handle_network_failure()
+```
 
 ## Contributing
 
