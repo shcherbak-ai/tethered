@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import _socket as _csocket  # C-level socket; immune to gevent/eventlet monkey-patching
 import collections
 import contextvars
 import ipaddress
 import logging
-import socket
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -269,12 +269,12 @@ def _handle_getaddrinfo(cfg: _Config, args: tuple[Any, ...]) -> None:
         return
 
     # Resolve and store IP -> hostname mapping for allowed hosts.
-    # This causes a second DNS resolution (the caller's original getaddrinfo
-    # will also resolve). The duplicate is intentional: we need the results
-    # now to populate the IP map before the subsequent connect() call.
+    # Uses _csocket (CPython's C-level _socket module) instead of socket to
+    # avoid gevent/eventlet monkey-patched getaddrinfo, which spawns real OS
+    # threads for DNS and can cause thread/memory explosion under load.
     _token = _in_hook.set(True)
     try:
-        results = socket.getaddrinfo(host, args[1])
+        results = _csocket.getaddrinfo(host, args[1], 0, 0, 0, 0)
         with _ip_map_lock:
             for _family, _socktype, _proto, _canonname, sockaddr in results:
                 ip = str(sockaddr[0])  # always str; cast for pyright

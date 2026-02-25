@@ -14,6 +14,7 @@ import tethered
 from tethered._core import (
     _IP_MAP_MAX_SIZE,
     _audit_hook,
+    _csocket,
     _extract_host_port,
     _in_hook,
     _ip_map_lock,
@@ -755,18 +756,44 @@ class TestAuditHookDirect:
         _audit_hook("socket.getaddrinfo", ("nonexistent.invalid", 80, 0, 0, 0))
 
     def test_getaddrinfo_allowed_handles_non_os_error(self, monkeypatch):
-        """IP map resolution tolerates non-OSError (e.g. gevent RuntimeError)."""
+        """IP map resolution tolerates non-OSError from C-level getaddrinfo."""
         tethered.activate(allow=["api.example.com"])
 
         def _boom(*_args, **_kwargs):
-            raise RuntimeError("can't start new thread")
+            raise RuntimeError("unexpected resolver failure")
 
-        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+        monkeypatch.setattr(_csocket, "getaddrinfo", _boom)
         # Should not raise — the IP map population is best-effort
         _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
         # No IP mapping stored (resolution failed), but DNS-level check passed
         with _ip_map_lock:
             assert not any(v == "api.example.com" for v in _ip_to_hostname.values())
+
+    def test_getaddrinfo_bypasses_monkey_patched_socket(self, monkeypatch):
+        """IP map resolution uses C-level _socket, not monkey-patchable socket.
+
+        gevent/eventlet monkey-patch socket.getaddrinfo to use a real OS thread
+        pool for DNS. Under load this causes thread explosion and memory
+        exhaustion. tethered must use _socket.getaddrinfo (the C implementation)
+        which is immune to monkey-patching.
+        """
+        # allow_localhost=True is the default, so localhost is already allowed
+        tethered.activate(allow=[])
+
+        patched_calls: list[tuple] = []
+
+        def _spy(*args, **_kwargs):
+            patched_calls.append(args)
+            raise RuntimeError("gevent thread pool exhausted")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _spy)
+        _audit_hook("socket.getaddrinfo", ("localhost", 80, 0, 0, 0))
+
+        # socket.getaddrinfo was NOT called by _handle_getaddrinfo
+        assert patched_calls == []
+        # IP map was populated via C-level _socket.getaddrinfo
+        with _ip_map_lock:
+            assert any(v == "localhost" for v in _ip_to_hostname.values())
 
     def test_connect_ex_fires_connect_event(self):
         """connect_ex raises audit event socket.connect in CPython, not socket.connect_ex."""
