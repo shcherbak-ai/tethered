@@ -1,7 +1,7 @@
 # 🪁 tethered
 
-[![CI](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml/badge.svg)](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml)
+[![CI](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/shcherbak-ai/tethered/actions/workflows/codeql.yml)
 [![PyPI](https://img.shields.io/pypi/v/tethered?v=1)](https://pypi.org/project/tethered/)
 [![Python](https://img.shields.io/pypi/pyversions/tethered?v=1)](https://pypi.org/project/tethered/)
 [![coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/SergiiShcherbak/20432f86c9102aa2b77ad9e4d4c21aa6/raw/tethered-coverage.json)](https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml)
