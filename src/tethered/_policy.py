@@ -5,6 +5,8 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 
 logger = logging.getLogger("tethered")
@@ -29,13 +31,15 @@ class _NetworkRule:
 def _could_be_ip(host: str) -> bool:
     """Fast heuristic: could ``host`` be an IP address?
 
-    IPv4 starts with a digit, IPv6 with a hex digit (0-9, a-f) or ``:``.
-    A leading non-hex letter rules it out immediately.
+    IPv4 starts with a digit. IPv6 contains ``:`` and starts with a hex
+    digit or ``:``.
     """
     if not host:
         return False
     c = host[0]
-    return not c.isalpha() or c in "abcdefABCDEF"
+    if c.isdigit() or c == ":":
+        return True
+    return ":" in host and c in "abcdefABCDEF"
 
 
 def _validate_port(port: int) -> int:
@@ -56,6 +60,7 @@ class AllowPolicy:
         "_allow_localhost",
         "_exact_hosts",
         "_exact_hosts_any_port",
+        "_exact_hosts_with_port",
         "_host_rules",
         "_network_rules",
     )
@@ -68,6 +73,9 @@ class AllowPolicy:
 
         for raw in allow:
             rule = raw.strip().lower()
+            if not rule.isascii():
+                rule = unicodedata.normalize("NFC", rule)
+                rule = rule.translate(_FULLWIDTH_DOT_TABLE)
 
             # Warn on empty/whitespace-only rules
             if not rule:
@@ -91,12 +99,16 @@ class AllowPolicy:
                         cidr_and_rest = remainder[1:]
                         if ":" in cidr_and_rest:
                             cidr_str, port_str = cidr_and_rest.rsplit(":", 1)
-                            if port_str.isdigit():
+                            if port_str.isascii() and port_str.isdigit():
                                 port = _validate_port(int(port_str))
                             ipv6_part += "/" + cidr_str
                         else:
                             ipv6_part += "/" + cidr_and_rest
-                    elif remainder.startswith(":") and remainder[1:].isdigit():
+                    elif (
+                        remainder.startswith(":")
+                        and remainder[1:].isascii()
+                        and remainder[1:].isdigit()
+                    ):
                         port = _validate_port(int(remainder[1:]))
                     try:
                         network = ipaddress.ip_network(ipv6_part, strict=False)
@@ -128,6 +140,7 @@ class AllowPolicy:
         # Split exact-match hostname rules from wildcard rules for O(1) lookup.
         exact_any_port: set[str] = set()
         exact_with_port: set[tuple[str, int]] = set()
+        exact_hosts_with_port: set[str] = set()
         wildcard_rules: list[_HostRule] = []
         for rule_obj in host_rules:
             if "*" in rule_obj.pattern or "?" in rule_obj.pattern or "[" in rule_obj.pattern:
@@ -136,15 +149,20 @@ class AllowPolicy:
                 exact_any_port.add(rule_obj.pattern)
             else:
                 exact_with_port.add((rule_obj.pattern, rule_obj.port))
+                exact_hosts_with_port.add(rule_obj.pattern)
 
         self._exact_hosts_any_port: frozenset[str] = frozenset(exact_any_port)
         self._exact_hosts: frozenset[tuple[str, int]] = frozenset(exact_with_port)
+        self._exact_hosts_with_port: frozenset[str] = frozenset(exact_hosts_with_port)
         self._host_rules: tuple[_HostRule, ...] = tuple(wildcard_rules)
         self._network_rules: tuple[_NetworkRule, ...] = tuple(network_rules)
 
     def is_allowed(self, host: str, port: int | None = None, *, _normalized: bool = False) -> bool:
         """Check if a host:port combination is allowed."""
         host_lower = host if _normalized else _normalize_host(host)
+
+        if _has_invalid_hostname_chars(host_lower):
+            return False
 
         if self._allow_localhost and _is_localhost(host_lower):
             return True
@@ -166,10 +184,8 @@ class AllowPolicy:
         if port is not None and (hostname, port) in self._exact_hosts:
             return True
         # Port rule with no port provided: allow (same as rule.port is not None and port is None)
-        if port is None and self._exact_hosts:
-            for h, _p in self._exact_hosts:
-                if h == hostname:
-                    return True
+        if port is None and hostname in self._exact_hosts_with_port:
+            return True
         # Fall through to wildcard rules
         for rule in self._host_rules:
             if rule.port is not None and port is not None and rule.port != port:
@@ -214,16 +230,52 @@ class AllowPolicy:
         return False
 
 
+_FULLWIDTH_DOT_TABLE = str.maketrans(
+    {
+        "\uff0e": ".",  # Fullwidth full stop
+        "\u3002": ".",  # Ideographic full stop
+        "\uff61": ".",  # Halfwidth ideographic full stop
+    }
+)
+
+
 def _normalize_host(host: str) -> str:
     """Normalize a hostname or IP for consistent matching."""
     h = host.lower().strip()
+    # Fast path: skip Unicode normalization for pure-ASCII hostnames
+    # (the vast majority in practice). isascii() is O(1) in CPython.
+    if not h.isascii():
+        # Unicode NFC normalization — ensures equivalent codepoint sequences
+        # (e.g. "café" NFC vs NFD) compare equal.
+        h = unicodedata.normalize("NFC", h)
+        # Normalize fullwidth/ideographic dots to ASCII dots — some IDNA
+        # implementations treat these as label separators.
+        h = h.translate(_FULLWIDTH_DOT_TABLE)
     # Strip exactly one trailing dot from FQDNs (e.g. "api.stripe.com." -> "api.stripe.com")
     if h.endswith(".") and not _is_ip_like(h):
         h = h[:-1]
     # Strip IPv6 scope ID (e.g. "fe80::1%eth0" -> "fe80::1")
-    if "%" in h:
+    # Only strip when host contains ":" (IPv6 indicator) to avoid
+    # truncating non-IPv6 hostnames that happen to contain "%".
+    if "%" in h and ":" in h:
         h = h.split("%")[0]
     return h
+
+
+# Control chars (\x00-\x1f), space (\x20), and DEL (\x7f).
+_INVALID_ASCII_HOST_RE = re.compile(r"[\x00-\x20\x7f]")
+
+
+def _has_invalid_hostname_chars(host: str) -> bool:
+    """Reject malformed hosts with control characters, whitespace, or invisible Unicode."""
+    if host.isascii():
+        return _INVALID_ASCII_HOST_RE.search(host) is not None
+    for ch in host:
+        if ch.isspace() or ord(ch) < 32 or ord(ch) == 127:
+            return True
+        if ord(ch) > 127 and unicodedata.category(ch) in ("Cf", "Cc", "Cs", "Co", "Cn"):
+            return True
+    return False
 
 
 def _is_ip_like(host: str) -> bool:
@@ -244,7 +296,7 @@ def _has_port_suffix(rule: str) -> bool:
         return False
     last_colon = rule.rfind(":")
     after = rule[last_colon + 1 :]
-    if not after.isdigit():
+    if not after.isascii() or not after.isdigit():
         return False
     before = rule[:last_colon]
     # Multiple colons means IPv6 -- no port suffix
@@ -263,13 +315,19 @@ def _is_localhost(host: str) -> bool:
         return True
     if not _could_be_ip(host):
         return False
+    # Fast reject for non-localhost IPv4: all loopback is 127.0.0.0/8 and the
+    # only unspecified address is 0.0.0.0 (already in the set above).  IPv6
+    # always contains ":" and bypasses this check.
+    c = host[0]
+    if c.isdigit() and ":" not in host and not (host.startswith("127.") or host.startswith("0.")):
+        return False
     try:
         ip = ipaddress.ip_address(host)
-        if ip.is_loopback:
+        if ip.is_loopback or ip.is_unspecified:
             return True
-        # IPv4-mapped IPv6 loopback (::ffff:127.0.0.1)
+        # IPv4-mapped IPv6 loopback/unspecified (::ffff:127.0.0.1, ::ffff:0.0.0.0)
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            return ip.ipv4_mapped.is_loopback
+            return ip.ipv4_mapped.is_loopback or ip.ipv4_mapped.is_unspecified
         return False
     except ValueError:
         return False

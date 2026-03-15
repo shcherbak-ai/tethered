@@ -31,12 +31,13 @@ def _test_egress_guard(event: str, args: tuple) -> None:
         host = args[0] if args else None
         if not isinstance(host, str) or not host:
             return
-        # IP-literal lookups are not an exfiltration vector
-        try:
-            ipaddress.ip_address(host)
-            return
-        except ValueError:
-            pass
+        if event != "socket.gethostbyaddr":
+            # IP-literal gethostbyname/getaddrinfo calls do not trigger DNS.
+            try:
+                ipaddress.ip_address(host)
+                return
+            except ValueError:
+                pass
         if not _GUARD_POLICY.is_allowed(host):
             raise EgressBlocked(host, None)
 

@@ -1,8 +1,8 @@
-# AGENTS.md — Tethered
+# AGENTS.md — tethered
 
-## What is Tethered
+## What is tethered
 
-Tethered is a zero-dependency Python library for runtime network egress control. It uses `sys.addaudithook` (PEP 578) to intercept outbound socket connections and enforce an allow list of permitted destinations. One function call, no sidecar containers, no infrastructure changes.
+tethered is a zero-dependency Python library for runtime network egress control. It uses `sys.addaudithook` (PEP 578) to intercept outbound socket connections and enforce an allow list of permitted destinations. One function call, no sidecar containers, no infrastructure changes.
 
 ```python
 import tethered
@@ -25,9 +25,9 @@ tests/
 
 ### Module responsibilities
 
-- **`_policy.py`** is pure logic. `AllowPolicy` is immutable after construction and thread-safe to read. It handles hostname wildcards (`*.stripe.com`), CIDR ranges (`10.0.0.0/8`), port filtering (`host:443`), and localhost detection. It has zero side effects and no imports beyond stdlib (`fnmatch`, `ipaddress`, `logging`, `dataclasses`).
+- **`_policy.py`** is pure logic. `AllowPolicy` is immutable after construction and thread-safe to read. It handles hostname wildcards (`*.stripe.com`), CIDR ranges (`10.0.0.0/8`), port filtering (`host:443`), and localhost detection. It has zero side effects and no imports beyond stdlib (`fnmatch`, `ipaddress`, `logging`, `re`, `dataclasses`, `unicodedata`).
 
-- **`_core.py`** owns the audit hook lifecycle. It installs a single `sys.addaudithook` that intercepts `socket.getaddrinfo` and `socket.gethostbyname`/`gethostbyaddr` (to enforce DNS-level policy and map IPs back to hostnames) and `socket.connect`/`sendto`/`sendmsg` (to enforce the connection policy). All per-activation state (`policy`, `log_only`, `fail_closed`, `on_blocked`, `locked`, `lock_token`) is bundled into a frozen `_Config` dataclass that is swapped atomically — this eliminates TOCTOU bugs between separate state reads and is safe on free-threaded Python (PEP 703). The IP-to-hostname map is an `OrderedDict` with LRU eviction. The hook is installed once and can never be removed — `deactivate()` sets `_config` to `None`, making the hook a no-op.
+- **`_core.py`** owns the audit hook lifecycle. It installs a single `sys.addaudithook` that intercepts `socket.getaddrinfo` and `socket.gethostbyname`/`gethostbyaddr` (to enforce DNS-level policy and map IPs back to hostnames) and `socket.connect`/`sendto`/`sendmsg` (to enforce the connection policy). All per-activation state (`policy`, `log_only`, `fail_closed`, `on_blocked`, `locked`, `lock_token`) is bundled into a frozen `_Config` dataclass that is swapped atomically under nested `_state_lock` + `_ip_map_lock` — this eliminates TOCTOU bugs between separate state reads, ensures the config and IP map are always consistent, and is safe on free-threaded Python (PEP 703). The IP-to-hostname map is an `OrderedDict` with LRU eviction. The hook is installed once and can never be removed — `deactivate()` sets `_config` to `None`, making the hook a no-op.
 
 - **`__init__.py`** re-exports the public API. Nothing else lives here.
 
@@ -41,7 +41,7 @@ tests/
 
 4. **Thread safety.** `AllowPolicy` is immutable. The `_Config` bundle is a frozen dataclass swapped atomically (single reference assignment). `_ip_to_hostname` is an `OrderedDict` guarded by `_ip_map_lock` with LRU eviction. Reentrancy guard uses `contextvars.ContextVar` (async-safe, faster than `threading.local()`).
 
-5. **Zero dependencies.** Everything uses stdlib only: `sys`, `socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `dataclasses`.
+5. **Zero dependencies.** Everything uses stdlib only: `sys`, `_socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `re`, `dataclasses`, `unicodedata`, `contextvars`.
 
 ## Conventions
 
@@ -51,7 +51,7 @@ tests/
 - Private modules are prefixed with `_` (e.g., `_core.py`, `_policy.py`).
 - Type hints on all public function signatures.
 - No docstrings on private helpers unless the logic is non-obvious.
-- Keep modules small and focused. If a module exceeds ~200 lines, consider splitting.
+- Keep modules small and focused. If a module exceeds ~500 lines, consider splitting.
 
 ### Testing
 

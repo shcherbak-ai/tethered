@@ -1,4 +1,4 @@
-# Contributing to Tethered
+# Contributing to tethered
 
 ## Setup
 
@@ -21,13 +21,13 @@ feature-branch → dev (PR) → main (release merge)
 ## Running tests
 
 ```bash
-uv run pytest tests/ -v
+uv run pytest -v
 ```
 
-With coverage:
+With coverage (100% is required — the command will fail if coverage drops below that):
 
 ```bash
-uv run pytest tests/ -v --cov
+uv run pytest --cov -v
 ```
 
 ## Linting and formatting
@@ -57,10 +57,11 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) e
 
 ```text
 src/tethered/
-    __init__.py    # Public API: activate(), deactivate(), EgressBlocked
+    __init__.py    # Public API: activate(), deactivate(), EgressBlocked, TetheredLocked
     _policy.py     # AllowPolicy — pattern parsing and matching (pure logic)
     _core.py       # Audit hook, state management, IP-to-hostname resolution
 tests/
+    conftest.py     # Test-suite egress guard
     test_policy.py  # Unit tests for AllowPolicy (no network)
     test_core.py    # Integration tests with real sockets
 ```

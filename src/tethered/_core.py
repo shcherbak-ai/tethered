@@ -101,7 +101,7 @@ _CONNECT_EVENTS = frozenset(
     )
 )
 
-# DNS resolution events to intercept (gethostbyname family)
+# DNS resolution events to intercept outside getaddrinfo
 _DNS_EVENTS = frozenset(
     (
         "socket.gethostbyname",
@@ -145,7 +145,7 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         return
 
     # Fast exit for non-socket events (open, import, exec, compile, etc.)
-    if event[:7] != "socket.":
+    if not event.startswith("socket."):
         return
 
     if event == "socket.getaddrinfo":
@@ -169,10 +169,10 @@ def _handle_dns_lookup(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     if not isinstance(host, str) or not host:
         return
 
-    if _is_ip(host):
-        return
-
     host_lower = _normalize_host(host)
+
+    if event != "socket.gethostbyaddr" and _is_ip(host_lower):
+        return
 
     try:
         allowed = cfg.policy.is_allowed(host_lower, _normalized=True)
@@ -274,10 +274,19 @@ def _handle_getaddrinfo(cfg: _Config, args: tuple[Any, ...]) -> None:
     # threads for DNS and can cause thread/memory explosion under load.
     _token = _in_hook.set(True)
     try:
-        results = _csocket.getaddrinfo(host, args[1], 0, 0, 0, 0)
+        port = args[1] if len(args) >= 2 else None
+        family = args[2] if len(args) >= 3 and isinstance(args[2], int) else 0
+        socktype = args[3] if len(args) >= 4 and isinstance(args[3], int) else 0
+        proto = args[4] if len(args) >= 5 and isinstance(args[4], int) else 0
+        flags = args[5] if len(args) >= 6 and isinstance(args[5], int) else 0
+        results = _csocket.getaddrinfo(host, port, family, socktype, proto, flags)
         with _ip_map_lock:
             for _family, _socktype, _proto, _canonname, sockaddr in results:
                 ip = str(sockaddr[0])  # always str; cast for pyright
+                if ip in _ip_to_hostname:
+                    _ip_to_hostname[ip] = host_lower
+                    _ip_to_hostname.move_to_end(ip)
+                    continue
                 # LRU eviction: remove oldest entry when at capacity
                 if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
                     _ip_to_hostname.popitem(last=False)
@@ -409,12 +418,22 @@ def activate(
         on_blocked: Optional callback ``(host, port) -> None`` invoked on
             blocked connections. Called even in log_only mode.
         locked: If True, ``deactivate()`` will refuse to disable enforcement
-            unless the correct ``lock_token`` is provided. Prevents
-            in-process adversaries from trivially disabling tethered.
-        lock_token: An opaque object that must be passed to ``deactivate()``
-            to unlock a locked policy. Only meaningful when ``locked=True``.
+            unless the correct ``lock_token`` is provided. Raises the bar
+            for accidental or casual in-process disabling of tethered.
+        lock_token: An opaque object required when ``locked=True`` and used
+            to authenticate when replacing an existing locked policy.
+            Compared by identity (``is``), not equality.
+
+    Raises:
+        ValueError: If ``locked=True`` is used without ``lock_token``.
+        TetheredLocked: If a locked policy is active and the correct
+            ``lock_token`` is not provided.
     """
     global _config
+
+    if locked and lock_token is None:
+        msg = "tethered: lock_token is required when locked=True"
+        raise ValueError(msg)
 
     policy = AllowPolicy(allow, allow_localhost=allow_localhost)
     cfg = _Config(
@@ -423,14 +442,20 @@ def activate(
         fail_closed=fail_closed,
         on_blocked=on_blocked,
         locked=locked,
-        lock_token=lock_token,
+        lock_token=lock_token if locked else None,
     )
 
     with _state_lock:
-        _config = cfg
-
-    with _ip_map_lock:
-        _ip_to_hostname.clear()
+        old = _config
+        if (
+            old is not None
+            and old.locked
+            and (lock_token is None or lock_token is not old.lock_token)
+        ):
+            raise TetheredLocked
+        with _ip_map_lock:
+            _config = cfg
+            _ip_to_hostname.clear()
 
     _install_hook()
     logger.info("tethered: activated with %d rules (log_only=%s)", len(allow), log_only)
@@ -456,10 +481,9 @@ def deactivate(*, lock_token: object | None = None) -> None:
             and (lock_token is None or lock_token is not cfg.lock_token)
         ):
             raise TetheredLocked
-        _config = None
-
-    with _ip_map_lock:
-        _ip_to_hostname.clear()
+        with _ip_map_lock:
+            _config = None
+            _ip_to_hostname.clear()
 
     logger.info("tethered: deactivated")
 
@@ -468,8 +492,6 @@ def _reset_state() -> None:
     """Reset all internal state. For testing only."""
     global _config
 
-    with _state_lock:
+    with _state_lock, _ip_map_lock:
         _config = None
-
-    with _ip_map_lock:
         _ip_to_hostname.clear()

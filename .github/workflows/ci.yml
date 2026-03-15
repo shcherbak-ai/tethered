@@ -49,7 +49,7 @@ jobs:
         run: uv sync
 
       - name: Run tests with coverage
-        run: uv run pytest tests/ -v --cov=src/tethered --cov-report=xml --cov-report=term-missing
+        run: uv run pytest tests/ -v --cov=src/tethered --cov-report=xml --cov-report=term-missing --cov-fail-under=100
 
       - name: Extract coverage percentage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'

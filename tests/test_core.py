@@ -561,6 +561,15 @@ class TestFailClosed:
 
 
 class TestLockedMode:
+    def test_locked_activation_requires_token(self):
+        with pytest.raises(ValueError, match="lock_token is required"):
+            tethered.activate(allow=["*.example.com"], locked=True)
+
+    def test_lock_token_without_locked_ignored(self):
+        """lock_token without locked=True is accepted but ignored for the new policy."""
+        tethered.activate(allow=["*.example.com"], lock_token=object())
+        tethered.deactivate()  # Should succeed — policy is not locked
+
     def test_locked_deactivate_without_token_raises(self):
         secret = object()
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
@@ -587,12 +596,29 @@ class TestLockedMode:
         with pytest.raises(tethered.EgressBlocked):
             socket.getaddrinfo("evil.com", 80)
 
-    def test_reactivate_replaces_locked_policy(self):
-        """activate() always works, even over a locked policy."""
+    def test_reactivate_over_locked_requires_token(self):
+        """activate() over a locked policy requires the correct lock_token."""
         secret = object()
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        # A new activate() replaces the locked policy
-        tethered.activate(allow=["evil.com"])
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.activate(allow=["evil.com"])
+
+    def test_reactivate_over_locked_with_correct_token(self):
+        """activate() with the correct lock_token replaces a locked policy."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        tethered.activate(allow=["evil.com"], lock_token=secret, locked=True)
+        # New policy is active
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("other.com", 80)
+
+    def test_reactivate_over_locked_unlocked_replacement(self):
+        """activate() with correct token can replace locked with unlocked policy."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        # Same token authenticates against old policy; new policy is unlocked
+        # because locked defaults to False when lock_token matches old config
+        tethered.activate(allow=["evil.com"], lock_token=secret)
         tethered.deactivate()  # Should succeed (new policy is not locked)
 
 
@@ -619,6 +645,9 @@ class TestIsIp:
 
     def test_empty(self):
         assert _is_ip("") is False
+
+    def test_invalid_ip_like_hostname(self):
+        assert _is_ip("1example.com") is False
 
 
 class TestExtractHostPort:
@@ -751,6 +780,50 @@ class TestAuditHookDirect:
         with _ip_map_lock:
             assert any(v == "dns.google" for v in _ip_to_hostname.values())
 
+    def test_getaddrinfo_allowed_refreshes_existing_ip_map_entry(self, monkeypatch):
+        tethered.activate(allow=["dns.google"])
+
+        with _ip_map_lock:
+            _ip_to_hostname.clear()
+            _ip_to_hostname["203.0.113.10"] = "old.example.com"
+            _ip_to_hostname["198.51.100.20"] = "stale.example.com"
+
+        monkeypatch.setattr(
+            _csocket,
+            "getaddrinfo",
+            lambda *args: [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("203.0.113.10", 443)),
+            ],
+        )
+
+        _audit_hook("socket.getaddrinfo", ("dns.google", 443, 0, 0, 0, 0))
+
+        with _ip_map_lock:
+            assert _ip_to_hostname["203.0.113.10"] == "dns.google"
+            assert list(_ip_to_hostname.keys())[-1] == "203.0.113.10"
+
+    def test_getaddrinfo_forwards_caller_args(self, monkeypatch):
+        """getaddrinfo forwards family/socktype/proto/flags to C-level resolver."""
+        tethered.activate(allow=["dns.google"])
+        captured = {}
+
+        def _capture(*args):
+            captured["args"] = args
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443))]
+
+        monkeypatch.setattr(_csocket, "getaddrinfo", _capture)
+        _audit_hook(
+            "socket.getaddrinfo",
+            ("dns.google", 443, socket.AF_INET6, socket.SOCK_STREAM, 6, socket.AI_CANONNAME),
+        )
+        host, port, family, socktype, proto, flags = captured["args"]
+        assert host == "dns.google"
+        assert port == 443
+        assert family == socket.AF_INET6
+        assert socktype == socket.SOCK_STREAM
+        assert proto == 6
+        assert flags == socket.AI_CANONNAME
+
     def test_getaddrinfo_allowed_handles_dns_failure(self):
         tethered.activate(allow=["nonexistent.invalid"])
         _audit_hook("socket.getaddrinfo", ("nonexistent.invalid", 80, 0, 0, 0))
@@ -870,9 +943,13 @@ class TestDNSLookupInterception:
             _audit_hook("socket.gethostbyname", ("evil.com",))
 
     def test_gethostbyaddr_blocks_disallowed(self):
-        tethered.activate(allow=["*.example.com"])
+        tethered.activate(allow=["198.51.100.0/24"])
         with pytest.raises(tethered.EgressBlocked):
-            _audit_hook("socket.gethostbyaddr", ("evil.com",))
+            _audit_hook("socket.gethostbyaddr", ("203.0.113.1",))
+
+    def test_gethostbyaddr_allows_allowed_ip(self):
+        tethered.activate(allow=["198.51.100.0/24"])
+        _audit_hook("socket.gethostbyaddr", ("198.51.100.1",))
 
     def test_gethostbyname_allows_allowed(self):
         tethered.activate(allow=["*.example.com"])
@@ -1306,13 +1383,13 @@ class TestParamNoResiduals:
             _audit_hook("socket.connect", (None, ("127.0.0.1", 80)))
 
     def test_locked_not_inherited(self):
-        """activate(locked=True) -> activate(locked=False) -> deactivate() works."""
+        """activate(locked=True) -> activate(locked=False, token) -> deactivate() works."""
         secret = object()
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
         with pytest.raises(tethered.TetheredLocked):
             tethered.deactivate()
 
-        tethered.activate(allow=["*.example.com"])
+        tethered.activate(allow=["*.example.com"], lock_token=secret)
         tethered.deactivate()  # should succeed — new policy is not locked
 
     def test_allow_list_not_inherited(self):
