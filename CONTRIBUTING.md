@@ -11,8 +11,8 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 
 ## Branching
 
-The default branch is `dev`. All pull requests should target `dev`.
-The `main` branch is for releases only.
+The default branch is `main`. All pull requests should target `dev`.
+The `main` branch is for releases only — `dev` is the working branch.
 
 ```text
 feature-branch → dev (PR) → main (release merge)
