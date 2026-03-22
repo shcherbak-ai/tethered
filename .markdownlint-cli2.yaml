@@ -1,4 +1,6 @@
 config:
+  no-duplicate-heading:
+    siblings_only: true
   line-length: false
   first-line-heading: false
   table-column-style: false
