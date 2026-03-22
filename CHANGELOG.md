@@ -6,6 +6,18 @@ Each version listed corresponds to a release published on [PyPI](https://pypi.or
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] — 2026-03-22
+
+### Fixed
+
+- `lock_token` now rejects internable types (`str`, `int`, `float`, `bytes`, `bool`) when
+  `locked=True`. CPython interns these types, so separate literals can share identity and
+  defeat the lock. Use `object()` or a custom instance instead.
+
+### Changed
+
+- Moved `_reset_state()` logic from production code to test fixtures.
+
 ## [0.3.2] — 2026-03-22
 
 ### Added
@@ -44,5 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[0.3.3]: https://github.com/shcherbak-ai/tethered/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/shcherbak-ai/tethered/compare/v0.2.0...v0.3.2
 [0.2.0]: https://github.com/shcherbak-ai/tethered/compare/v0.1.4...v0.2.0
