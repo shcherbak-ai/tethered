@@ -12,6 +12,7 @@ import threading
 import pytest
 
 import tethered
+import tethered._core as _core
 from tethered._core import (
     _IP_MAP_MAX_SIZE,
     _audit_hook,
@@ -26,7 +27,6 @@ from tethered._core import (
     _ip_map_lock,
     _ip_to_hostname,
     _is_ip,
-    _reset_state,
     _ScopeConfig,
     _scopes,
 )
@@ -44,7 +44,10 @@ requires_network = pytest.mark.requires_network
 def _cleanup():
     """Reset tethered state after each test."""
     yield
-    _reset_state()
+    with _core._state_lock, _ip_map_lock:
+        _core._config = None
+        _ip_to_hostname.clear()
+    _scopes.set(())
 
 
 class TestInputValidation:
@@ -1551,7 +1554,7 @@ class TestConftestEgressGuard:
 
     def test_dns_blocked_when_tethered_inactive(self):
         """Guard blocks DNS for non-allowed hosts when tethered is deactivated."""
-        # _cleanup fixture has called _reset_state(), so _config is None
+        # _cleanup fixture has reset _core._config to None
         with pytest.raises(tethered.EgressBlocked, match=r"evil\.test"):
             socket.getaddrinfo("evil.test", 80)
 

@@ -898,14 +898,3 @@ def deactivate(*, lock_token: object | None = None) -> None:
             _ip_to_hostname.clear()
 
     logger.info("tethered: deactivated")
-
-
-def _reset_state() -> None:
-    """Reset all internal state. For testing only."""
-    global _config
-
-    with _state_lock, _ip_map_lock:
-        _config = None
-        _ip_to_hostname.clear()
-    # Reset scopes in the current context
-    _scopes.set(())

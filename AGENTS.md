@@ -39,7 +39,7 @@ examples/
 
 1. **Fail-open by default, fail-closed optional.** If the matching logic itself raises an unexpected exception, the connection is allowed and a warning is logged (fail-open). Users can set `fail_closed=True` for stricter environments where errors should block rather than allow.
 
-2. **Audit hooks are irremovable.** `sys.addaudithook` has no corresponding remove function. This is a feature for security (malicious code can't unhook it) but means tests must use `deactivate()` + `_reset_state()` for cleanup rather than removing the hook.
+2. **Audit hooks are irremovable.** `sys.addaudithook` has no corresponding remove function. This is a feature for security (malicious code can't unhook it) but means tests must use `deactivate()` or reset internal state directly in fixtures for cleanup rather than removing the hook.
 
 3. **IP-to-hostname mapping via getaddrinfo interception.** When `socket.getaddrinfo("api.stripe.com", 443)` fires, we resolve it ourselves (with a reentrancy guard) and store `{resolved_ip: "api.stripe.com"}`. When `socket.connect(sock, (resolved_ip, 443))` fires later, we look up the hostname and check it against the policy.
 
@@ -63,7 +63,7 @@ examples/
 
 - **Egress guard** (`conftest.py`): An independent audit hook that uses `AllowPolicy` to block unexpected network access between tests (when tethered is deactivated). Only `dns.google` and localhost are allowed. When tethered IS active, its own hook handles enforcement and the guard is a no-op.
 - **Unit tests** (`test_policy.py`): Test `AllowPolicy` in isolation. No audit hooks, no network calls. This is where the bulk of pattern-matching coverage lives.
-- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Includes scope tests covering context manager usage, decorator usage, nesting, intersection semantics with the global policy, and concurrent scope isolation. Use the `_cleanup` autouse fixture that calls `_reset_state()` after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
+- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Includes scope tests covering context manager usage, decorator usage, nesting, intersection semantics with the global policy, and concurrent scope isolation. Use the `_cleanup` autouse fixture that resets internal state after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
 - Run core tests: `uv run pytest tests/ -v`
 - Run with coverage: `uv run pytest tests/ -v --cov`
 - Run example tests (requires network): `uv run pytest tests_examples/ -v`

@@ -111,7 +111,7 @@ Never use hostnames that could trigger unexpected connections to services with s
 ## Testing conventions
 
 - **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of coverage lives here.
-- **Integration tests** (`test_core.py`): Use real sockets. The `_cleanup` autouse fixture calls `_reset_state()` after each test.
+- **Integration tests** (`test_core.py`): Use real sockets. The `_cleanup` autouse fixture resets internal state after each test.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before any packet leaves the machine.
