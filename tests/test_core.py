@@ -1764,7 +1764,7 @@ class TestScopeDecorator:
             await asyncio.get_event_loop().getaddrinfo("evil.test", 80)
 
         with pytest.raises(tethered.EgressBlocked):
-            asyncio.get_event_loop().run_until_complete(guarded())
+            asyncio.run(guarded())
 
     def test_decorator_preserves_name(self):
         """@scope() preserves __name__ via functools.wraps."""
@@ -1827,7 +1827,7 @@ class TestScopeDecorator:
         async def guarded():
             return 42
 
-        result = asyncio.get_event_loop().run_until_complete(guarded())
+        result = asyncio.run(guarded())
         assert result == 42
 
     def test_decorator_scope_exits_after_call(self):

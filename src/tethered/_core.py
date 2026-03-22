@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import _socket as _csocket  # C-level socket; immune to gevent/eventlet monkey-patching
-import asyncio
 import collections
 import contextvars
 import functools
@@ -767,7 +766,7 @@ class scope:
 
         scope_cfg = self._scope_cfg
 
-        if asyncio.iscoroutinefunction(fn):
+        if inspect.iscoroutinefunction(fn):
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
