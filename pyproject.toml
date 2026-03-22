@@ -54,6 +54,7 @@ packages = ["src/tethered"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["requires_network: test needs external DNS resolution (dns.google)"]
 
 [tool.ruff]
 target-version = "py310"

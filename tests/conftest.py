@@ -8,7 +8,10 @@ IS active, its own hook handles enforcement and this guard is a no-op.
 from __future__ import annotations
 
 import ipaddress
+import socket
 import sys
+
+import pytest
 
 import tethered._core as _core
 from tethered._core import _CONNECT_EVENTS, _DNS_EVENTS, EgressBlocked
@@ -56,3 +59,19 @@ def _test_egress_guard(event: str, args: tuple) -> None:
 
 
 sys.addaudithook(_test_egress_guard)
+
+
+def _has_network() -> bool:
+    """Check if external DNS resolution is available."""
+    try:
+        socket.getaddrinfo("dns.google", 443)
+        return True
+    except OSError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_no_network(request):
+    """Skip @requires_network tests at runtime when DNS is unavailable."""
+    if request.node.get_closest_marker("requires_network") and not _has_network():
+        pytest.skip("No network access")

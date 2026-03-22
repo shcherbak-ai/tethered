@@ -37,19 +37,7 @@ def _raise_runtime(self, host, port=None):
     raise RuntimeError("simulated policy bug")
 
 
-def _has_network() -> bool:
-    """Check if external DNS resolution is available."""
-    try:
-        socket.getaddrinfo("dns.google", 443)
-        return True
-    except OSError:
-        return False
-
-
-requires_network = pytest.mark.skipif(
-    not _has_network(),
-    reason="No network access",
-)
+requires_network = pytest.mark.requires_network
 
 
 @pytest.fixture(autouse=True)
@@ -254,6 +242,7 @@ class TestLogOnly:
 
         assert len(blocked) > 0
 
+    @requires_network
     def test_log_only_getaddrinfo_does_not_raise(self):
         blocked: list[tuple[str, int | None]] = []
 
@@ -347,6 +336,7 @@ class TestAsyncSockets:
         except (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError):
             pass  # Connection refused/timeout is fine — EgressBlocked would be wrong
 
+    @requires_network
     @pytest.mark.asyncio
     async def test_async_log_only_does_not_raise(self):
         blocked: list[tuple[str, int | None]] = []
@@ -553,6 +543,7 @@ class TestEgressBlockedException:
 
 
 class TestFailOpen:
+    @requires_network
     def test_fail_open_getaddrinfo(self, monkeypatch):
         """If policy.is_allowed raises, getaddrinfo should proceed (fail-open)."""
         tethered.activate(allow=["*.example.com"])
@@ -1618,6 +1609,7 @@ class TestScope:
         ):
             socket.getaddrinfo("localhost", 80)
 
+    @requires_network
     def test_scope_exit_restores_policy(self):
         """After exiting a scope, previously blocked hosts are accessible."""
         with tethered.scope(allow=["*.example.com"]), pytest.raises(tethered.EgressBlocked):
@@ -1879,6 +1871,7 @@ class TestScopeAsync:
 class TestScopeThreading:
     """Test scope() thread isolation."""
 
+    @requires_network
     def test_scope_thread_isolation(self):
         """Scope in one thread does not affect another thread."""
         results: dict[str, bool] = {}
@@ -1917,6 +1910,7 @@ class TestScopeThreading:
 class TestScopeLogOnly:
     """Test scope() log_only mode and on_blocked callback."""
 
+    @requires_network
     def test_log_only_does_not_raise(self):
         """scope(log_only=True) logs but does not raise."""
         with tethered.scope(allow=["*.example.com"], log_only=True):
@@ -1938,6 +1932,7 @@ class TestScopeLogOnly:
 
         assert ("evil.test", None) in blocked
 
+    @requires_network
     def test_log_only_with_callback(self):
         """log_only + on_blocked: callback fires, no exception raised."""
         blocked: list[tuple[str, int | None]] = []
