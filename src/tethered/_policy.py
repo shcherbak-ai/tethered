@@ -77,10 +77,19 @@ class AllowPolicy:
                 rule = unicodedata.normalize("NFC", rule)
                 rule = rule.translate(_FULLWIDTH_DOT_TABLE)
 
-            # Warn on empty/whitespace-only rules
+            # Reject empty/whitespace-only rules
             if not rule:
-                logger.warning("tethered: ignoring empty allow rule: %r", raw)
-                continue
+                msg = f"allow rule {raw!r} is empty or whitespace-only"
+                raise ValueError(msg)
+
+            # Reject URLs — a common mistake (should be hostname, not URL)
+            if "://" in rule:
+                msg = (
+                    f"allow rule {raw!r} looks like a URL. "
+                    f"Use a hostname pattern instead (e.g. 'api.stripe.com:443', "
+                    f"not 'https://api.stripe.com:443')."
+                )
+                raise ValueError(msg)
 
             # Strip exactly one trailing dot from FQDNs (not IPs, not CIDRs)
             if rule.endswith(".") and not rule.endswith("/"):
@@ -130,9 +139,21 @@ class AllowPolicy:
             except ValueError:
                 pass
 
-            # Warn on overly-broad patterns
-            if rule == "*":
-                logger.warning("tethered: rule %r matches ALL destinations — intended?", raw)
+            # Reject overly broad wildcards — the host portion (without port)
+            # must contain at least one literal character that isn't a wildcard
+            # or dot. Patterns like *, *.*, *?*, ?* match all destinations.
+            # Patterns with only ? (like ???.??) are allowed because ? matches
+            # exactly one character — they are bounded, not open-ended.
+            if "*" in rule:
+                host_part_for_check = rule.split(":")[0] if ":" in rule else rule
+                if all(c in "*?." for c in host_part_for_check):
+                    msg = (
+                        f"allow rule {raw!r} matches ALL destinations, "
+                        f"which disables egress control entirely. "
+                        f"Use specific hostname patterns instead "
+                        f"(e.g. '*.stripe.com:443')."
+                    )
+                    raise ValueError(msg)
 
             # It's a hostname pattern
             host_rules.append(_HostRule(pattern=rule, port=port))
@@ -156,6 +177,24 @@ class AllowPolicy:
         self._exact_hosts_with_port: frozenset[str] = frozenset(exact_hosts_with_port)
         self._host_rules: tuple[_HostRule, ...] = tuple(wildcard_rules)
         self._network_rules: tuple[_NetworkRule, ...] = tuple(network_rules)
+
+    def _has_any_port_rule(self, host: str) -> bool:
+        """Check if a host has a port-unrestricted rule (exact or wildcard or CIDR)."""
+        host_lower = _normalize_host(host)
+        if host_lower in self._exact_hosts_any_port:
+            return True
+        for rule in self._host_rules:
+            if rule.port is None and fnmatch.fnmatchcase(host_lower, rule.pattern):
+                return True
+        if _could_be_ip(host_lower):
+            try:
+                ip = ipaddress.ip_address(host_lower)
+                for rule in self._network_rules:
+                    if rule.port is None and ip in rule.network:
+                        return True
+            except ValueError:
+                pass
+        return False
 
     def is_allowed(self, host: str, port: int | None = None, *, _normalized: bool = False) -> bool:
         """Check if a host:port combination is allowed."""
@@ -228,6 +267,83 @@ class AllowPolicy:
                 return True
 
         return False
+
+    def _check_wildcard_overlap(self, pattern: str, port: int | None) -> str:
+        """Check how a wildcard scope rule overlaps with this policy.
+
+        Returns:
+            "none" — no connection can satisfy both (dead rule or disjoint ports).
+            "partial" — some overlap but the scope is broader (on hostnames, port, or both).
+            "full" — an identical rule exists in this policy (same pattern, same port).
+        """
+
+        def _ports_overlap(global_port: int | None) -> bool:
+            if port is None or global_port is None:
+                return True
+            return port == global_port
+
+        # Best result across all global rules: full > partial > none
+        best = "none"
+
+        # Check global wildcard rules — only identical pattern+port is "full"
+        for rule in self._host_rules:
+            if rule.pattern == pattern and rule.port == port:
+                return "full"
+            if rule.pattern == pattern and _ports_overlap(rule.port):
+                best = "partial"
+
+        # Check exact hostnames — a wildcard matching an exact host is always
+        # "partial" at best because the wildcard covers more hosts
+        for hostname in self._exact_hosts_any_port:
+            if fnmatch.fnmatchcase(hostname, pattern) and _ports_overlap(None):
+                best = "partial"
+                break
+        for hostname, rule_port in self._exact_hosts:
+            if fnmatch.fnmatchcase(hostname, pattern) and _ports_overlap(rule_port):
+                best = "partial"
+                break
+
+        # Check overlap with global wildcards via suffix heuristic
+        if best == "none":
+            for rule in self._host_rules:
+                scope_suffix = pattern.lstrip("*?")
+                rule_suffix = rule.pattern.lstrip("*?")
+                if (
+                    scope_suffix
+                    and rule_suffix
+                    and (scope_suffix.endswith(rule_suffix) or rule_suffix.endswith(scope_suffix))
+                    and _ports_overlap(rule.port)
+                ):
+                    best = "partial"
+                    break
+
+        return best
+
+    def _check_cidr_overlap(
+        self,
+        network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+        port: int | None,
+    ) -> str:
+        """Check how a CIDR scope rule overlaps with this policy.
+
+        Returns:
+            "none" — no network rule in this policy overlaps.
+            "partial" — overlaps but the scope CIDR is broader.
+            "full" — an identical or narrower CIDR exists in this policy.
+        """
+        best = "none"
+        for rule in self._network_rules:
+            if not network.overlaps(rule.network):
+                continue
+            # Networks overlap — check port compatibility
+            if port is not None and rule.port is not None and port != rule.port:
+                continue  # disjoint ports on this rule — try the next one
+            ports_match = port == rule.port
+            network_narrower = network.prefixlen >= rule.network.prefixlen
+            if network_narrower and ports_match:
+                return "full"
+            best = "partial"
+        return best
 
 
 _FULLWIDTH_DOT_TABLE = str.maketrans(

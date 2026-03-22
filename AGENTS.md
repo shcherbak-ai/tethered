@@ -14,22 +14,26 @@ tethered.activate(allow=["*.stripe.com:443", "db.internal:5432"])
 
 ```text
 src/tethered/
-    __init__.py    # Public API surface: activate(), deactivate(), EgressBlocked, TetheredLocked
+    __init__.py    # Public API surface: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
     _policy.py     # AllowPolicy — pattern parsing and matching (pure logic, no side effects)
-    _core.py       # Audit hook, _Config bundle, state management, IP-to-hostname resolution
+    _core.py       # Audit hook, _Config bundle, scope, state management, IP-to-hostname resolution
 tests/
     conftest.py     # Test-suite egress guard — uses AllowPolicy
     test_policy.py  # Unit tests for AllowPolicy (no hooks, no network)
-    test_core.py    # Integration tests with real sockets (sync and async)
+    test_core.py    # Integration tests with real sockets (sync, async, scopes)
+tests_examples/
+    test_examples.py  # Runs each example/ script as a subprocess (requires network)
+examples/
+    *.py           # Runnable usage examples (httpx + api.github.com)
 ```
 
 ### Module responsibilities
 
 - **`_policy.py`** is pure logic. `AllowPolicy` is immutable after construction and thread-safe to read. It handles hostname wildcards (`*.stripe.com`), CIDR ranges (`10.0.0.0/8`), port filtering (`host:443`), and localhost detection. It has zero side effects and no imports beyond stdlib (`fnmatch`, `ipaddress`, `logging`, `re`, `dataclasses`, `unicodedata`).
 
-- **`_core.py`** owns the audit hook lifecycle. It installs a single `sys.addaudithook` that intercepts `socket.getaddrinfo` and `socket.gethostbyname`/`gethostbyaddr` (to enforce DNS-level policy and map IPs back to hostnames) and `socket.connect`/`sendto`/`sendmsg` (to enforce the connection policy). All per-activation state (`policy`, `log_only`, `fail_closed`, `on_blocked`, `locked`, `lock_token`) is bundled into a frozen `_Config` dataclass that is swapped atomically under nested `_state_lock` + `_ip_map_lock` — this eliminates TOCTOU bugs between separate state reads, ensures the config and IP map are always consistent, and is safe on free-threaded Python (PEP 703). The IP-to-hostname map is an `OrderedDict` with LRU eviction. The hook is installed once and can never be removed — `deactivate()` sets `_config` to `None`, making the hook a no-op.
+- **`_core.py`** owns the audit hook lifecycle. It installs a single `sys.addaudithook` that intercepts `socket.getaddrinfo` and `socket.gethostbyname`/`gethostbyaddr` (to enforce DNS-level policy and map IPs back to hostnames) and `socket.connect`/`sendto`/`sendmsg` (to enforce the connection policy). All per-activation state (`policy`, `log_only`, `fail_closed`, `on_blocked`, `locked`, `lock_token`) is bundled into a frozen `_Config` dataclass that is swapped atomically under nested `_state_lock` + `_ip_map_lock` — this eliminates TOCTOU bugs between separate state reads, ensures the config and IP map are always consistent, and is safe on free-threaded Python (PEP 703). The IP-to-hostname map is an `OrderedDict` with LRU eviction. The hook is installed once and can never be removed — `deactivate()` sets `_config` to `None`, making the hook a no-op. Context-local scopes are managed by a `_ScopeConfig` dataclass, a `_scopes` `ContextVar` holding a per-context scope stack, and the `scope` class (usable as both a context manager and a decorator). The `_check_scopes` and `_enforce_scope_block` helpers are called from the audit hook to intersect scope rules with the global policy.
 
-- **`__init__.py`** re-exports the public API. Nothing else lives here.
+- **`__init__.py`** re-exports the public API (`activate`, `deactivate`, `scope`, `EgressBlocked`, `TetheredLocked`). Nothing else lives here.
 
 ### Key design decisions
 
@@ -42,6 +46,8 @@ tests/
 4. **Thread safety.** `AllowPolicy` is immutable. The `_Config` bundle is a frozen dataclass swapped atomically (single reference assignment). `_ip_to_hostname` is an `OrderedDict` guarded by `_ip_map_lock` with LRU eviction. Reentrancy guard uses `contextvars.ContextVar` (async-safe, faster than `threading.local()`).
 
 5. **Zero dependencies.** Everything uses stdlib only: `sys`, `_socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `re`, `dataclasses`, `unicodedata`, `contextvars`.
+
+6. **Context-local scopes.** `scope()` uses `contextvars.ContextVar` to maintain a per-context stack of scope configurations, making it safe for concurrent use across threads and async tasks. Scopes use intersection semantics with the global policy — they can only narrow the set of allowed destinations, never widen it. `scope` works as both a context manager (`with tethered.scope(allow=[...]):`) and a decorator (`@tethered.scope(allow=[...])`).
 
 ## Conventions
 
@@ -57,10 +63,12 @@ tests/
 
 - **Egress guard** (`conftest.py`): An independent audit hook that uses `AllowPolicy` to block unexpected network access between tests (when tethered is deactivated). Only `dns.google` and localhost are allowed. When tethered IS active, its own hook handles enforcement and the guard is a no-op.
 - **Unit tests** (`test_policy.py`): Test `AllowPolicy` in isolation. No audit hooks, no network calls. This is where the bulk of pattern-matching coverage lives.
-- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Use the `_cleanup` autouse fixture that calls `_reset_state()` after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
-- Run tests with: `uv run pytest tests/ -v`
+- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Includes scope tests covering context manager usage, decorator usage, nesting, intersection semantics with the global policy, and concurrent scope isolation. Use the `_cleanup` autouse fixture that calls `_reset_state()` after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
+- Run core tests: `uv run pytest tests/ -v`
 - Run with coverage: `uv run pytest tests/ -v --cov`
-- Tests must not depend on external network availability for correctness. Use known IPs, localhost, and `settimeout()` to handle network-level failures gracefully.
+- Run example tests (requires network): `uv run pytest tests_examples/ -v`
+- **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` as a subprocess. They make real HTTP calls to `api.github.com`. Not included in coverage (subprocesses aren't measured). Kept in a separate directory to avoid affecting coverage thresholds.
+- Core tests that need DNS resolution (log-only, fail-open, IP map tests) are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 
 ### Linting and formatting
 

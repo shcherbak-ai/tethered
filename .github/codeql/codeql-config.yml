@@ -1,0 +1,5 @@
+# test_examples.py runs example scripts via subprocess.run with a hardcoded
+# whitelist — process isolation is required because sys.addaudithook is
+# irremovable. All paths are static, no user input.
+paths-ignore:
+  - tests_examples/test_examples.py

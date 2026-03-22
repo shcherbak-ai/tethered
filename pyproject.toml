@@ -45,6 +45,7 @@ dev = [
     "commitizen>=4.13",
     "pyright>=1.1.408",
     "interrogate>=1.7",
+    "httpx>=0.28.1",
 ]
 
 [tool.hatch.build.targets.wheel]

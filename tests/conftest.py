@@ -26,6 +26,8 @@ def _test_egress_guard(event: str, args: tuple) -> None:
     """Block unexpected network access when tethered is not active."""
     if _core._config is not None:
         return  # tethered is active — its hook handles enforcement
+    if _core._scopes.get():
+        return  # scope is active — its hook handles enforcement
 
     if event in _ALL_DNS_EVENTS:
         host = args[0] if args else None

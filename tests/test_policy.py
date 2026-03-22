@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from tethered._policy import (
@@ -10,6 +12,7 @@ from tethered._policy import (
     _has_port_suffix,
     _is_ip_like,
     _is_localhost,
+    _NetworkRule,
     _normalize_host,
 )
 
@@ -153,7 +156,7 @@ class TestAllowPolicyHostname:
     def test_exact_match(self):
         policy = AllowPolicy(["api.stripe.com"])
         assert policy.is_allowed("api.stripe.com") is True
-        assert policy.is_allowed("evil.com") is False
+        assert policy.is_allowed("evil.test") is False
 
     def test_case_insensitive(self):
         policy = AllowPolicy(["API.Stripe.COM"])
@@ -168,14 +171,14 @@ class TestAllowPolicyHostname:
 
     def test_wildcard_does_not_match_unrelated(self):
         policy = AllowPolicy(["*.stripe.com"])
-        assert policy.is_allowed("evil.com") is False
-        assert policy.is_allowed("api.stripe.com.evil.com") is False
+        assert policy.is_allowed("evil.test") is False
+        assert policy.is_allowed("api.stripe.com.evil.test") is False
 
     def test_multiple_rules(self):
         policy = AllowPolicy(["api.stripe.com", "*.twilio.com"])
         assert policy.is_allowed("api.stripe.com") is True
         assert policy.is_allowed("api.twilio.com") is True
-        assert policy.is_allowed("evil.com") is False
+        assert policy.is_allowed("evil.test") is False
 
     def test_wildcard_crosses_label_boundaries(self):
         """fnmatch * matches across dots, unlike TLS cert wildcards."""
@@ -347,9 +350,18 @@ class TestAllowPolicyIPWildcard:
 
 
 class TestAllowPolicyEdgeCases:
+    def test_url_rejected(self):
+        """URLs are rejected with a helpful error message."""
+        with pytest.raises(ValueError, match="looks like a URL"):
+            AllowPolicy(["https://api.stripe.com:443"])
+
+    def test_http_url_rejected(self):
+        with pytest.raises(ValueError, match="looks like a URL"):
+            AllowPolicy(["http://api.stripe.com"])
+
     def test_empty_allow_list(self):
         policy = AllowPolicy([])
-        assert policy.is_allowed("evil.com") is False
+        assert policy.is_allowed("evil.test") is False
         # Localhost still allowed
         assert policy.is_allowed("127.0.0.1") is True
 
@@ -358,14 +370,17 @@ class TestAllowPolicyEdgeCases:
         assert policy.is_allowed("api.stripe.com") is True
 
     def test_empty_string_rule(self):
-        # Empty/whitespace rules should not crash or match anything
-        policy = AllowPolicy(["", "  "])
-        assert policy.is_allowed("evil.com") is False
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            AllowPolicy([""])
+
+    def test_whitespace_only_rule(self):
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            AllowPolicy(["  "])
 
     def test_garbage_rule(self):
         # Non-parseable rules become harmless dead hostname patterns
         policy = AllowPolicy(["not a valid rule!@#$"])
-        assert policy.is_allowed("evil.com") is False
+        assert policy.is_allowed("evil.test") is False
 
     def test_invalid_ip_like_hostname_falls_back_to_hostname_matching(self):
         policy = AllowPolicy(["1example.com"])
@@ -399,25 +414,75 @@ class TestAllowPolicyPortValidation:
 class TestAllowPolicyWildcardWarnings:
     """Test that overly-broad patterns emit warnings."""
 
-    def test_bare_star_warns(self, caplog):
-        AllowPolicy(["*"])
-        assert "matches ALL destinations" in caplog.text
+    def test_bare_star_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*"])
 
-    def test_normal_wildcard_no_warning(self, caplog):
+    def test_star_dot_star_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*.*"])
+
+    def test_star_dot_star_dot_star_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*.*.*"])
+
+    def test_star_dot_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*."])
+
+    def test_star_with_port_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*:443"])
+
+    def test_mixed_star_question_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*?*"])
+
+    def test_question_star_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["?*"])
+
+    def test_star_question_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*?"])
+
+    def test_mixed_star_question_with_port_raises(self):
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy(["*?*:443"])
+
+    def test_star_with_literal_accepted(self):
+        """*a* has a literal character — accepted."""
+        AllowPolicy(["*a*"])
+
+    def test_normal_wildcard_no_error(self):
         AllowPolicy(["*.stripe.com"])
-        assert "matches ALL destinations" not in caplog.text
+
+    def test_question_mark_pattern_accepted(self):
+        """? is a single-char match, not 'match all' — must be accepted."""
+        AllowPolicy(["???.??"])
+
+    def test_question_mark_with_port_accepted(self):
+        """?:443 matches single-char hostnames on port 443 — must be accepted."""
+        AllowPolicy(["?:443"])
+
+    def test_question_mark_prefix_accepted(self):
+        """?.stripe.com matches single-char subdomains — must be accepted."""
+        AllowPolicy(["?.stripe.com"])
 
 
-class TestAllowPolicyEmptyRuleWarnings:
-    """Test that empty/whitespace rules emit warnings."""
+class TestAllowPolicyEmptyRuleRaises:
+    """Test that empty/whitespace rules raise ValueError."""
 
-    def test_empty_rule_warns(self, caplog):
-        AllowPolicy(["", "  ", "valid.com"])
-        assert "ignoring empty allow rule" in caplog.text
+    def test_empty_rule_raises(self):
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            AllowPolicy(["", "valid.com"])
 
-    def test_valid_rule_no_warning(self, caplog):
+    def test_whitespace_rule_raises(self):
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            AllowPolicy(["  "])
+
+    def test_valid_rule_no_error(self):
         AllowPolicy(["valid.com"])
-        assert "ignoring empty" not in caplog.text
 
 
 class TestNormalizationConsistency:
@@ -444,27 +509,27 @@ class TestHostnameNormalizationEdgeCases:
     def test_null_byte_in_hostname(self):
         """Null bytes should be rejected as malformed hostnames."""
         policy = AllowPolicy(["*.allowed.com"])
-        assert policy.is_allowed("evil.com\x00.allowed.com") is False
+        assert policy.is_allowed("evil.test\x00.allowed.com") is False
 
     def test_newline_in_hostname(self):
         """Newlines should be rejected as malformed hostnames."""
         policy = AllowPolicy(["*.allowed.com"])
-        assert policy.is_allowed("evil.com\n.allowed.com") is False
+        assert policy.is_allowed("evil.test\n.allowed.com") is False
 
     def test_tab_in_hostname(self):
         """Tabs should be rejected as malformed hostnames."""
         policy = AllowPolicy(["*.allowed.com"])
-        assert policy.is_allowed("evil.com\t.allowed.com") is False
+        assert policy.is_allowed("evil.test\t.allowed.com") is False
 
     def test_nbsp_in_hostname(self):
         """Non-breaking space (U+00A0) should be rejected."""
         policy = AllowPolicy(["*.allowed.com"])
-        assert policy.is_allowed("evil.com\xa0.allowed.com") is False
+        assert policy.is_allowed("evil.test\xa0.allowed.com") is False
 
     def test_zero_width_space_in_hostname(self):
         """Zero-width space (U+200B) should be rejected."""
         policy = AllowPolicy(["*.allowed.com"])
-        assert policy.is_allowed("evil.com\u200b.allowed.com") is False
+        assert policy.is_allowed("evil.test\u200b.allowed.com") is False
 
     def test_idn_hostname_allowed(self):
         """Internationalized domain names with visible Unicode should work."""
@@ -504,7 +569,7 @@ class TestHostnameNormalizationEdgeCases:
         """Duplicate rules should not cause issues."""
         policy = AllowPolicy(["api.stripe.com", "api.stripe.com", "*.stripe.com"])
         assert policy.is_allowed("api.stripe.com") is True
-        assert policy.is_allowed("evil.com") is False
+        assert policy.is_allowed("evil.test") is False
 
 
 class TestCIDREdgeCases:
@@ -531,13 +596,10 @@ class TestCIDREdgeCases:
 
     def test_cross_family_typeerror_caught(self):
         """Non-standard network objects are safely skipped by isinstance guard."""
-        from unittest.mock import MagicMock
-
         policy = AllowPolicy(["10.0.0.0/8"])
         # Replace the network with a mock that raises TypeError on __contains__
         mock_network = MagicMock()
         mock_network.__contains__ = MagicMock(side_effect=TypeError("cross-family"))
-        from tethered._policy import _NetworkRule
 
         object.__setattr__(
             policy,
@@ -583,18 +645,18 @@ class TestUnicodeNormalization:
 
     def test_fullwidth_dot_normalized(self):
         """Fullwidth full stop (U+FF0E) should be normalized to ASCII dot."""
-        policy = AllowPolicy(["evil.com"])
-        assert policy.is_allowed("evil\uff0ecom") is True
+        policy = AllowPolicy(["evil.test"])
+        assert policy.is_allowed("evil\uff0etest") is True
 
     def test_ideographic_full_stop_normalized(self):
         """Ideographic full stop (U+3002) should be normalized to ASCII dot."""
-        policy = AllowPolicy(["evil.com"])
-        assert policy.is_allowed("evil\u3002com") is True
+        policy = AllowPolicy(["evil.test"])
+        assert policy.is_allowed("evil\u3002test") is True
 
     def test_fullwidth_dot_in_rule_normalized(self):
         """Fullwidth dots in rules should also be normalized."""
-        policy = AllowPolicy(["evil\uff0ecom"])
-        assert policy.is_allowed("evil.com") is True
+        policy = AllowPolicy(["evil\uff0etest"])
+        assert policy.is_allowed("evil.test") is True
 
 
 class TestPortParsingNonAsciiDigits:

@@ -20,14 +20,22 @@ feature-branch → dev (PR) → main (release merge)
 
 ## Running tests
 
+Core tests (unit + integration, some tests skip if DNS is unavailable):
+
 ```bash
-uv run pytest -v
+uv run pytest tests/ -v
 ```
 
 With coverage (100% is required — the command will fail if coverage drops below that):
 
 ```bash
-uv run pytest --cov -v
+uv run pytest tests/ --cov -v
+```
+
+Example tests (run each example script as a subprocess, requires network):
+
+```bash
+uv run pytest tests_examples/ -v
 ```
 
 ## Linting and formatting
@@ -57,13 +65,17 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) e
 
 ```text
 src/tethered/
-    __init__.py    # Public API: activate(), deactivate(), EgressBlocked, TetheredLocked
+    __init__.py    # Public API: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
     _policy.py     # AllowPolicy — pattern parsing and matching (pure logic)
-    _core.py       # Audit hook, state management, IP-to-hostname resolution
+    _core.py       # Audit hook, scope, state management, IP-to-hostname resolution
 tests/
     conftest.py     # Test-suite egress guard
     test_policy.py  # Unit tests for AllowPolicy (no network)
-    test_core.py    # Integration tests with real sockets
+    test_core.py    # Integration tests with real sockets (sync, async, scopes)
+tests_examples/
+    test_examples.py  # Runs each example/ script as a subprocess (requires network)
+examples/
+    01_basic_activate.py ... 10_package_maintainer.py  # Runnable usage examples
 ```
 
 ## Network safety in tests
@@ -100,5 +112,6 @@ Never use hostnames that could trigger unexpected connections to services with s
 
 - **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of coverage lives here.
 - **Integration tests** (`test_core.py`): Use real sockets. The `_cleanup` autouse fixture calls `_reset_state()` after each test.
-- Tests must not depend on external network availability for correctness.
+- **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
+- Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before any packet leaves the machine.
