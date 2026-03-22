@@ -827,9 +827,13 @@ def activate(
             for accidental or casual in-process disabling of tethered.
         lock_token: An opaque object required when ``locked=True`` and used
             to authenticate when replacing an existing locked policy.
-            Compared by identity (``is``), not equality.
+            Compared by identity (``is``), not equality.  Must not be a
+            ``str``, ``int``, ``float``, ``bytes``, or ``bool`` — CPython
+            interns these types, so separate literals can share identity
+            and defeat the lock.  Use ``object()`` or a custom instance.
 
     Raises:
+        TypeError: If ``lock_token`` is an internable type.
         ValueError: If ``locked=True`` is used without ``lock_token``.
         TetheredLocked: If a locked policy is active and the correct
             ``lock_token`` is not provided.
@@ -846,6 +850,14 @@ def activate(
     if locked and lock_token is None:
         msg = "tethered: lock_token is required when locked=True"
         raise ValueError(msg)
+
+    if locked and isinstance(lock_token, (str, int, float, bytes, bool)):
+        msg = (
+            "lock_token must not be a str, int, float, bytes, or bool — "
+            "these types are interned by CPython, so separate literals can "
+            "share identity and defeat the lock. Use object() or a custom instance."
+        )
+        raise TypeError(msg)
 
     policy = AllowPolicy(allow, allow_localhost=allow_localhost)
     cfg = _Config(

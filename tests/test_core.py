@@ -623,6 +623,16 @@ class TestLockedMode:
         with pytest.raises(ValueError, match="lock_token is required"):
             tethered.activate(allow=["*.example.com"], locked=True)
 
+    @pytest.mark.parametrize("token", ["secret", 42, 3.14, b"key", True])
+    def test_lock_token_rejects_internable_types(self, token):
+        with pytest.raises(TypeError, match="must not be a str"):
+            tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+
+    def test_lock_token_internable_type_allowed_when_not_locked(self):
+        """Internable lock_token types are accepted when locked=False (token is discarded)."""
+        tethered.activate(allow=["*.example.com"], lock_token="secret")
+        tethered.deactivate()  # Should succeed — policy is not locked
+
     def test_lock_token_without_locked_ignored(self):
         """lock_token without locked=True is accepted but ignored for the new policy."""
         tethered.activate(allow=["*.example.com"], lock_token=object())
