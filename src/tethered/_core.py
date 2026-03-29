@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
 
+try:
+    from tethered import _guardian as _c_guardian
+except ImportError:  # pragma: no cover
+    _c_guardian = None  # type: ignore[assignment]
+
 logger = logging.getLogger("tethered")
 
 # Maximum number of IP -> hostname entries to retain.
@@ -93,6 +98,7 @@ class _ScopeConfig:
 
 _state_lock = threading.Lock()
 _config: _Config | None = None
+_guardian_token_id: int = 0  # stored for test fixture cleanup
 
 # IP -> hostname mapping from intercepted getaddrinfo calls.
 # OrderedDict for LRU eviction: move_to_end() on access, popitem(last=False) to evict.
@@ -797,6 +803,49 @@ class scope:
         return sync_wrapper
 
 
+def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, bool]]:
+    """Build a snapshot of critical object identities for the C guardian.
+
+    Each entry is ``(owner, attr_name, check_code)`` where ``check_code``
+    indicates whether the ``__code__`` attribute should also be verified.
+
+    Snapshots ALL slots on ``_Config`` and ``AllowPolicy`` rather than a
+    hand-picked list, so new fields are automatically protected.
+    """
+    entries: list[tuple[object, str, bool]] = []
+    this = sys.modules[__name__]
+    policy = cfg.policy
+    policy_cls = type(policy)
+
+    # All _Config fields (detects object.__setattr__ on frozen dataclass)
+    for attr in _Config.__slots__:
+        entries.append((cfg, attr, False))
+
+    # All AllowPolicy internals (detects in-place mutation of rule sets)
+    for attr in AllowPolicy.__slots__:
+        entries.append((policy, attr, False))
+
+    # Policy matching methods (function + bytecode)
+    for method in ("is_allowed", "_check_hostname", "_check_ip"):
+        entries.append((policy_cls, method, True))
+
+    # Core enforcement handlers (function + bytecode)
+    for func in (
+        "_audit_hook",
+        "_handle_getaddrinfo",
+        "_handle_connect",
+        "_handle_dns_lookup",
+        "_check_scopes",
+        "_enforce_scope_block",
+    ):
+        entries.append((this, func, True))
+
+    # Exception class identity
+    entries.append((this, "EgressBlocked", False))
+
+    return entries
+
+
 def activate(
     *,
     allow: list[str],
@@ -833,12 +882,14 @@ def activate(
             and defeat the lock.  Use ``object()`` or a custom instance.
 
     Raises:
+        RuntimeError: If ``locked=True`` but the C guardian extension is
+            not available.
         TypeError: If ``lock_token`` is an internable type.
         ValueError: If ``locked=True`` is used without ``lock_token``.
         TetheredLocked: If a locked policy is active and the correct
             ``lock_token`` is not provided.
     """
-    global _config
+    global _config, _guardian_token_id
 
     _validate_allow(allow)
     _validate_bool(log_only, "log_only")
@@ -846,6 +897,14 @@ def activate(
     _validate_bool(allow_localhost, "allow_localhost")
     _validate_bool(locked, "locked")
     _validate_callback(on_blocked)
+
+    # pragma: no cover — C extension is required; build fails without it
+    if locked and _c_guardian is None:  # pragma: no cover
+        msg = (
+            "tethered: locked=True requires the C guardian extension, which is "
+            "not available. This indicates a broken installation — reinstall tethered."
+        )
+        raise RuntimeError(msg)
 
     if locked and lock_token is None:
         msg = "tethered: lock_token is required when locked=True"
@@ -869,17 +928,40 @@ def activate(
         lock_token=lock_token if locked else None,
     )
 
+    token_id = id(lock_token) if lock_token is not None else 0
+
     with _state_lock:
-        old = _config
-        if (
-            old is not None
-            and old.locked
-            and (lock_token is None or lock_token is not old.lock_token)
-        ):
-            raise TetheredLocked
+        # Check lock: C guardian is source of truth when available
+        if _c_guardian is not None and _c_guardian.is_active():
+            if not _c_guardian.check_token(token_id):
+                raise TetheredLocked
+        else:  # pragma: no cover — fallback when C guardian is unavailable
+            old = _config
+            if (
+                old is not None
+                and old.locked
+                and (lock_token is None or lock_token is not old.lock_token)
+            ):
+                raise TetheredLocked
         with _ip_map_lock:
             _config = cfg
             _ip_to_hostname.clear()
+
+    # Manage C guardian for tamper-resistant locked enforcement
+    if _c_guardian is not None:
+        if locked:
+            snapshot = _build_integrity_snapshot(cfg)
+            try:
+                _c_guardian.activate(cfg, EgressBlocked, token_id, snapshot)
+            except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
+                raise TetheredLocked from None
+            _guardian_token_id = token_id
+        elif _c_guardian.is_active():
+            try:
+                _c_guardian.deactivate(token_id)
+            except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
+                raise TetheredLocked from None
+            _guardian_token_id = 0
 
     _install_hook()
     logger.info("tethered: activated with %d rules (log_only=%s)", len(allow), log_only)
@@ -897,14 +979,23 @@ def deactivate(*, lock_token: object | None = None) -> None:
     """
     global _config
 
+    token_id = id(lock_token) if lock_token is not None else 0
+
     with _state_lock:
-        cfg = _config
-        if (
-            cfg is not None
-            and cfg.locked
-            and (lock_token is None or lock_token is not cfg.lock_token)
-        ):
-            raise TetheredLocked
+        # Check lock: C guardian is source of truth when available
+        if _c_guardian is not None and _c_guardian.is_active():
+            try:
+                _c_guardian.deactivate(token_id)
+            except RuntimeError:
+                raise TetheredLocked from None
+        else:  # pragma: no cover — fallback when C guardian is unavailable
+            cfg = _config
+            if (
+                cfg is not None
+                and cfg.locked
+                and (lock_token is None or lock_token is not cfg.lock_token)
+            ):
+                raise TetheredLocked
         with _ip_map_lock:
             _config = None
             _ip_to_hostname.clear()

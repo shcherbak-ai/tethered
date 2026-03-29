@@ -9,3 +9,9 @@ If you discover a security vulnerability in tethered, please report it
 Please avoid opening public issues for security vulnerabilities.
 
 Confirmed vulnerabilities will be addressed in a patch release.
+
+## Security Model
+
+See the [Security model](README.md#security-model) section in the README for
+the full threat model, including what tethered protects against, what it does
+not, and design trade-offs.

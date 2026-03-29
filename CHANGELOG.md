@@ -6,6 +6,28 @@ Each version listed corresponds to a release published on [PyPI](https://pypi.or
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-03-23
+
+### Added
+
+- C extension (`_guardian.c`) for tamper-resistant locked mode. Snapshots the identity
+  of every critical Python object at activation time and verifies integrity on every
+  socket event. Detects config replacement, method monkey-patching, frozen field mutation
+  via `object.__setattr__`, and bytecode swapping. On tamper detection, blocks ALL network
+  access (fail-closed) and writes a tamper alert to stderr via `os.write(fd 2)`.
+- The C extension is now required — installation fails without a C compiler (pre-built
+  wheels include the compiled extension for all platforms).
+- `cibuildwheel` CI job builds platform-specific wheels with the compiled C extension
+  for Linux, macOS, and Windows across Python 3.10–3.14.
+- Publish workflow split into a separate GitHub Actions workflow, triggered via
+  `workflow_run` after CI succeeds.
+- CodeQL now scans both Python and C/C++ code.
+- `cppcheck` static analysis for C code via Docker-based pre-commit hook.
+
+### Changed
+
+- Build backend switched from `hatchling` to `setuptools` for native C extension support.
+
 ## [0.3.3] — 2026-03-22
 
 ### Fixed
@@ -56,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[0.4.0]: https://github.com/shcherbak-ai/tethered/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/shcherbak-ai/tethered/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/shcherbak-ai/tethered/compare/v0.2.0...v0.3.2
 [0.2.0]: https://github.com/shcherbak-ai/tethered/compare/v0.1.4...v0.2.0

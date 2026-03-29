@@ -17,6 +17,9 @@ permissions:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        language: [python, c-cpp]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -24,8 +27,19 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@38697555549f1db7851b81482ff19f1fa5c4fedc  # v4
         with:
-          languages: python
+          languages: ${{ matrix.language }}
           config-file: .github/codeql/codeql-config.yml
+
+      - name: Install uv (C build)
+        if: matrix.language == 'c-cpp'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+
+      - name: Build C extension (for CodeQL tracing)
+        if: matrix.language == 'c-cpp'
+        run: |
+          uv python install 3.13
+          uv pip install setuptools
+          uv run python setup.py build_ext --inplace
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@38697555549f1db7851b81482ff19f1fa5c4fedc  # v4

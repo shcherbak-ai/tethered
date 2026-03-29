@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "tethered"
@@ -16,14 +16,15 @@ keywords = ["security", "egress", "network", "audit", "supply-chain"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Security",
     "Topic :: System :: Networking",
     "Typing :: Typed",
@@ -46,10 +47,14 @@ dev = [
     "pyright>=1.1.408",
     "interrogate>=1.7",
     "httpx>=0.28.1",
+    "setuptools>=82",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/tethered"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tethered = ["py.typed", "*.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,6 +8,9 @@ on:
     branches: [main, dev]
   workflow_dispatch:
 
+# Note: the publish workflow (.github/workflows/publish.yml) triggers
+# via workflow_run after this workflow succeeds on a tag push.
+
 permissions:
   contents: read
 
@@ -28,6 +31,14 @@ jobs:
 
       - name: Run pre-commit checks (includes pyright)
         run: uv run pre-commit run --all-files
+
+      - name: Run cppcheck on C extension
+        run: |
+          sudo apt-get install -y -qq cppcheck > /dev/null
+          cppcheck --error-exitcode=1 --enable=warning,performance,portability \
+            --suppress=missingIncludeSystem \
+            --suppress=missingReturn:src/tethered/_guardian.c \
+            src/tethered/_guardian.c
 
   test:
     runs-on: ${{ matrix.os }}
@@ -72,27 +83,3 @@ jobs:
           valColorRange: ${{ steps.coverage.outputs.pct }}
           minColorRange: 50
           maxColorRange: 100
-
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test]
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
-
-      - name: Set up Python
-        run: uv python install 3.13
-
-      - name: Build package
-        run: uv build
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0

@@ -65,7 +65,7 @@ Or with pip:
 pip install tethered
 ```
 
-Requires Python 3.10+. Zero runtime dependencies.
+Requires Python 3.10+. Zero runtime dependencies. Pre-built wheels are available for Linux, macOS, and Windows. Source installs require a C compiler (the package includes a C extension for tamper-resistant locked mode).
 
 ## Getting started
 
@@ -223,8 +223,8 @@ tethered.activate(
 | `fail_closed` | Block when the policy check itself errors, instead of failing open. Default `False`. |
 | `allow_localhost` | Allow loopback addresses (`127.0.0.0/8`, `::1`). Default `True`. |
 | `on_blocked` | Callback `(host, port) -> None` invoked on every blocked connection, including in log-only mode. |
-| `locked` | Prevent `deactivate()` and `activate()` without the correct `lock_token`. Default `False`. |
-| `lock_token` | Opaque token required when `locked=True`. Also required to replace an existing locked policy. Compared by identity (`is`), not equality. |
+| `locked` | Enable tamper-resistant enforcement via C extension. Prevents `deactivate()` and `activate()` without the correct `lock_token`, and installs a C-level integrity verifier that blocks ALL network access on tamper detection. Default `False`. See [Locked mode](#locked-mode). |
+| `lock_token` | Opaque, non-internable token required when `locked=True`. Must be an instance like `object()` — internable types (`str`, `int`, `float`, `bytes`, `bool`) are rejected with `TypeError`. Compared by identity (`is`), not equality. |
 
 Can be called multiple times to replace the active policy — calling `activate()` again does not require `deactivate()` first. If the current policy is locked, the correct `lock_token` must be provided. Each call creates a completely new policy; no parameters or state carry over from previous calls.
 
@@ -267,7 +267,7 @@ tethered logs to the `"tethered"` logger via stdlib `logging`. To see log-only w
 
 #### Locked mode
 
-Raise the bar against accidental or casual disabling of enforcement:
+Tamper-resistant enforcement backed by a C extension:
 
 ```python
 secret = object()
@@ -277,7 +277,7 @@ tethered.activate(allow=["*.stripe.com:443"], locked=True, lock_token=secret)
 tethered.deactivate(lock_token=secret)
 ```
 
-Calling `activate(locked=True)` without a `lock_token` raises `ValueError`. Calling `activate()` or `deactivate()` when a locked policy is active without the correct token raises `TetheredLocked`.
+Calling `activate()` or `deactivate()` without the correct `lock_token` raises `TetheredLocked`. See the [Security model](#security-model) for the full threat analysis.
 
 ### `tethered.deactivate()`
 
@@ -339,7 +339,8 @@ Trusted-but-buggy code and supply chain threats: dependencies that use Python's 
 - **`ctypes` / `cffi` / direct syscalls.** Native code can call libc's `connect()` directly, bypassing the audit hook.
 - **Subprocesses.** `subprocess.Popen`, `os.system`, and `os.exec*` create new processes without the audit hook.
 - **C extensions with raw socket calls.** Extensions calling C-level socket functions are not intercepted.
-- **In-process disabling.** Code in the same interpreter can call `deactivate()` or `activate()` unless `locked=True` is used. Even locked mode can be bypassed by code that modifies module state — Python has no true encapsulation.
+- **In-process disabling (without `locked=True`).** Code in the same interpreter can call `deactivate()` or `activate()` unless `locked=True` is used.
+- **`ctypes` memory manipulation (with `locked=True`).** Locked mode catches Python-level tampering: config replacement, method monkey-patching, frozen field mutation, bytecode swapping, and exception class replacement. `sys.modules` replacement is ineffective — the C guardian holds direct references to critical objects cached at activation time, so it never looks up modules through `sys.modules`. The remaining bypasses require `ctypes` to manipulate raw process memory — targeting CPython internals and/or the compiled C extension's private state. These attacks are version-specific, platform-specific, and fragile. They are not practical for opportunistic supply-chain attacks — they require a payload tailored to the exact Python version, OS, and tethered build.
 
 ### Design trade-offs
 

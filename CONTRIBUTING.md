@@ -2,6 +2,8 @@
 
 ## Setup
 
+**Prerequisites:** Python 3.10+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook).
+
 ```bash
 git clone https://github.com/shcherbak-ai/tethered.git
 cd tethered
@@ -65,15 +67,20 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) e
 
 ```text
 src/tethered/
-    __init__.py    # Public API: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
-    _policy.py     # AllowPolicy — pattern parsing and matching (pure logic)
-    _core.py       # Audit hook, scope, state management, IP-to-hostname resolution
+    __init__.py      # Public API: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
+    _policy.py       # AllowPolicy — pattern parsing and matching (pure logic)
+    _core.py         # Audit hook, scope, state management, IP-to-hostname resolution
+    _guardian.c      # C extension — integrity verifier for tamper-resistant locked mode
+    _guardian.pyi    # Type stub for the C extension
+setup.py             # Build config for the C extension (setuptools)
+scripts/
+    cppcheck.sh      # Docker-based cppcheck runner for pre-commit
 tests/
-    conftest.py     # Test-suite egress guard
-    test_policy.py  # Unit tests for AllowPolicy (no network)
-    test_core.py    # Integration tests with real sockets (sync, async, scopes)
+    conftest.py      # Test-suite egress guard
+    test_policy.py   # Unit tests for AllowPolicy (no network)
+    test_core.py     # Integration tests with real sockets (sync, async, scopes, guardian)
 tests_examples/
-    test_examples.py  # Runs each example/ script as a subprocess (requires network)
+    test_examples.py # Runs each example/ script as a subprocess (requires network)
 examples/
     01_basic_activate.py ... 10_package_maintainer.py  # Runnable usage examples
 ```
@@ -100,10 +107,24 @@ Some integration tests need real DNS resolution to verify that allowed hostnames
 
 Never use hostnames that could trigger unexpected connections to services with side effects (e.g., API endpoints, webhook URLs).
 
+## C extension
+
+The `_guardian.c` C extension provides tamper-resistant locked mode. It is built automatically by `setuptools` during `uv sync` or `pip install -e .`. A C compiler is required — the build will fail without one.
+
+### cppcheck
+
+C static analysis runs via Docker in pre-commit. Requires Docker installed and running:
+
+```bash
+uv run pre-commit run cppcheck --all-files
+```
+
+On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` with `cppcheck` installed. The image is cached by Docker for subsequent runs.
+
 ## Code conventions
 
-- Zero runtime dependencies — stdlib only.
-- `from __future__ import annotations` in all modules.
+- Zero runtime dependencies — stdlib only (including the C extension, which uses only the CPython C API).
+- `from __future__ import annotations` in all Python modules.
 - Private modules prefixed with `_`.
 - Type hints on all public functions.
 - Python 3.10+ only — no syntax from 3.12+ (`type` statement) or 3.11+ (`except*`).
@@ -111,7 +132,7 @@ Never use hostnames that could trigger unexpected connections to services with s
 ## Testing conventions
 
 - **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of coverage lives here.
-- **Integration tests** (`test_core.py`): Use real sockets. The `_cleanup` autouse fixture resets internal state after each test.
+- **Integration tests** (`test_core.py`): Use real sockets. Includes `TestCGuardian` for C extension tamper detection. The `_cleanup` autouse fixture resets internal state and deactivates the C guardian after each test.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before any packet leaves the machine.

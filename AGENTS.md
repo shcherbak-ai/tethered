@@ -14,17 +14,22 @@ tethered.activate(allow=["*.stripe.com:443", "db.internal:5432"])
 
 ```text
 src/tethered/
-    __init__.py    # Public API surface: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
-    _policy.py     # AllowPolicy — pattern parsing and matching (pure logic, no side effects)
-    _core.py       # Audit hook, _Config bundle, scope, state management, IP-to-hostname resolution
+    __init__.py      # Public API surface: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
+    _policy.py       # AllowPolicy — pattern parsing and matching (pure logic, no side effects)
+    _core.py         # Audit hook, _Config bundle, scope, state management, IP-to-hostname resolution
+    _guardian.c      # C extension — integrity verifier for tamper-resistant locked mode
+    _guardian.pyi    # Type stub for the C extension
+setup.py             # Build config for the C extension (setuptools)
+scripts/
+    cppcheck.sh      # Docker-based cppcheck runner for pre-commit
 tests/
-    conftest.py     # Test-suite egress guard — uses AllowPolicy
-    test_policy.py  # Unit tests for AllowPolicy (no hooks, no network)
-    test_core.py    # Integration tests with real sockets (sync, async, scopes)
+    conftest.py      # Test-suite egress guard — uses AllowPolicy
+    test_policy.py   # Unit tests for AllowPolicy (no hooks, no network)
+    test_core.py     # Integration tests with real sockets (sync, async, scopes, guardian)
 tests_examples/
-    test_examples.py  # Runs each example/ script as a subprocess (requires network)
+    test_examples.py # Runs each example/ script as a subprocess (requires network)
 examples/
-    *.py           # Runnable usage examples (httpx + api.github.com)
+    *.py             # Runnable usage examples (httpx + api.github.com)
 ```
 
 ### Module responsibilities
@@ -34,6 +39,8 @@ examples/
 - **`_core.py`** owns the audit hook lifecycle. It installs a single `sys.addaudithook` that intercepts `socket.getaddrinfo` and `socket.gethostbyname`/`gethostbyaddr` (to enforce DNS-level policy and map IPs back to hostnames) and `socket.connect`/`sendto`/`sendmsg` (to enforce the connection policy). All per-activation state (`policy`, `log_only`, `fail_closed`, `on_blocked`, `locked`, `lock_token`) is bundled into a frozen `_Config` dataclass that is swapped atomically under nested `_state_lock` + `_ip_map_lock` — this eliminates TOCTOU bugs between separate state reads, ensures the config and IP map are always consistent, and is safe on free-threaded Python (PEP 703). The IP-to-hostname map is an `OrderedDict` with LRU eviction. The hook is installed once and can never be removed — `deactivate()` sets `_config` to `None`, making the hook a no-op. Context-local scopes are managed by a `_ScopeConfig` dataclass, a `_scopes` `ContextVar` holding a per-context scope stack, and the `scope` class (usable as both a context manager and a decorator). The `_check_scopes` and `_enforce_scope_block` helpers are called from the audit hook to intersect scope rules with the global policy.
 
 - **`__init__.py`** re-exports the public API (`activate`, `deactivate`, `scope`, `EgressBlocked`, `TetheredLocked`). Nothing else lives here.
+
+- **`_guardian.c`** is a C extension that provides tamper-resistant locked mode. It does NOT reimplement policy matching — all matching stays in Python. Instead, it snapshots the identity (`id()`) of every critical Python object at `activate(locked=True)` time: all `_Config` fields, all `AllowPolicy` internals, enforcement handler functions (+ their `__code__`), and the `EgressBlocked` class. On every socket audit event, it re-fetches each attribute and compares pointers. Any mismatch (object replaced, method monkey-patched, frozen field mutated via `object.__setattr__`) triggers fail-closed: ALL network access is blocked and a tamper alert is written to fd 2. The C guardian also owns the lock state — `deactivate()` and `activate()` go through C for token verification, so swapping `_config` to an unlocked config doesn't help. `locked=True` requires the C extension. The extension is always built during installation — a C compiler is required for source installs.
 
 ### Key design decisions
 
@@ -45,9 +52,11 @@ examples/
 
 4. **Thread safety.** `AllowPolicy` is immutable. The `_Config` bundle is a frozen dataclass swapped atomically (single reference assignment). `_ip_to_hostname` is an `OrderedDict` guarded by `_ip_map_lock` with LRU eviction. Reentrancy guard uses `contextvars.ContextVar` (async-safe, faster than `threading.local()`).
 
-5. **Zero dependencies.** Everything uses stdlib only: `sys`, `_socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `re`, `dataclasses`, `unicodedata`, `contextvars`.
+5. **Zero runtime dependencies.** Everything uses stdlib only: `sys`, `_socket`, `threading`, `collections`, `ipaddress`, `fnmatch`, `logging`, `re`, `dataclasses`, `unicodedata`, `contextvars`. The C extension (`_guardian.c`) uses only the CPython C API. Build dependencies (`setuptools`) are build-time only.
 
 6. **Context-local scopes.** `scope()` uses `contextvars.ContextVar` to maintain a per-context stack of scope configurations, making it safe for concurrent use across threads and async tasks. Scopes use intersection semantics with the global policy — they can only narrow the set of allowed destinations, never widen it. `scope` works as both a context manager (`with tethered.scope(allow=[...]):`) and a decorator (`@tethered.scope(allow=[...])`).
+
+7. **Tamper-resistant locked mode via C extension.** When `activate(locked=True)` is called, the C guardian snapshots all critical Python objects and verifies their integrity on every socket event. This catches `_config` replacement, method monkey-patching, `object.__setattr__` on frozen dataclasses, and `__code__` swapping. The only remaining bypass is raw memory manipulation via `ctypes` (requires reverse-engineering the compiled extension).
 
 ## Conventions
 
@@ -63,7 +72,7 @@ examples/
 
 - **Egress guard** (`conftest.py`): An independent audit hook that uses `AllowPolicy` to block unexpected network access between tests (when tethered is deactivated). Only `dns.google` and localhost are allowed. When tethered IS active, its own hook handles enforcement and the guard is a no-op.
 - **Unit tests** (`test_policy.py`): Test `AllowPolicy` in isolation. No audit hooks, no network calls. This is where the bulk of pattern-matching coverage lives.
-- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Includes scope tests covering context manager usage, decorator usage, nesting, intersection semantics with the global policy, and concurrent scope isolation. Use the `_cleanup` autouse fixture that resets internal state after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
+- **Integration tests** (`test_core.py`): Test `activate()`/`deactivate()` with real sockets (sync and async). Includes scope tests covering context manager usage, decorator usage, nesting, intersection semantics with the global policy, and concurrent scope isolation. Includes `TestCGuardian` for C extension tamper detection. Use the `_cleanup` autouse fixture that resets internal state and deactivates the C guardian after each test. Async tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
 - Run core tests: `uv run pytest tests/ -v`
 - Run with coverage: `uv run pytest tests/ -v --cov`
 - Run example tests (requires network): `uv run pytest tests_examples/ -v`
@@ -80,12 +89,13 @@ examples/
 - Type check: `uv run pyright src/`
 - Docstrings: `uv run interrogate src/ -v`
 - Security: `uv run bandit -c pyproject.toml -r src/`
-- Pre-commit hooks run ruff, bandit, pyright, interrogate, and markdownlint on every commit, and commitizen on commit messages. Pyright and interrogate run as local hooks via `uv run`. Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. Third-party hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
-- CI runs `pre-commit run --all-files` (lint job, includes pyright) and the full test matrix. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow runs on push to main, on PRs, and weekly.
+- Cppcheck runs C static analysis on `_guardian.c` via a Docker-based pre-commit hook (`scripts/cppcheck.sh`). Requires Docker. Also runs in the CI lint job via `apt-get install cppcheck`.
+- Pre-commit hooks run ruff, bandit, pyright, interrogate, markdownlint, and cppcheck on every commit, and commitizen on commit messages. Pyright and interrogate run as local hooks via `uv run`. Cppcheck runs via Docker (builds a `tethered-cppcheck` image from `ubuntu:24.04` on first use). Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. Third-party hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
+- CI runs `pre-commit run --all-files` (lint job, includes pyright), `cppcheck` on the C extension, and the full test matrix. The publish job uses `cibuildwheel` to build platform-specific wheels with the compiled C extension. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow scans both Python and C/C++ code on push to main, on PRs, and weekly.
 
 ### What NOT to do
 
-- Do not add runtime dependencies. This library must remain zero-dep.
+- Do not add runtime dependencies. This library must remain zero-dep. The C extension uses only the CPython C API (no external C libraries).
 - Do not monkey-patch `socket.socket` or any other stdlib class. The audit hook API is the only interception mechanism.
 - Do not catch `EgressBlocked` inside tethered itself (except in tests). It must propagate to the caller.
 - Do not add framework-specific code (Django, Flask, etc.) to the core package. Framework integrations belong in documentation, not code.

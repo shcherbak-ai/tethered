@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import unittest.mock
 
 import pytest
 
@@ -44,6 +45,9 @@ requires_network = pytest.mark.requires_network
 def _cleanup():
     """Reset tethered state after each test."""
     yield
+    # Deactivate C guardian first (using stored token_id)
+    if _core._c_guardian is not None and _core._c_guardian.is_active():
+        _core._c_guardian.deactivate(_core._guardian_token_id)
     with _core._state_lock, _ip_map_lock:
         _core._config = None
         _ip_to_hostname.clear()
@@ -688,6 +692,243 @@ class TestLockedMode:
         # because locked defaults to False when lock_token matches old config
         tethered.activate(allow=["evil.test"], lock_token=secret)
         tethered.deactivate()  # Should succeed (new policy is not locked)
+
+
+class TestLockedRequiresCGuardian:
+    def test_locked_raises_without_c_guardian(self):
+        """locked=True raises RuntimeError if C guardian is unavailable."""
+        with (
+            unittest.mock.patch.object(_core, "_c_guardian", None),
+            pytest.raises(RuntimeError, match="C guardian extension"),
+        ):
+            tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestCGuardian:
+    """Tests for the C-level tamper detector."""
+
+    def test_guardian_activates_with_locked_mode(self):
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        assert _core._c_guardian.is_active() is True
+
+    def test_guardian_not_activated_without_locked(self):
+        tethered.activate(allow=["*.example.com"])
+        assert _core._c_guardian.is_active() is False
+
+    def test_tamper_blocks_all_network(self):
+        """Setting _config = None blocks ALL connections (fail-closed)."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        _core._config = None
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+        # Even allowed hosts are blocked after tamper
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("anything.example.com", 80)
+
+    def test_tamper_with_replacement_config(self):
+        """Replacing _config with a permissive policy is detected."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        permissive = _core._Config(policy=AllowPolicy(["evil.test"]))
+        _core._config = permissive
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_monkey_patch_policy_with_config_tamper(self):
+        """Monkey-patching is_allowed + _config=None doesn't bypass guardian."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        original = AllowPolicy.is_allowed
+        try:
+            AllowPolicy.is_allowed = lambda self, *a, **k: True
+            _core._config = None
+            with pytest.raises(tethered.EgressBlocked):
+                socket.getaddrinfo("evil.test", 80)
+        finally:
+            AllowPolicy.is_allowed = original
+
+    def test_monkey_patch_policy_without_config_tamper(self):
+        """Monkey-patching is_allowed without changing _config is also detected."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        original = AllowPolicy.is_allowed
+        try:
+            AllowPolicy.is_allowed = lambda self, *a, **k: True
+            # _config is NOT changed — guardian detects the method replacement
+            with pytest.raises(tethered.EgressBlocked):
+                socket.getaddrinfo("evil.test", 80)
+        finally:
+            AllowPolicy.is_allowed = original
+
+    def test_inplace_config_policy_mutation_detected(self):
+        """object.__setattr__(cfg, 'policy', ...) is detected."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        cfg = _core._config
+        permissive = AllowPolicy(["evil.test"])
+        object.__setattr__(cfg, "policy", permissive)
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_inplace_config_log_only_mutation_detected(self):
+        """object.__setattr__(cfg, 'log_only', True) is detected."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        cfg = _core._config
+        object.__setattr__(cfg, "log_only", True)
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_inplace_policy_internals_mutation_detected(self):
+        """Mutating AllowPolicy._exact_hosts_any_port is detected."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        policy = _core._config.policy
+        object.__setattr__(policy, "_exact_hosts_any_port", frozenset({"evil.test"}))
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_guardian_noop_when_not_tampered(self):
+        """Guardian is a no-op when _config matches (main hook enforces)."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        # Main hook should block — guardian should not interfere
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_deactivate_with_correct_token(self):
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        tethered.deactivate(lock_token=secret)
+        assert _core._c_guardian.is_active() is False
+
+    def test_deactivate_without_token_blocked_by_guardian(self):
+        """C guardian blocks deactivation even if _config is tampered to unlocked."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        # Tamper _config to an unlocked config
+        _core._config = _core._Config(policy=AllowPolicy(["*.example.com"]))
+        # deactivate() without token should STILL fail — C guardian owns the lock
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.deactivate()
+
+    def test_reactivate_requires_token_from_guardian(self):
+        """activate() over locked policy requires token from C guardian, not _config."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        _core._config = _core._Config(policy=AllowPolicy([]))  # tamper
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.activate(allow=["evil.test"], locked=True, lock_token=object())
+
+    def test_guardian_replaced_on_reactivate(self):
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        tethered.activate(allow=["*.other.com"], locked=True, lock_token=secret)
+        assert _core._c_guardian.is_active() is True
+
+    def test_tamper_alert_writes_to_stderr(self, capfd):
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        _core._config = None
+        try:
+            socket.getaddrinfo("evil.test", 80)
+        except tethered.EgressBlocked:
+            pass
+        captured = capfd.readouterr()
+        assert "TAMPER DETECTED" in captured.err
+
+    def test_sys_modules_replacement_ineffective(self):
+        """Replacing sys.modules['tethered._core'] does not bypass guardian.
+
+        The C guardian caches a direct pointer to the real module at
+        activation time and never looks it up through sys.modules.
+        """
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        real_module = sys.modules["tethered._core"]
+        try:
+            # Replace the module in sys.modules with a fake
+            fake = type(sys)("fake_core")
+            fake._config = None
+            sys.modules["tethered._core"] = fake
+            # Guardian still uses the real cached module — enforcement intact
+            with pytest.raises(tethered.EgressBlocked):
+                socket.getaddrinfo("evil.test", 80)
+        finally:
+            sys.modules["tethered._core"] = real_module
+
+    def test_concurrent_socket_during_deactivation(self):
+        """Socket events concurrent with deactivation must not crash.
+
+        Exercises the race window where a thread has passed the
+        guardian_active check and is walking the snapshot while another
+        thread deactivates (clears the snapshot).  With heap-allocated
+        snapshots this would be a use-after-free; with the static array
+        the worst case is a benign fail-closed block or a no-op.
+        """
+        secret = object()
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2, timeout=5)
+
+        def socket_storm():
+            """Hammer getaddrinfo while guardian is being deactivated."""
+            try:
+                barrier.wait()
+                for _ in range(200):
+                    try:
+                        socket.getaddrinfo("anything.example.com", 80)
+                    except (tethered.EgressBlocked, OSError):
+                        pass
+            except Exception as exc:
+                errors.append(exc)
+
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+
+        t = threading.Thread(target=socket_storm)
+        t.start()
+        barrier.wait()
+        tethered.deactivate(lock_token=secret)
+        t.join(timeout=10)
+
+        assert not t.is_alive(), "socket_storm thread hung"
+        assert not errors, f"socket_storm raised: {errors}"
+
+    def test_concurrent_socket_during_reactivation(self):
+        """Socket events concurrent with reactivation must not crash.
+
+        Exercises the snapshot swap path in build_snapshot (clear old,
+        memcpy new) while another thread is iterating the snapshot via
+        verify_integrity.
+        """
+        secret = object()
+        errors: list[BaseException] = []
+        stop = threading.Event()
+
+        def socket_storm():
+            try:
+                while not stop.is_set():
+                    try:
+                        socket.getaddrinfo("anything.example.com", 80)
+                    except (tethered.EgressBlocked, OSError):
+                        pass
+            except Exception as exc:
+                errors.append(exc)
+
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+
+        t = threading.Thread(target=socket_storm)
+        t.start()
+        # Repeatedly swap the guardian while socket events are firing
+        for _ in range(50):
+            tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        stop.set()
+        t.join(timeout=10)
+
+        assert not t.is_alive(), "socket_storm thread hung"
+        assert not errors, f"socket_storm raised: {errors}"
 
 
 class TestTetheredLockedException:
