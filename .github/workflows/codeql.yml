@@ -38,6 +38,7 @@ jobs:
         if: matrix.language == 'c-cpp'
         run: |
           uv python install 3.13
+          uv venv
           uv pip install setuptools
           uv run python setup.py build_ext --inplace
 
