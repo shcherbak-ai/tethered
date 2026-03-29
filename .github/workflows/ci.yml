@@ -9,7 +9,9 @@ on:
   workflow_dispatch:
 
 # Note: the publish workflow (.github/workflows/publish.yml) triggers
-# via workflow_run after this workflow succeeds on a tag push.
+# via workflow_run after CI succeeds. A tag push and main push may both
+# trigger CI; the publish workflow uses a concurrency group to cancel
+# the duplicate.
 
 permissions:
   contents: read
