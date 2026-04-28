@@ -100,12 +100,20 @@ jobs:
       # it.  Catches anything missing from the sdist that's needed for a
       # working source install (tethered.pth, _guardian.c, _autoactivate.py,
       # etc.) before the artifact reaches PyPI.
+      #
+      # Install into a fresh venv (not the runner's system Python).  pip on
+      # the runner's system Python falls back to ``--user`` because the
+      # system site-packages isn't writable, which lands the ``.pth`` in
+      # ``~/.local/...`` — but ``sysconfig.get_path("purelib")`` (used by
+      # ``wheel_smoke_test.py``) returns the *system* purelib, so the smoke
+      # test would falsely report a missing ``.pth``.  A venv has a writable
+      # purelib that ``sysconfig`` reports correctly.
       - name: Verify sdist roundtrip
         run: |
-          python -m pip install --upgrade pip
-          python -m pip wheel dist/tethered-*.tar.gz -w wheelhouse-from-sdist/ --no-deps
-          python -m pip install wheelhouse-from-sdist/tethered-*.whl
-          python scripts/wheel_smoke_test.py
+          uv venv --seed /tmp/sdist-verify
+          /tmp/sdist-verify/bin/python -m pip wheel dist/tethered-*.tar.gz -w wheelhouse-from-sdist/ --no-deps
+          /tmp/sdist-verify/bin/python -m pip install wheelhouse-from-sdist/tethered-*.whl
+          /tmp/sdist-verify/bin/python scripts/wheel_smoke_test.py
 
       - name: Upload sdist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

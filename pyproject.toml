@@ -99,6 +99,7 @@ version_files = [
     "CITATION.cff:version",
 ]
 tag_format = "v$version"
+annotated_tag = true
 pre_bump_hooks = [
     "uv lock --no-upgrade",
     "git add uv.lock",
