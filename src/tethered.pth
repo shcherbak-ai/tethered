@@ -1,0 +1,1 @@
+import os; "_TETHERED_CHILD_POLICY" in os.environ and __import__("tethered._autoactivate")

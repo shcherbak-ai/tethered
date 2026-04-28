@@ -13,8 +13,7 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 
 ## Branching
 
-The default branch is `main`. All pull requests should target `dev`.
-The `main` branch is for releases only — `dev` is the working branch.
+The default branch is `main`. All pull requests should target `dev`. The `main` branch is for releases only — `dev` is the working branch.
 
 ```text
 feature-branch → dev (PR) → main (release merge)
@@ -54,7 +53,7 @@ Individual tools:
 uv run ruff check .        # lint
 uv run ruff check --fix .  # lint with auto-fix
 uv run ruff format .       # format
-uv run pyright src/        # type check
+uv run ty check src/ examples/   # type check
 uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 ```
@@ -67,22 +66,30 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) e
 
 ```text
 src/tethered/
-    __init__.py      # Public API: activate(), deactivate(), scope, EgressBlocked, TetheredLocked
-    _policy.py       # AllowPolicy — pattern parsing and matching (pure logic)
-    _core.py         # Audit hook, scope, state management, IP-to-hostname resolution
-    _guardian.c      # C extension — integrity verifier for tamper-resistant locked mode
-    _guardian.pyi    # Type stub for the C extension
-setup.py             # Build config for the C extension (setuptools)
+    __init__.py           # Public API: activate, deactivate, scope, EgressBlocked, TetheredLocked, SubprocessBlocked
+    _policy.py            # AllowPolicy — pattern parsing and matching (pure logic)
+    _core.py              # Audit hook, scope, subprocess propagation, state management, IP-to-hostname
+    _autoactivate.py      # Child-process bootstrap — reads _TETHERED_CHILD_POLICY and re-activates
+    _guardian.c           # C extension — integrity verifier for tamper-resistant locked mode
+    _guardian.pyi         # Type stub for the C extension
+src/tethered.pth          # Auto-imported by site.py — runs _autoactivate in every Python interpreter
+setup.py                  # Build config: C extension + tethered.pth packaging (setuptools)
 scripts/
-    cppcheck.sh      # Docker-based cppcheck runner for pre-commit
+    cppcheck.sh           # Docker-based cppcheck runner for pre-commit
+    wheel_smoke_test.py   # Post-build smoke test invoked by cibuildwheel
 tests/
-    conftest.py      # Test-suite egress guard
-    test_policy.py   # Unit tests for AllowPolicy (no network)
-    test_core.py     # Integration tests with real sockets (sync, async, scopes, guardian)
+    conftest.py           # Test-suite egress guard + .pth installer for editable installs
+    test_policy.py        # Unit tests for AllowPolicy (no network)
+    test_core.py          # Integration tests with real sockets (sync, async, scopes)
+    test_subprocess.py    # Subprocess audit, scope propagation, locked-mode integrity, perf
+    test_autoactivate.py  # Child-side bootstrap parsing + scope inheritance
+    test_guardian.py      # C extension tamper detection
 tests_examples/
-    test_examples.py # Runs each example/ script as a subprocess (requires network)
+    test_examples.py      # Runs each example/ script as a subprocess (requires network)
 examples/
-    01_basic_activate.py ... 10_package_maintainer.py  # Runnable usage examples
+    01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
+docs/
+    API.md, ARCHITECTURE.md, COOKBOOK.md, SUBPROCESS.md  # Detailed reference
 ```
 
 ## Network safety in tests
@@ -131,8 +138,11 @@ On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` wi
 
 ## Testing conventions
 
-- **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of coverage lives here.
-- **Integration tests** (`test_core.py`): Use real sockets. Includes `TestCGuardian` for C extension tamper detection. The `_cleanup` autouse fixture resets internal state and deactivates the C guardian after each test.
+- **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of pattern-matching coverage lives here.
+- **Integration tests** (`test_core.py`): Use real sockets. Sync + async + scope intersection semantics. The `_cleanup` autouse fixture resets internal state, deactivates the C guardian, and clears `_TETHERED_CHILD_POLICY` between tests.
+- **Subprocess tests** (`test_subprocess.py`): `external_subprocess_policy` enforcement, locked-mode payload-integrity check, scope-to-subprocess propagation (round-trip, multi-thread, locked + scope), frame-locals helper unit tests, Windows command-line parser tests, locked-mode `tethered.pth` FS-tamper hook, and microbenchmarks bounding the audit-hook helpers' per-call cost.
+- **Autoactivate tests** (`test_autoactivate.py`): Direct unit tests for `_autoactivate_from_env()` plus end-to-end integration tests that spawn real Python subprocesses to verify the `.pth` bootstrap chain and scope inheritance.
+- **Guardian tests** (`test_guardian.py`): C extension tamper detection — replaces `_config`, monkey-patches `is_allowed`, mutates frozen-dataclass slots via `object.__setattr__`, replaces helper functions; all should fail-closed.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before any packet leaves the machine.

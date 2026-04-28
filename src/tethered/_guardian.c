@@ -6,6 +6,12 @@
  * each object and compares — any mismatch means tampering, and ALL network
  * access is blocked (fail-closed).
  *
+ * Also owns trusted reentrancy state for DNS resolution.  The Python-side
+ * _in_hook ContextVar is a convenience flag; in locked mode, the C guardian
+ * verifies its value against its own thread-local counter.  A mismatch
+ * means someone set the ContextVar from Python without going through the
+ * trusted C path (_guardian.resolve()).
+ *
  * No policy matching in C.  Zero duplication of Python logic.
  */
 
@@ -18,6 +24,19 @@
 #  define write _write
 #else
 #  include <unistd.h>
+#endif
+
+/* ── Thread-local storage ───────────────────────────────────────── */
+
+#if defined(_MSC_VER)
+#  define THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define THREAD_LOCAL __thread
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
+      && !defined(__STDC_NO_THREADS__)
+#  define THREAD_LOCAL _Thread_local
+#else
+#  define THREAD_LOCAL  /* fallback: not thread-safe, but still functional */
 #endif
 
 /* ── Snapshot entry ──────────────────────────────────────────────── */
@@ -60,11 +79,34 @@ static ATOMIC_INT       tamper_alerted = 0;
 static PyObject        *core_module = NULL;
 static PyObject        *egress_blocked_cls = NULL; /* strong ref */
 
+/* Cached ContextVar object (strong ref) */
+static PyObject        *in_hook_var = NULL;        /* _in_hook ContextVar */
+
+/* Cached _socket module for resolve() */
+static PyObject        *csocket_module = NULL;
+
+/* Cached __code__ objects for caller verification of resolve() (strong refs).
+ * Slot 0: _handle_getaddrinfo (the audit-hook DNS path).
+ * Slot 1: _fallback_resolve   (the connect-time re-resolution path used to
+ *                              repair DNS divergence under gevent +
+ *                              load-balanced services).
+ * NULL slots are skipped — fail closed if every slot is NULL. */
+#define EXPECTED_CALLER_COUNT 2
+static PyObject        *expected_caller_codes[EXPECTED_CALLER_COUNT] = { NULL, NULL };
+static const char      *expected_caller_names[EXPECTED_CALLER_COUNT] = {
+    "_handle_getaddrinfo",
+    "_fallback_resolve",
+};
+
+/* Thread-local trusted reentrancy counter for DNS resolution.
+ * Invisible to Python — only C functions can modify it. */
+static THREAD_LOCAL int resolving_depth = 0;
+
 /*
  * Static array — never freed, so a racing thread that slipped past the
  * guardian_active check reads zeroed-but-valid memory (fail-closed) rather
  * than freed heap memory (undefined behavior).  128 entries is generous;
- * the current snapshot uses ~27.
+ * the current snapshot uses ~28.
  */
 #define MAX_SNAPSHOT 128
 static SnapshotEntry    snapshot[MAX_SNAPSHOT];
@@ -100,6 +142,25 @@ raise_blocked(const char *host)
         PyErr_Format(PyExc_RuntimeError,
                      "Blocked by tethered (integrity violation): %s", host);
     return -1;
+}
+
+/* Helper: raise EgressBlocked from a Python-callable function (returns NULL). */
+static PyObject *
+raise_blocked_py(const char *desc)
+{
+    write_tamper_alert();
+    if (egress_blocked_cls != NULL) {
+        PyObject *exc = PyObject_CallFunction(
+            egress_blocked_cls, "sO", desc, Py_None);
+        if (exc != NULL) {
+            PyErr_SetObject(egress_blocked_cls, exc);
+            Py_DECREF(exc);
+        }
+    }
+    if (!PyErr_Occurred())
+        PyErr_Format(PyExc_RuntimeError,
+                     "Blocked by tethered (integrity violation): %s", desc);
+    return NULL;
 }
 
 /* ── Integrity verification ──────────────────────────────────────── */
@@ -160,6 +221,52 @@ verify_integrity(void)
     return 1; /* integrity intact */
 }
 
+/* ── ContextVar consistency check ───────────────────────────────── */
+
+/*
+ * Verify that the _in_hook ContextVar matches C-owned trusted state.
+ *
+ * _in_hook should only be True when resolving_depth > 0 (i.e., we are
+ * inside _guardian.resolve()).  Only relevant for socket events.
+ *
+ * Returns 1 if consistent, 0 if tampered.
+ */
+static int
+check_contextvar_consistency(int is_socket)
+{
+    /* Use PyContextVar_Get (direct C API) instead of PyObject_CallMethod —
+     * this is the audit-event hot path, and method dispatch through Python
+     * adds measurable overhead.  The ContextVar carries a registered default
+     * of False, so passing NULL for default_value yields a strong reference
+     * to the default when the var is unset in this context. */
+    if (is_socket && in_hook_var != NULL) {
+        PyObject *val = NULL;
+        if (PyContextVar_Get(in_hook_var, NULL, &val) == 0 && val != NULL) {
+            int is_true = PyObject_IsTrue(val);
+            Py_DECREF(val);
+            if (is_true && resolving_depth == 0)
+                return 0; /* _in_hook True without C-owned resolution */
+        } else {
+            PyErr_Clear();
+        }
+    }
+
+    return 1; /* consistent */
+}
+
+/* ── Subprocess event check ──────────────────────────────────────── */
+
+static int
+is_subprocess_event(const char *event)
+{
+    return (strcmp(event, "subprocess.Popen") == 0 ||
+            strcmp(event, "os.system") == 0 ||
+            strcmp(event, "os.exec") == 0 ||
+            strcmp(event, "os.posix_spawn") == 0 ||
+            strcmp(event, "os.spawn") == 0 ||
+            strcmp(event, "os.startfile") == 0);
+}
+
 /* ── The C audit hook ────────────────────────────────────────────── */
 
 static int
@@ -170,22 +277,44 @@ guardian_hook(const char *event, PyObject *args, void *userData)
     if (!ATOMIC_LOAD(guardian_active))
         return 0;
 
-    if (strncmp(event, "socket.", 7) != 0)
+    int is_socket = (strncmp(event, "socket.", 7) == 0);
+    if (!is_socket && !is_subprocess_event(event))
         return 0;
+
+    /* Fast path: legitimate recursion from our own resolve() */
+    if (is_socket && resolving_depth > 0)
+        return 0;
+
+    /* Check ContextVar consistency BEFORE integrity check.
+     * Detects _in_hook.set(True) without corresponding C-owned trusted state. */
+    if (!check_contextvar_consistency(is_socket)) {
+        write_tamper_alert();
+
+        const char *host = "unknown (ContextVar tamper)";
+        if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
+            PyObject *h = PyTuple_GET_ITEM(args, 0);
+            if (PyUnicode_Check(h)) {
+                const char *s = PyUnicode_AsUTF8(h);
+                if (s) host = s;
+            }
+        }
+        return raise_blocked(host);
+    }
 
     if (verify_integrity())
         return 0; /* All good — Python hook handles enforcement */
 
-    /* TAMPER DETECTED — block ALL network access */
+    /* TAMPER DETECTED — block ALL network/subprocess access */
     write_tamper_alert();
 
-    /* Extract hostname for the error message */
+    /* Extract context for the error message */
     const char *host = "unknown";
     if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
         PyObject *h = PyTuple_GET_ITEM(args, 0);
-        if (strcmp(event, "socket.connect") == 0 ||
-            strcmp(event, "socket.sendto") == 0 ||
-            strcmp(event, "socket.sendmsg") == 0) {
+        if (is_socket &&
+            (strcmp(event, "socket.connect") == 0 ||
+             strcmp(event, "socket.sendto") == 0 ||
+             strcmp(event, "socket.sendmsg") == 0)) {
             if (PyTuple_GET_SIZE(args) >= 2) {
                 PyObject *addr = PyTuple_GET_ITEM(args, 1);
                 if (PyTuple_Check(addr) && PyTuple_GET_SIZE(addr) >= 1)
@@ -289,6 +418,18 @@ fail:
     return -1;
 }
 
+/* ── Helper: cache a function's __code__ from core_module ────────── */
+
+static PyObject *
+cache_func_code(const char *func_name)
+{
+    PyObject *func = PyObject_GetAttrString(core_module, func_name);
+    if (func == NULL) return NULL;
+    PyObject *code = PyObject_GetAttrString(func, "__code__");
+    Py_DECREF(func);
+    return code; /* caller owns the reference; may be NULL on error */
+}
+
 /* ── Python-callable functions ───────────────────────────────────── */
 
 static PyObject *
@@ -334,6 +475,30 @@ py_activate(PyObject *self, PyObject *args)
             return NULL;
     }
 
+    /* Cache _socket module for resolve() */
+    if (csocket_module == NULL) {
+        csocket_module = PyImport_ImportModule("_socket");
+        if (csocket_module == NULL)
+            return NULL;
+    }
+
+    /* Cache ContextVar object */
+    Py_XDECREF(in_hook_var);
+    in_hook_var = PyObject_GetAttrString(core_module, "_in_hook");
+    if (in_hook_var == NULL) { PyErr_Clear(); }
+
+    /* Cache expected __code__ objects for caller verification of resolve(). */
+    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
+        Py_XDECREF(expected_caller_codes[i]);
+        expected_caller_codes[i] = cache_func_code(expected_caller_names[i]);
+        if (expected_caller_codes[i] == NULL) {
+            /* Best-effort: a missing helper means that path can't be
+             * authorized.  PyErr is cleared so activate() doesn't fault;
+             * resolve() will fail closed for the missing slot. */
+            PyErr_Clear();
+        }
+    }
+
     /* Install audit hook once */
     static int hook_installed = 0;
     if (!hook_installed) {
@@ -367,6 +532,11 @@ py_deactivate(PyObject *self, PyObject *args)
     clear_snapshot();
     Py_CLEAR(guardian_config);
     Py_CLEAR(egress_blocked_cls);
+    Py_CLEAR(in_hook_var);
+    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
+        Py_CLEAR(expected_caller_codes[i]);
+    }
+    /* csocket_module kept alive — harmless, avoids re-import */
     guardian_token_id = 0;
     ATOMIC_STORE(tamper_alerted, 0);
 
@@ -392,6 +562,65 @@ py_check_token(PyObject *self, PyObject *args)
     return PyBool_FromLong(token_id == guardian_token_id);
 }
 
+/* ── C-guarded DNS resolution ───────────────────────────────────── */
+
+/*
+ * resolve(host, port, family, type, proto, flags) → list
+ *
+ * Wraps _socket.getaddrinfo with a C-internal resolving_depth counter
+ * that the guardian hook trusts.  When the guardian is active, also
+ * verifies that the caller is _handle_getaddrinfo (frame __code__ check).
+ */
+static PyObject *
+py_resolve(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *host, *port;
+    int family = 0, socktype = 0, proto = 0, flags = 0;
+
+    if (!PyArg_ParseTuple(args, "OOiiii",
+                          &host, &port, &family, &socktype, &proto, &flags))
+        return NULL;
+
+    /* Caller verification: only the cached authorized callers
+     * (_handle_getaddrinfo and _fallback_resolve) may call this.
+     * Fail closed if no Python frame is available — a missing frame means
+     * the caller is non-Python (e.g. a C extension) and cannot be verified,
+     * so we cannot grant trust.  All-NULL slots also fail closed (no
+     * authorized caller registered → resolve unavailable). */
+    if (ATOMIC_LOAD(guardian_active)) {
+        PyFrameObject *frame = PyEval_GetFrame();
+        if (frame == NULL)
+            return raise_blocked_py("unauthorized _guardian.resolve() call");
+        PyCodeObject *code = PyFrame_GetCode(frame);  /* strong ref */
+        int valid = 0;
+        for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
+            PyObject *expected = expected_caller_codes[i];
+            if (expected != NULL && (PyObject *)code == expected) {
+                valid = 1;
+                break;
+            }
+        }
+        Py_DECREF(code);
+        if (!valid)
+            return raise_blocked_py("unauthorized _guardian.resolve() call");
+    }
+
+    if (csocket_module == NULL) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "tethered: _guardian not activated (no _socket module)");
+        return NULL;
+    }
+
+    resolving_depth++;
+    PyObject *result = PyObject_CallMethod(
+        csocket_module, "getaddrinfo", "OOiiii",
+        host, port, family, socktype, proto, flags);
+    resolving_depth--;
+
+    return result;
+}
+
 /* ── Module definition ───────────────────────────────────────────── */
 
 static PyMethodDef guardian_methods[] = {
@@ -403,6 +632,8 @@ static PyMethodDef guardian_methods[] = {
      "Return True if the guardian is active."},
     {"check_token", py_check_token, METH_VARARGS,
      "Return True if token_id matches."},
+    {"resolve",     py_resolve,     METH_VARARGS,
+     "C-guarded DNS resolution with caller verification."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -411,7 +642,8 @@ static struct PyModuleDef guardian_module = {
     "tethered._guardian",
     "C-level integrity verifier for tethered locked mode.\n\n"
     "Snapshots identity of all critical Python objects at activation.\n"
-    "On tamper detection, blocks ALL network access (fail-closed).",
+    "On tamper detection, blocks ALL network access (fail-closed).\n"
+    "Owns trusted reentrancy state for DNS resolution.",
     -1,
     guardian_methods
 };

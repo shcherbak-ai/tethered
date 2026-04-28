@@ -28,9 +28,9 @@ repos:
 
   - repo: local
     hooks:
-      - id: pyright
-        name: pyright
-        entry: uv run pyright src/
+      - id: ty
+        name: ty
+        entry: uv run ty check src/ examples/
         language: system
         types: [python]
         pass_filenames: false

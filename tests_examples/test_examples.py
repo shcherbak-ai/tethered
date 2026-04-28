@@ -29,6 +29,8 @@ EXAMPLE_SCRIPTS = [
     EXAMPLES_DIR / "08_scope_in_threads.py",
     EXAMPLES_DIR / "09_async_scope.py",
     EXAMPLES_DIR / "10_package_maintainer.py",
+    EXAMPLES_DIR / "11_subprocess_control.py",
+    EXAMPLES_DIR / "12_scope_subprocess.py",
 ]
 
 

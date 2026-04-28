@@ -5,10 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-import subprocess
-import sys
 import threading
-import unittest.mock
 
 import pytest
 
@@ -39,19 +36,6 @@ def _raise_runtime(self, host, port=None):
 
 
 requires_network = pytest.mark.requires_network
-
-
-@pytest.fixture(autouse=True)
-def _cleanup():
-    """Reset tethered state after each test."""
-    yield
-    # Deactivate C guardian first (using stored token_id)
-    if _core._c_guardian is not None and _core._c_guardian.is_active():
-        _core._c_guardian.deactivate(_core._guardian_token_id)
-    with _core._state_lock, _ip_map_lock:
-        _core._config = None
-        _ip_to_hostname.clear()
-    _scopes.set(())
 
 
 class TestInputValidation:
@@ -548,6 +532,96 @@ class TestEgressBlockedException:
         assert issubclass(tethered.EgressBlocked, RuntimeError)
         assert isinstance(tethered.EgressBlocked("h", 1), RuntimeError)
 
+    def test_scope_label_attribute_default_is_none(self):
+        """Without a scope-driven block, ``scope_label`` is ``None``."""
+        exc = tethered.EgressBlocked("evil.test", 443)
+        assert exc.scope_label is None
+        assert "blocked by" not in str(exc)
+
+    def test_scope_label_appears_in_message_when_provided(self):
+        """When a scope produced the block, the label is part of the message."""
+        exc = tethered.EgressBlocked("evil.test", 443, scope_label="scope(api.mylib.com:443)")
+        assert exc.scope_label == "scope(api.mylib.com:443)"
+        assert "(blocked by scope(api.mylib.com:443))" in str(exc)
+
+    def test_scope_label_set_when_scope_blocks_real_call(self):
+        """End-to-end: a scope-driven block raises with ``scope_label`` populated."""
+        tethered.activate(allow=["*.allowed.com"])
+        with tethered.scope(allow=["api.allowed.com"]):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_label is not None
+                assert "scope(" in exc.scope_label
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_scope_label_none_when_global_blocks(self):
+        """A block from the global policy (no scope on the stack) has ``scope_label=None``."""
+        tethered.activate(allow=["*.allowed.com"])
+        try:
+            socket.getaddrinfo("evil.test", 80)
+        except tethered.EgressBlocked as exc:
+            assert exc.scope_label is None
+        else:
+            pytest.fail("expected EgressBlocked")
+
+    def test_user_provided_scope_label_propagates_to_egress_blocked(self):
+        """A ``label=`` passed to scope() shows up as ``EgressBlocked.scope_label``."""
+        tethered.activate(allow=["*.allowed.com"])
+        with tethered.scope(allow=["api.allowed.com"], label="WeatherClient.fetch"):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_label == "WeatherClient.fetch"
+                assert "(blocked by WeatherClient.fetch)" in str(exc)
+            else:
+                pytest.fail("expected EgressBlocked")
+
+
+class TestScopeLabelParam:
+    """Tests for the ``label=`` parameter on scope()."""
+
+    def test_default_label_auto_derived_from_allow(self):
+        """Without ``label=``, the auto-derived ``scope(<rules>)`` form is used."""
+        s = tethered.scope(allow=["api.example.com:443"])
+        assert s._scope_cfg.label == "scope(api.example.com:443)"
+
+    def test_custom_label_used_verbatim(self):
+        """A user-provided ``label=`` is stored verbatim, no ``scope(...)`` wrapper added."""
+        s = tethered.scope(allow=["api.example.com:443"], label="MyClient.fetch")
+        assert s._scope_cfg.label == "MyClient.fetch"
+
+    def test_label_appears_in_log_warning(self, caplog):
+        """The label is what shows up in log messages when the scope blocks."""
+        tethered.activate(allow=["*.allowed.com"])
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            tethered.scope(allow=["api.allowed.com"], label="lib.task"),
+        ):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked:
+                pass
+        assert any("lib.task blocked" in r.message for r in caplog.records)
+
+    def test_invalid_label_type_raises(self):
+        """Non-str, non-None ``label`` is rejected at construction time."""
+        with pytest.raises(TypeError, match="label must be a str or None"):
+            tethered.scope(allow=[], label=123)
+        with pytest.raises(TypeError, match="label must be a str or None"):
+            tethered.scope(allow=[], label=object())
+
+    def test_explicit_none_label_uses_default(self):
+        """``label=None`` is equivalent to omitting the parameter."""
+        s = tethered.scope(allow=["api.example.com"], label=None)
+        assert s._scope_cfg.label == "scope(api.example.com)"
+
+    def test_empty_string_label_preserved(self):
+        """An empty string is a valid label and is NOT replaced by the auto-derived default."""
+        s = tethered.scope(allow=["api.example.com"], label="")
+        assert s._scope_cfg.label == ""
+
 
 class TestFailOpen:
     @requires_network
@@ -620,326 +694,6 @@ class TestFailClosed:
         monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
         with pytest.raises(tethered.EgressBlocked):
             _audit_hook("socket.gethostbyname", ("evil.test",))
-
-
-class TestLockedMode:
-    def test_locked_activation_requires_token(self):
-        with pytest.raises(ValueError, match="lock_token is required"):
-            tethered.activate(allow=["*.example.com"], locked=True)
-
-    @pytest.mark.parametrize("token", ["secret", 42, 3.14, b"key", True])
-    def test_lock_token_rejects_internable_types(self, token):
-        with pytest.raises(TypeError, match="must not be a str"):
-            tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
-
-    def test_lock_token_internable_type_allowed_when_not_locked(self):
-        """Internable lock_token types are accepted when locked=False (token is discarded)."""
-        tethered.activate(allow=["*.example.com"], lock_token="secret")
-        tethered.deactivate()  # Should succeed — policy is not locked
-
-    def test_lock_token_without_locked_ignored(self):
-        """lock_token without locked=True is accepted but ignored for the new policy."""
-        tethered.activate(allow=["*.example.com"], lock_token=object())
-        tethered.deactivate()  # Should succeed — policy is not locked
-
-    def test_locked_deactivate_without_token_raises(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        with pytest.raises(tethered.TetheredLocked):
-            tethered.deactivate()
-
-    def test_locked_deactivate_with_wrong_token_raises(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        with pytest.raises(tethered.TetheredLocked):
-            tethered.deactivate(lock_token=object())
-
-    @requires_network
-    def test_locked_deactivate_with_correct_token_succeeds(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        tethered.deactivate(lock_token=secret)
-        # After deactivation, tethered no longer blocks
-        socket.getaddrinfo("dns.google", 80)
-
-    def test_locked_policy_still_enforces(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_reactivate_over_locked_requires_token(self):
-        """activate() over a locked policy requires the correct lock_token."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        with pytest.raises(tethered.TetheredLocked):
-            tethered.activate(allow=["evil.test"])
-
-    def test_reactivate_over_locked_with_correct_token(self):
-        """activate() with the correct lock_token replaces a locked policy."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        tethered.activate(allow=["evil.test"], lock_token=secret, locked=True)
-        # New policy is active
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("other.com", 80)
-
-    def test_reactivate_over_locked_unlocked_replacement(self):
-        """activate() with correct token can replace locked with unlocked policy."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        # Same token authenticates against old policy; new policy is unlocked
-        # because locked defaults to False when lock_token matches old config
-        tethered.activate(allow=["evil.test"], lock_token=secret)
-        tethered.deactivate()  # Should succeed (new policy is not locked)
-
-
-class TestLockedRequiresCGuardian:
-    def test_locked_raises_without_c_guardian(self):
-        """locked=True raises RuntimeError if C guardian is unavailable."""
-        with (
-            unittest.mock.patch.object(_core, "_c_guardian", None),
-            pytest.raises(RuntimeError, match="C guardian extension"),
-        ):
-            tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
-
-
-@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
-class TestCGuardian:
-    """Tests for the C-level tamper detector."""
-
-    def test_guardian_activates_with_locked_mode(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        assert _core._c_guardian.is_active() is True
-
-    def test_guardian_not_activated_without_locked(self):
-        tethered.activate(allow=["*.example.com"])
-        assert _core._c_guardian.is_active() is False
-
-    def test_tamper_blocks_all_network(self):
-        """Setting _config = None blocks ALL connections (fail-closed)."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        _core._config = None
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-        # Even allowed hosts are blocked after tamper
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("anything.example.com", 80)
-
-    def test_tamper_with_replacement_config(self):
-        """Replacing _config with a permissive policy is detected."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        permissive = _core._Config(policy=AllowPolicy(["evil.test"]))
-        _core._config = permissive
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_monkey_patch_policy_with_config_tamper(self):
-        """Monkey-patching is_allowed + _config=None doesn't bypass guardian."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        original = AllowPolicy.is_allowed
-        try:
-            AllowPolicy.is_allowed = lambda self, *a, **k: True
-            _core._config = None
-            with pytest.raises(tethered.EgressBlocked):
-                socket.getaddrinfo("evil.test", 80)
-        finally:
-            AllowPolicy.is_allowed = original
-
-    def test_monkey_patch_policy_without_config_tamper(self):
-        """Monkey-patching is_allowed without changing _config is also detected."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        original = AllowPolicy.is_allowed
-        try:
-            AllowPolicy.is_allowed = lambda self, *a, **k: True
-            # _config is NOT changed — guardian detects the method replacement
-            with pytest.raises(tethered.EgressBlocked):
-                socket.getaddrinfo("evil.test", 80)
-        finally:
-            AllowPolicy.is_allowed = original
-
-    def test_inplace_config_policy_mutation_detected(self):
-        """object.__setattr__(cfg, 'policy', ...) is detected."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        cfg = _core._config
-        permissive = AllowPolicy(["evil.test"])
-        object.__setattr__(cfg, "policy", permissive)
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_inplace_config_log_only_mutation_detected(self):
-        """object.__setattr__(cfg, 'log_only', True) is detected."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        cfg = _core._config
-        object.__setattr__(cfg, "log_only", True)
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_inplace_policy_internals_mutation_detected(self):
-        """Mutating AllowPolicy._exact_hosts_any_port is detected."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        policy = _core._config.policy
-        object.__setattr__(policy, "_exact_hosts_any_port", frozenset({"evil.test"}))
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_guardian_noop_when_not_tampered(self):
-        """Guardian is a no-op when _config matches (main hook enforces)."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        # Main hook should block — guardian should not interfere
-        with pytest.raises(tethered.EgressBlocked):
-            socket.getaddrinfo("evil.test", 80)
-
-    def test_deactivate_with_correct_token(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        tethered.deactivate(lock_token=secret)
-        assert _core._c_guardian.is_active() is False
-
-    def test_deactivate_without_token_blocked_by_guardian(self):
-        """C guardian blocks deactivation even if _config is tampered to unlocked."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        # Tamper _config to an unlocked config
-        _core._config = _core._Config(policy=AllowPolicy(["*.example.com"]))
-        # deactivate() without token should STILL fail — C guardian owns the lock
-        with pytest.raises(tethered.TetheredLocked):
-            tethered.deactivate()
-
-    def test_reactivate_requires_token_from_guardian(self):
-        """activate() over locked policy requires token from C guardian, not _config."""
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        _core._config = _core._Config(policy=AllowPolicy([]))  # tamper
-        with pytest.raises(tethered.TetheredLocked):
-            tethered.activate(allow=["evil.test"], locked=True, lock_token=object())
-
-    def test_guardian_replaced_on_reactivate(self):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        tethered.activate(allow=["*.other.com"], locked=True, lock_token=secret)
-        assert _core._c_guardian.is_active() is True
-
-    def test_tamper_alert_writes_to_stderr(self, capfd):
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        _core._config = None
-        try:
-            socket.getaddrinfo("evil.test", 80)
-        except tethered.EgressBlocked:
-            pass
-        captured = capfd.readouterr()
-        assert "TAMPER DETECTED" in captured.err
-
-    def test_sys_modules_replacement_ineffective(self):
-        """Replacing sys.modules['tethered._core'] does not bypass guardian.
-
-        The C guardian caches a direct pointer to the real module at
-        activation time and never looks it up through sys.modules.
-        """
-        secret = object()
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        real_module = sys.modules["tethered._core"]
-        try:
-            # Replace the module in sys.modules with a fake
-            fake = type(sys)("fake_core")
-            fake._config = None
-            sys.modules["tethered._core"] = fake
-            # Guardian still uses the real cached module — enforcement intact
-            with pytest.raises(tethered.EgressBlocked):
-                socket.getaddrinfo("evil.test", 80)
-        finally:
-            sys.modules["tethered._core"] = real_module
-
-    def test_concurrent_socket_during_deactivation(self):
-        """Socket events concurrent with deactivation must not crash.
-
-        Exercises the race window where a thread has passed the
-        guardian_active check and is walking the snapshot while another
-        thread deactivates (clears the snapshot).  With heap-allocated
-        snapshots this would be a use-after-free; with the static array
-        the worst case is a benign fail-closed block or a no-op.
-        """
-        secret = object()
-        errors: list[BaseException] = []
-        barrier = threading.Barrier(2, timeout=5)
-
-        def socket_storm():
-            """Hammer getaddrinfo while guardian is being deactivated."""
-            try:
-                barrier.wait()
-                for _ in range(200):
-                    try:
-                        socket.getaddrinfo("anything.example.com", 80)
-                    except (tethered.EgressBlocked, OSError):
-                        pass
-            except Exception as exc:
-                errors.append(exc)
-
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-
-        t = threading.Thread(target=socket_storm)
-        t.start()
-        barrier.wait()
-        tethered.deactivate(lock_token=secret)
-        t.join(timeout=10)
-
-        assert not t.is_alive(), "socket_storm thread hung"
-        assert not errors, f"socket_storm raised: {errors}"
-
-    def test_concurrent_socket_during_reactivation(self):
-        """Socket events concurrent with reactivation must not crash.
-
-        Exercises the snapshot swap path in build_snapshot (clear old,
-        memcpy new) while another thread is iterating the snapshot via
-        verify_integrity.
-        """
-        secret = object()
-        errors: list[BaseException] = []
-        stop = threading.Event()
-
-        def socket_storm():
-            try:
-                while not stop.is_set():
-                    try:
-                        socket.getaddrinfo("anything.example.com", 80)
-                    except (tethered.EgressBlocked, OSError):
-                        pass
-            except Exception as exc:
-                errors.append(exc)
-
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-
-        t = threading.Thread(target=socket_storm)
-        t.start()
-        # Repeatedly swap the guardian while socket events are firing
-        for _ in range(50):
-            tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
-        stop.set()
-        t.join(timeout=10)
-
-        assert not t.is_alive(), "socket_storm thread hung"
-        assert not errors, f"socket_storm raised: {errors}"
-
-
-class TestTetheredLockedException:
-    def test_message(self):
-        exc = tethered.TetheredLocked()
-        assert "locked" in str(exc).lower()
-        assert "deactivate" in str(exc).lower()
-
-    def test_is_runtime_error(self):
-        assert issubclass(tethered.TetheredLocked, RuntimeError)
-        assert isinstance(tethered.TetheredLocked(), RuntimeError)
 
 
 class TestIsIp:
@@ -1364,6 +1118,423 @@ class TestIPMapEviction:
             assert keys.index("198.51.100.1") > keys.index("198.51.100.2")
 
 
+class TestAllowedHostnamesRecording:
+    """``_allowed_hostnames`` LRU is populated by ``_handle_getaddrinfo``.
+
+    Used as the candidate pool by ``_fallback_resolve`` when the IP map
+    misses (DNS divergence under gevent/load-balanced services).
+    """
+
+    def test_globally_allowed_hostname_is_recorded(self):
+        """A getaddrinfo that passes the global policy populates ``_allowed_hostnames``."""
+        tethered.activate(allow=["api.example.com"])
+        # Use the audit-hook entry directly so the test stays offline.
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        assert "api.example.com" in _core._allowed_hostnames
+
+    def test_globally_blocked_hostname_is_not_recorded(self):
+        """A getaddrinfo that fails the global policy is NOT recorded."""
+        tethered.activate(allow=["api.example.com"])
+        try:
+            _audit_hook("socket.getaddrinfo", ("evil.test", 80, 0, 0, 0))
+        except tethered.EgressBlocked:
+            pass
+        assert "evil.test" not in _core._allowed_hostnames
+
+    def test_repeat_lookup_moves_hostname_to_end(self):
+        """Re-resolving a recorded hostname promotes it to most-recent (LRU)."""
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook("socket.getaddrinfo", ("a.example.com", 443, 0, 0, 0))
+        _audit_hook("socket.getaddrinfo", ("b.example.com", 443, 0, 0, 0))
+        _audit_hook("socket.getaddrinfo", ("a.example.com", 443, 0, 0, 0))
+        keys = list(_core._allowed_hostnames)
+        # ``a.example.com`` was re-looked-up after ``b.example.com``, so it
+        # should be the most-recent (rightmost).
+        assert keys[-1] == "a.example.com"
+        assert keys.index("a.example.com") > keys.index("b.example.com")
+
+    def test_lru_eviction_at_max_size(self):
+        """Once ``_ALLOWED_HOSTNAMES_MAX_SIZE`` is reached, oldest entries evict."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames.clear()
+            # Pre-fill to one below the cap so the next insert evicts.
+            for i in range(_core._ALLOWED_HOSTNAMES_MAX_SIZE):
+                _core._allowed_hostnames[f"h{i}.example.com"] = None
+        # Inserting one more should evict ``h0.example.com`` (the oldest).
+        _audit_hook("socket.getaddrinfo", ("new.example.com", 443, 0, 0, 0))
+        assert len(_core._allowed_hostnames) == _core._ALLOWED_HOSTNAMES_MAX_SIZE
+        assert "h0.example.com" not in _core._allowed_hostnames
+        assert "new.example.com" in _core._allowed_hostnames
+
+    def test_activate_clears_allowed_hostnames(self):
+        """``activate()`` clears ``_allowed_hostnames`` (no carryover from prior policy)."""
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        assert "api.example.com" in _core._allowed_hostnames
+        tethered.activate(allow=["*.different.com"])
+        assert "api.example.com" not in _core._allowed_hostnames
+
+    def test_deactivate_clears_allowed_hostnames(self):
+        """``deactivate()`` clears ``_allowed_hostnames``."""
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        assert "api.example.com" in _core._allowed_hostnames
+        tethered.deactivate()
+        assert "api.example.com" not in _core._allowed_hostnames
+
+
+class TestFallbackResolve:
+    """Direct unit tests for ``_fallback_resolve`` (DNS-divergence repair).
+
+    Mocks ``_csocket.getaddrinfo`` (non-locked path) and ``_c_guardian.is_active`` /
+    ``_c_guardian.resolve`` (locked path) so the tests stay offline.  Exercises:
+
+    - Empty candidate pool → returns ``None`` immediately.
+    - Match found → returns hostname AND enriches ``_ip_to_hostname``.
+    - No match → returns ``None`` after iterating all candidates.
+    - Per-hostname resolve exceptions → swallowed; loop continues.
+    - Bound by ``_FALLBACK_RESOLVE_MAX_CANDIDATES``.
+    - LRU eviction of ``_ip_to_hostname`` during enrichment.
+    - Locked-mode branch routes through ``_c_guardian.resolve``.
+    """
+
+    @staticmethod
+    def _fake_addrinfo(*ips):
+        """Build a fake getaddrinfo result list for the given IPs."""
+        return [(0, 0, 0, "", (ip, 0)) for ip in ips]
+
+    def test_returns_none_when_no_candidates(self):
+        """Empty ``_allowed_hostnames`` → no work, immediate ``None``."""
+        # No activate() and the cleanup fixture clears the pool, so we start empty.
+        assert _core._fallback_resolve("203.0.113.1", 443) is None
+
+    def test_finds_matching_ip(self, monkeypatch):
+        """Re-resolve hits and returns the matching hostname."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["api.example.com"] = None
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            lambda *a, **kw: self._fake_addrinfo("203.0.113.99"),
+        )
+        assert _core._fallback_resolve("203.0.113.99", 443) == "api.example.com"
+        # IP map enriched for the fast path on the next connect.
+        with _ip_map_lock:
+            assert _ip_to_hostname.get("203.0.113.99") == "api.example.com"
+
+    def test_returns_none_when_no_candidate_matches(self, monkeypatch):
+        """All candidates resolve, none match the target IP → ``None``."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["a.example.com"] = None
+            _core._allowed_hostnames["b.example.com"] = None
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            lambda host, *a, **kw: self._fake_addrinfo("198.51.100.1"),
+        )
+        assert _core._fallback_resolve("203.0.113.99", 443) is None
+
+    def test_per_hostname_exception_swallowed(self, monkeypatch):
+        """A failing resolve doesn't abort the search — next candidate still tried."""
+        tethered.activate(allow=["*.example.com"])
+        # Insert ``good`` first so it's the OLDER entry; ``bad`` becomes the
+        # newest and is tried FIRST (LRU iteration is newest-first).  The bad
+        # one raises, exception is swallowed, the loop continues to ``good``
+        # which matches.
+        with _ip_map_lock:
+            _core._allowed_hostnames.clear()
+            _core._allowed_hostnames["good.example.com"] = None
+            _core._allowed_hostnames["bad.example.com"] = None
+
+        def fake(host, *a, **kw):
+            if host == "good.example.com":
+                return self._fake_addrinfo("203.0.113.42")
+            raise OSError("simulated resolver failure")
+
+        monkeypatch.setattr(_core._csocket, "getaddrinfo", fake)
+        assert _core._fallback_resolve("203.0.113.42", 443) == "good.example.com"
+
+    def test_bounded_by_max_candidates(self, monkeypatch):
+        """Iteration stops at ``_FALLBACK_RESOLVE_MAX_CANDIDATES`` even when no match."""
+        tethered.activate(allow=["*.example.com"])
+        # Fill candidates with more than the cap.
+        with _ip_map_lock:
+            _core._allowed_hostnames.clear()
+            for i in range(_core._FALLBACK_RESOLVE_MAX_CANDIDATES + 20):
+                _core._allowed_hostnames[f"h{i}.example.com"] = None
+
+        call_count = 0
+
+        def fake(*a, **kw):
+            nonlocal call_count
+            call_count += 1
+            return self._fake_addrinfo("198.51.100.1")  # never matches target
+
+        monkeypatch.setattr(_core._csocket, "getaddrinfo", fake)
+        assert _core._fallback_resolve("203.0.113.99", 443) is None
+        assert call_count == _core._FALLBACK_RESOLVE_MAX_CANDIDATES
+
+    def test_enrichment_evicts_when_ip_map_full(self, monkeypatch):
+        """During enrichment, hitting ``_IP_MAP_MAX_SIZE`` triggers LRU eviction."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames.clear()
+            _core._allowed_hostnames["h.example.com"] = None
+            _ip_to_hostname.clear()
+            # Fill IP map to capacity with sentinel entries.
+            for i in range(_IP_MAP_MAX_SIZE):
+                _ip_to_hostname[f"10.0.0.{i}"] = "old.example.com"
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            lambda *a, **kw: self._fake_addrinfo("203.0.113.42"),
+        )
+        result = _core._fallback_resolve("203.0.113.42", 443)
+        assert result == "h.example.com"
+        with _ip_map_lock:
+            # The new IP was inserted; the oldest sentinel was evicted.
+            assert "203.0.113.42" in _ip_to_hostname
+            assert "10.0.0.0" not in _ip_to_hostname
+            assert len(_ip_to_hostname) == _IP_MAP_MAX_SIZE
+
+    def test_enrichment_updates_existing_ip_entry(self, monkeypatch):
+        """When re-resolution returns an IP already in the map, the entry is refreshed."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["new.example.com"] = None
+            _ip_to_hostname["203.0.113.5"] = "stale.example.com"
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            lambda *a, **kw: self._fake_addrinfo("203.0.113.5"),
+        )
+        assert _core._fallback_resolve("203.0.113.5", 443) == "new.example.com"
+        with _ip_map_lock:
+            assert _ip_to_hostname["203.0.113.5"] == "new.example.com"
+
+    def test_locked_mode_routes_through_c_guardian(self, monkeypatch):
+        """When the C guardian is active, ``_fallback_resolve`` calls its trusted resolve."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["api.example.com"] = None
+
+        # Pretend the C guardian is active even though it isn't (mock both probes).
+        monkeypatch.setattr(_core, "_c_guardian", _FakeGuardian())
+        assert _core._fallback_resolve("203.0.113.7", 443) == "api.example.com"
+
+    def test_recent_first_iteration_order(self, monkeypatch):
+        """Most-recently-allowed hostname is tried first (LRU order, newest-first)."""
+        tethered.activate(allow=["*.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames.clear()
+            _core._allowed_hostnames["old.example.com"] = None
+            _core._allowed_hostnames["new.example.com"] = None  # most-recent
+
+        attempted: list[str] = []
+
+        def fake(host, *a, **kw):
+            attempted.append(host)
+            return self._fake_addrinfo("203.0.113.99")  # always matches
+
+        monkeypatch.setattr(_core._csocket, "getaddrinfo", fake)
+        assert _core._fallback_resolve("203.0.113.99", 443) == "new.example.com"
+        assert attempted == ["new.example.com"]  # stopped at first match
+
+    def test_handle_connect_calls_fallback_on_miss(self, monkeypatch):
+        """The miss path in ``_handle_connect`` invokes ``_fallback_resolve``.
+
+        Simulates DNS divergence: ``api.example.com`` is in the allowed-pool
+        (passed a prior global getaddrinfo check), but the IP CPython is
+        connecting to (``203.0.113.42``) was not seen by tethered's earlier
+        resolution.  Without the fallback, this would raise ``EgressBlocked``;
+        with it, the fallback re-resolves and finds the match.
+        """
+        tethered.activate(allow=["api.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["api.example.com"] = None
+            # Note: _ip_to_hostname does NOT contain ``203.0.113.42`` — that's
+            # the divergence we're simulating.
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            lambda *a, **kw: self._fake_addrinfo("203.0.113.42"),
+        )
+        # No EgressBlocked should be raised.
+        _audit_hook("socket.connect", (None, ("203.0.113.42", 443)))
+        # The fallback enriched the map; future connects take the fast path.
+        with _ip_map_lock:
+            assert _ip_to_hostname.get("203.0.113.42") == "api.example.com"
+
+    def test_handle_connect_blocks_when_fallback_finds_no_match(self, monkeypatch):
+        """A genuinely-disallowed IP is still blocked after the fallback.
+
+        Fallback iterates the candidate pool, none resolves to the target IP,
+        returns ``None`` — the connect-time policy check then sees the bare
+        IP, which doesn't match any hostname allow rule, and blocks.
+        """
+        tethered.activate(allow=["api.example.com"])
+        with _ip_map_lock:
+            _core._allowed_hostnames["api.example.com"] = None
+
+        monkeypatch.setattr(
+            _core._csocket,
+            "getaddrinfo",
+            # Candidate resolves to a different IP than the connect target.
+            lambda *a, **kw: self._fake_addrinfo("198.51.100.1"),
+        )
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.connect", (None, ("203.0.113.99", 443)))
+
+
+class TestSelfIntrospectionExemption:
+    """Self-introspection of the local hostname is exempt from the policy check.
+
+    ``socket.getfqdn()``, ``gethostbyaddr(gethostname())``, and similar paths
+    consult the local resolver / ``/etc/hosts`` / NSS to retrieve the canonical
+    name string — no network connection is made.  Affects any caller that
+    introspects its own machine identity: ``smtplib`` HELO/EHLO,
+    ``email.utils.make_msgid``, the stdlib ``logging.handlers.SMTPHandler``
+    (and its downstream users like Django's ``AdminEmailHandler``),
+    ``paramiko``/``fabric`` host-identification code, etc.  Prior to the
+    exemption, the policy check ran on the local hostname (often a
+    container or VM short ID that doesn't match any allow rule), blocking
+    these introspection paths.  The most visible production failure mode
+    was the Django email-on-error cascade — any logged 4xx escalated into
+    a 500 because ``AdminEmailHandler.emit()`` couldn't build its message
+    — but the fix is general.
+
+    Scope: ONLY the DNS-lookup audit-hook path is exempted.  Connect-time
+    enforcement on the IP the hostname resolves to is unchanged.
+    """
+
+    @staticmethod
+    def _local_hostname() -> str:
+        """Return the same captured hostname tethered uses internally."""
+        return _core._capture_local_hostname()
+
+    def test_capture_local_hostname_returns_normalized_string(self):
+        """``_capture_local_hostname`` returns the OS hostname, normalized."""
+        assert isinstance(self._local_hostname(), str)
+        # Real OSes always have a hostname; an empty result would point to a
+        # broken environment, which is fine for the helper but uninteresting
+        # for this test.
+        assert self._local_hostname()
+
+    def test_getfqdn_succeeds_without_blocking(self):
+        """``socket.getfqdn()`` returns the FQDN string without raising."""
+        tethered.activate(allow=["api.example.com"])
+        # Returns a string; never raises EgressBlocked.
+        result = socket.getfqdn()
+        assert isinstance(result, str)
+        assert result  # non-empty in any sane environment
+
+    def test_gethostbyaddr_of_gethostname_succeeds(self):
+        """``gethostbyaddr(gethostname())`` is the cascading-failure path."""
+        tethered.activate(allow=["api.example.com"])
+        local = self._local_hostname()
+        # gethostbyaddr may return OSError if the hostname isn't resolvable
+        # (common in stripped Docker images), but it must not raise
+        # EgressBlocked from tethered.
+        try:
+            socket.gethostbyaddr(local)
+        except OSError:
+            pass  # acceptable — we're testing tethered doesn't block
+
+    def test_gethostbyname_of_gethostname_succeeds(self):
+        """``gethostbyname(gethostname())`` also bypasses the policy check."""
+        tethered.activate(allow=["api.example.com"])
+        local = self._local_hostname()
+        try:
+            socket.gethostbyname(local)
+        except OSError:
+            pass
+
+    def test_getaddrinfo_of_gethostname_succeeds(self):
+        """``getaddrinfo(gethostname(), 0)`` also bypasses the policy check."""
+        tethered.activate(allow=["api.example.com"])
+        local = self._local_hostname()
+        try:
+            socket.getaddrinfo(local, 0)
+        except OSError:
+            pass
+
+    def test_unrelated_hostname_still_blocked(self):
+        """Sanity: only the captured hostname is exempt; other names still block."""
+        tethered.activate(allow=["api.example.com"])
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.gethostbyaddr", ("evil.attacker.com",))
+
+    def test_handle_dns_lookup_short_circuit(self):
+        """Direct ``_handle_dns_lookup`` call short-circuits for the local hostname."""
+        tethered.activate(allow=["api.example.com"])
+        local = self._local_hostname()
+        # Should not raise; should not log a block.
+        _audit_hook("socket.gethostbyaddr", (local,))
+
+    def test_handle_getaddrinfo_short_circuit(self):
+        """Direct ``_handle_getaddrinfo`` call short-circuits for the local hostname."""
+        tethered.activate(allow=["api.example.com"])
+        local = self._local_hostname()
+        # Should not raise; should not populate the IP map (no resolve runs
+        # on the short-circuit path).
+        with _ip_map_lock:
+            initial_size = len(_ip_to_hostname)
+        _audit_hook("socket.getaddrinfo", (local, 0, 0, 0, 0))
+        with _ip_map_lock:
+            # The short-circuit returns before the resolve+populate step.
+            assert len(_ip_to_hostname) == initial_size
+
+    def test_empty_local_hostname_disables_exemption(self, monkeypatch):
+        """If ``_local_hostname`` is empty, no hostname is exempted."""
+        # Capture a real hostname first, then construct a Config with an empty
+        # local hostname to verify the exemption is gated on non-empty value.
+        tethered.activate(allow=["api.example.com"])
+        # Mutate the frozen field via object.__setattr__ for the test (in
+        # locked mode this would be detected, but we're not locked here).
+        cfg = _core._config
+        assert cfg is not None
+        object.__setattr__(cfg, "_local_hostname", "")
+        # Even a connection to the real local hostname is now subject to
+        # the normal policy check (which blocks it).
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook(
+                "socket.gethostbyaddr",
+                (self._local_hostname(),),
+            )
+
+    def test_self_introspection_does_not_widen_connect(self):
+        """The exemption applies ONLY to DNS lookups, not to connect.
+
+        A connect to a non-loopback IP is blocked even if that IP would be
+        reachable via ``gethostname()`` resolution.  This is the security
+        property the surgical fix preserves: the cascade is fixed, but no
+        new egress is allowed.
+        """
+        tethered.activate(allow=["api.example.com"])
+        # Pretend the hostname resolves to a non-loopback IP.  The connect
+        # to that IP must still be blocked (the exemption is DNS-only).
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.connect", (None, ("203.0.113.42", 80)))
+
+
+class _FakeGuardian:
+    """Minimal stand-in for the C guardian used by ``TestFallbackResolve``."""
+
+    def is_active(self) -> bool:
+        return True
+
+    def resolve(self, host, port, family, socktype, proto, flags):
+        return [(0, 0, 0, "", ("203.0.113.7", 0))]
+
+
 class TestIPv6Integration:
     """Test IPv6 connect path via audit hook direct calls."""
 
@@ -1776,28 +1947,6 @@ class TestHostnameResolutionFlow:
         tethered.activate(allow=["dns.google"])
         loop = asyncio.get_event_loop()
         await loop.getaddrinfo("dns.google", 443)
-
-
-class TestProcessIsolation:
-    """Verify that tethered's audit hook does not leak to child processes."""
-
-    def test_subprocess_no_tethered_state(self):
-        """Child process has no tethered config — _config is None."""
-        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
-
-        result = subprocess.run(  # nosec B603 B607
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import tethered._core as c; "
-                    "assert c._config is None, 'child should have no tethered config'"
-                ),
-            ],
-            capture_output=True,
-            timeout=10,
-        )
-        assert result.returncode == 0, result.stderr.decode()
 
 
 class TestConftestEgressGuard:

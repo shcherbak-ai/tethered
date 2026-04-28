@@ -44,10 +44,10 @@ dev = [
     "ruff>=0.15",
     "pre-commit>=4.5",
     "commitizen>=4.13",
-    "pyright>=1.1.408",
     "interrogate>=1.7",
     "httpx>=0.28.1",
     "setuptools>=82",
+    "ty>=0.0.32",
 ]
 
 [tool.setuptools.packages.find]
@@ -55,6 +55,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 tethered = ["py.typed", "*.pyi"]
+
+# The auto-activation .pth file (src/tethered.pth) ships at the top of the
+# wheel via a custom build_py command in setup.py — this lands it in
+# site-packages on install so site.py processes it on every interpreter
+# startup, re-engaging tethered in spawn-mode children.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

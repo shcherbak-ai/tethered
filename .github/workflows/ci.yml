@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Run pre-commit checks (includes pyright)
+      - name: Run pre-commit checks (includes ty)
         run: uv run pre-commit run --all-files
 
       - name: Run cppcheck on C extension
