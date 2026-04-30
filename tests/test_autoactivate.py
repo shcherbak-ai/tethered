@@ -576,3 +576,31 @@ class TestInheritScopes:
         with caplog.at_level(logging.WARNING, logger="tethered"):
             _autoactivate._inherit_scopes(scopes_payload)
         assert _core._scopes.get() == ()
+
+    def test_inherit_scopes_carries_hint(self):
+        """A hint serialized into the child policy survives reconstruction."""
+        scopes_payload = [
+            {
+                "allow": ["api.example.com"],
+                "label": "lib.task",
+                "hint": "lib.task needs api.example.com — see docs",
+            },
+        ]
+        _autoactivate._inherit_scopes(scopes_payload)
+        scopes = _core._scopes.get()
+        assert len(scopes) == 1
+        assert scopes[0].hint == "lib.task needs api.example.com — see docs"
+
+    def test_inherit_scopes_missing_hint_defaults_to_empty(self):
+        """A scope payload without a hint reconstructs with an empty hint."""
+        _autoactivate._inherit_scopes([{"allow": ["api.example.com"], "label": "no-hint"}])
+        scopes = _core._scopes.get()
+        assert scopes[0].hint == ""
+
+    def test_inherit_scopes_non_string_hint_is_dropped(self):
+        """A malformed (non-string) hint in the payload is treated as empty."""
+        _autoactivate._inherit_scopes(
+            [{"allow": ["api.example.com"], "label": "bad-hint", "hint": 42}],
+        )
+        scopes = _core._scopes.get()
+        assert scopes[0].hint == ""

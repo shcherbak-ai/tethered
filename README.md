@@ -109,7 +109,7 @@ Also usable as a context manager (`with tethered.scope(allow=[...]):`). No `deac
 
 `scope()` works on its own — no `activate()` required. When the app also called `activate()`, the effective policy is the **intersection** — a connection must be allowed by both. Scopes can only narrow, never widen. Full details: [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredscope).
 
-> **Package maintainers:** Use `scope()`, never `activate()`. Your library doesn't own the process — the app does.
+> **Package maintainers:** Use `scope()`, never `activate()`. Your library doesn't own the process — the app does. Pass `hint=` to attach a one-line egress contract (what hosts your library needs + docs link) to your scope; if a block ever fires — yours or the host's — the hint is readable as `exc.scope_hint` and appended to the exception message. See [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#surface-actionable-guidance-via-hint).
 
 ### Subprocess control
 

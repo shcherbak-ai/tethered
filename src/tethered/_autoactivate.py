@@ -123,6 +123,7 @@ def _inherit_scopes(scopes_payload: list) -> None:
         except (TypeError, ValueError) as e:
             logger.warning("tethered: failed to inherit scope: %s", e)
             continue
+        raw_hint = s.get("hint", "")
         inherited.append(
             _core._ScopeConfig(
                 policy=policy,
@@ -130,6 +131,7 @@ def _inherit_scopes(scopes_payload: list) -> None:
                 fail_closed=bool(s.get("fail_closed", False)),
                 on_blocked=None,  # callbacks don't cross process boundaries
                 label=s.get("label", "inherited-scope"),
+                hint=raw_hint if isinstance(raw_hint, str) else "",
             )
         )
 

@@ -42,6 +42,7 @@ class EgressBlocked(RuntimeError):
         *,
         resolved_from: str | None = None,
         scope_label: str | None = None,
+        scope_hint: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -52,6 +53,13 @@ class EgressBlocked(RuntimeError):
         # ``EgressBlocked`` in their own exception type and want to
         # disambiguate which scope produced the block.
         self.scope_label = scope_label
+        # Optional actionable guidance carried from the deepest hinted
+        # ``scope()`` on the stack at block-time (whitespace-normalized at
+        # scope construction).  ``None`` when no hinted scope was active.
+        # Surfaces in the default message on its own line as ``Hint: ...``.
+        # Named ``scope_hint`` to mirror ``scope_label`` — both are scope-
+        # derived; ``activate()`` has no hint API by design.
+        self.scope_hint = scope_hint
 
         msg = f"Blocked by tethered: {host}"
         if port is not None:
@@ -61,6 +69,8 @@ class EgressBlocked(RuntimeError):
         msg += " is not in the allow list"
         if scope_label:
             msg += f" (blocked by {scope_label})"
+        if scope_hint:
+            msg += f"\nHint: {scope_hint}"
         super().__init__(msg)
 
 
@@ -148,6 +158,14 @@ class _ScopeConfig:
     fail_closed: bool = False
     on_blocked: Callable[[str, int | None], None] | None = field(default=None, repr=False)
     label: str = ""
+    # Optional whitespace-normalized actionable guidance attached to any
+    # ``EgressBlocked`` raised while this scope is on the stack and is the
+    # deepest hinted scope.  Empty string here means "no hint set" — the
+    # ``scope()`` constructor coerces None / empty / whitespace-only inputs
+    # to ``""``.  User-facing only: tampering with this field changes the
+    # message, never enforcement, so it is not part of the locked-mode
+    # integrity snapshot (matches the treatment of ``label``).
+    hint: str = ""
 
 
 # ── Module-level state ──────────────────────────────────────────────
@@ -213,6 +231,23 @@ def _validate_optional_str(value: object, param_name: str) -> None:
     if value is not None and not isinstance(value, str):
         msg = f"{param_name} must be a str or None, got {type(value).__name__}"
         raise TypeError(msg)
+
+
+def _normalize_hint(value: object) -> str:
+    """Validate and whitespace-normalize a ``hint=`` argument.
+
+    Returns the normalized string, or ``""`` for ``None`` / empty / whitespace-only
+    input.  Collapses runs of any whitespace (including embedded newlines) to a
+    single space so multi-line literals render cleanly on the trailing
+    ``Hint:`` line of an ``EgressBlocked`` message.  Raises ``TypeError`` for
+    non-str, non-None inputs.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        msg = f"hint must be a str or None, got {type(value).__name__}"
+        raise TypeError(msg)
+    return " ".join(value.split())
 
 
 # Hook installed flag
@@ -337,6 +372,20 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         _handle_pth_fs_op(cfg, event, args)
 
 
+def _hint_from_stack(scope_stack: tuple[_ScopeConfig, ...]) -> str | None:
+    """Return the deepest hinted scope's hint, or ``None``.
+
+    "Deepest" means the rightmost (innermost) entry on the scope stack with
+    a non-empty hint — irrespective of which scope's rule actually produced
+    the block.  The deepest hinted scope is the most context-specific to the
+    immediate caller, so its guidance is most likely to be actionable.
+    """
+    for sc in reversed(scope_stack):
+        if sc.hint:
+            return sc.hint
+    return None
+
+
 def _check_scopes(
     scope_stack: tuple[_ScopeConfig, ...],
     host: str,
@@ -373,6 +422,7 @@ def _enforce_scope_block(
     *,
     global_allowed: bool = False,
     resolved_from: str | None = None,
+    scope_stack: tuple[_ScopeConfig, ...] = (),
 ) -> None:
     """Log and optionally raise for a scope-level block."""
     extra = " (allowed by global policy)" if global_allowed else ""
@@ -390,7 +440,13 @@ def _enforce_scope_block(
             )
 
     if not sc.log_only:
-        raise EgressBlocked(host, port, resolved_from=resolved_from, scope_label=sc.label)
+        raise EgressBlocked(
+            host,
+            port,
+            resolved_from=resolved_from,
+            scope_label=sc.label,
+            scope_hint=_hint_from_stack(scope_stack),
+        )
 
 
 def _handle_dns_lookup(
@@ -446,7 +502,9 @@ def _handle_dns_lookup(
                     host,
                     exc_info=True,
                 )
-                raise EgressBlocked(host_lower, None) from None
+                raise EgressBlocked(
+                    host_lower, None, scope_hint=_hint_from_stack(scope_stack)
+                ) from None
             logger.warning(
                 "tethered: error checking policy for %s(%s), failing open",
                 event,
@@ -470,7 +528,7 @@ def _handle_dns_lookup(
                     )
 
             if not cfg.log_only:
-                raise EgressBlocked(host_lower, None)
+                raise EgressBlocked(host_lower, None, scope_hint=_hint_from_stack(scope_stack))
 
     # ── Scope checks ──
     blocking_scope = _check_scopes(scope_stack, host_lower, None, _normalized=True)
@@ -481,6 +539,7 @@ def _handle_dns_lookup(
             None,
             event,
             global_allowed=global_allowed,
+            scope_stack=scope_stack,
         )
 
 
@@ -530,7 +589,9 @@ def _handle_getaddrinfo(
                     host,
                     exc_info=True,
                 )
-                raise EgressBlocked(host_lower, None) from None
+                raise EgressBlocked(
+                    host_lower, None, scope_hint=_hint_from_stack(scope_stack)
+                ) from None
             logger.warning(
                 "tethered: error checking policy for getaddrinfo(%s), failing open",
                 host,
@@ -553,7 +614,7 @@ def _handle_getaddrinfo(
                     )
 
             if not cfg.log_only:
-                raise EgressBlocked(host_lower, None)
+                raise EgressBlocked(host_lower, None, scope_hint=_hint_from_stack(scope_stack))
             return
 
     # Record the hostname for the connect-time fallback-resolve path.
@@ -578,6 +639,7 @@ def _handle_getaddrinfo(
             None,
             "getaddrinfo",
             global_allowed=global_allowed,
+            scope_stack=scope_stack,
         )
         # If _enforce_scope_block raised (log_only=False), we never reach here.
         # For log_only scopes, fall through to populate the IP map — without it,
@@ -767,7 +829,12 @@ def _handle_connect(
                     port,
                     exc_info=True,
                 )
-                raise EgressBlocked(host, port, resolved_from=resolved_from) from None
+                raise EgressBlocked(
+                    host,
+                    port,
+                    resolved_from=resolved_from,
+                    scope_hint=_hint_from_stack(scope_stack),
+                ) from None
             # Fail-open: a bug in tethered should not break the host app
             logger.warning(
                 "tethered: error checking policy for %s:%s, failing open",
@@ -800,7 +867,12 @@ def _handle_connect(
                     )
 
             if not cfg.log_only:
-                raise EgressBlocked(host, port, resolved_from=resolved_from)
+                raise EgressBlocked(
+                    host,
+                    port,
+                    resolved_from=resolved_from,
+                    scope_hint=_hint_from_stack(scope_stack),
+                )
 
     # ── Scope checks ──
     # Check resolved hostname first; if blocked, try raw IP as fallback
@@ -819,6 +891,7 @@ def _handle_connect(
             event_desc,
             global_allowed=global_allowed,
             resolved_from=resolved_from,
+            scope_stack=scope_stack,
         )
 
 
@@ -1378,6 +1451,18 @@ class scope:
             blocks to a specific call site (e.g.
             ``label="WeatherClient.get_forecast"``).  Defaults to an
             auto-derived ``"scope(<first 3 allow rules>)"`` summary.
+        hint: Optional actionable guidance attached to any ``EgressBlocked``
+            raised while this scope is the deepest hinted scope on the
+            stack.  Surfaces as ``EgressBlocked.scope_hint`` and as a
+            trailing ``Hint: ...`` line on the exception message.
+            Whitespace is normalized at construction (runs of any
+            whitespace, including embedded newlines, collapse to a single
+            space) so multi-line literals render cleanly.  ``None``,
+            empty, and whitespace-only inputs are equivalent to "no hint
+            set" — the exception message is unchanged.  The hint travels
+            with the scope through subprocess auto-propagation, so a
+            child process blocked by an inherited scope sees the same
+            guidance.
     """
 
     __slots__ = ("_scope_cfg", "_token")
@@ -1391,6 +1476,7 @@ class scope:
         fail_closed: bool = False,
         on_blocked: Callable[[str, int | None], None] | None = None,
         label: str | None = None,
+        hint: str | None = None,
     ) -> None:
         _validate_allow(allow)
         _validate_bool(allow_localhost, "allow_localhost")
@@ -1398,6 +1484,7 @@ class scope:
         _validate_bool(fail_closed, "fail_closed")
         _validate_callback(on_blocked)
         _validate_optional_str(label, "label")
+        normalized_hint = _normalize_hint(hint)
         if label is None:
             label = "scope({})".format(
                 ", ".join(allow[:3]) + ("..." if len(allow) > 3 else ""),
@@ -1409,6 +1496,7 @@ class scope:
             fail_closed=fail_closed,
             on_blocked=on_blocked,
             label=label,
+            hint=normalized_hint,
         )
         self._token: contextvars.Token[tuple[_ScopeConfig, ...]] | None = None
 
@@ -1936,7 +2024,9 @@ def _serialize_scope(scope_cfg: _ScopeConfig) -> dict[str, Any]:
     """Serialize a ``_ScopeConfig`` for cross-process propagation.
 
     Mirrors :func:`_build_global_payload_dict`.  ``on_blocked`` is not
-    propagated (function identity can't cross process boundaries).
+    propagated (function identity can't cross process boundaries).  ``hint``
+    travels alongside ``label`` so a child blocked by an inherited scope
+    surfaces the same actionable guidance as the parent would.
     """
     policy = scope_cfg.policy
     return {
@@ -1948,6 +2038,7 @@ def _serialize_scope(scope_cfg: _ScopeConfig) -> dict[str, Any]:
         "log_only": scope_cfg.log_only,
         "fail_closed": scope_cfg.fail_closed,
         "label": scope_cfg.label,
+        "hint": scope_cfg.hint,
     }
 
 

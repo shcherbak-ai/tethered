@@ -1335,6 +1335,46 @@ class TestScopeSubprocessPropagation:
         assert observed["user"] == "user-value"
         assert observed["scope_allow"] == [["api.allowed.com"]]
 
+    def test_scope_hint_round_trip_to_subprocess(self):
+        """A hinted scope on the parent surfaces in a child process's EgressBlocked message.
+
+        The hint contains a non-ASCII character (em dash) deliberately — that's what real
+        package authors will write.  Pin both the child's stdout encoding and the parent's
+        decode to UTF-8 so the assertion doesn't depend on the runner's locale (Windows
+        cp1252 vs POSIX UTF-8 vs CI default).  The auto-propagation env injection adds
+        ``_TETHERED_CHILD_POLICY`` on top of whatever env we pass.
+        """
+        tethered.activate(allow=["*.allowed.com"])
+        child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        with tethered.scope(
+            allow=["api.allowed.com"],
+            label="lib.task",
+            hint="lib.task needs api.allowed.com — see docs/security.md",
+        ):
+            r = subprocess.run(  # nosec B603 B607
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import socket, tethered\n"
+                        "try:\n"
+                        "    socket.getaddrinfo('other.allowed.com', 80)\n"
+                        "    print('ALLOWED')\n"
+                        "except tethered.EgressBlocked as exc:\n"
+                        "    print(f'HINT={exc.scope_hint!r}')\n"
+                        "    print(f'STR={str(exc)!r}')"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=child_env,
+                timeout=15,
+            )
+        assert r.returncode == 0, r.stderr
+        assert "HINT='lib.task needs api.allowed.com — see docs/security.md'" in r.stdout
+        assert "Hint: lib.task needs api.allowed.com" in r.stdout
+
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     def test_locked_plus_scope_canonical_global_preserved(self):
         """In locked mode, the child inherits both the canonical global AND the active scope."""

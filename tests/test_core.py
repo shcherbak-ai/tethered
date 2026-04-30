@@ -21,6 +21,7 @@ from tethered._core import (
     _handle_connect,
     _handle_dns_lookup,
     _handle_getaddrinfo,
+    _hint_from_stack,
     _in_hook,
     _ip_map_lock,
     _ip_to_hostname,
@@ -621,6 +622,136 @@ class TestScopeLabelParam:
         """An empty string is a valid label and is NOT replaced by the auto-derived default."""
         s = tethered.scope(allow=["api.example.com"], label="")
         assert s._scope_cfg.label == ""
+
+
+class TestScopeHintParam:
+    """Tests for the ``hint=`` parameter on scope() and ``EgressBlocked.scope_hint``."""
+
+    def test_default_hint_is_none_on_exception(self):
+        """Without a hinted scope, ``EgressBlocked.scope_hint`` is None and shows no Hint line."""
+        tethered.activate(allow=["*.allowed.com"])
+        try:
+            socket.getaddrinfo("evil.test", 80)
+        except tethered.EgressBlocked as exc:
+            assert exc.scope_hint is None
+            assert "Hint:" not in str(exc)
+        else:
+            pytest.fail("expected EgressBlocked")
+
+    def test_hint_surfaces_when_scope_blocks(self):
+        """A scope-driven block raises with the scope's hint attached."""
+        tethered.activate(allow=["*.allowed.com"])
+        with tethered.scope(
+            allow=["api.allowed.com"],
+            hint="this lib needs api.allowed.com — see docs/security.md",
+        ):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_hint == "this lib needs api.allowed.com — see docs/security.md"
+                assert ("\nHint: this lib needs api.allowed.com — see docs/security.md") in str(exc)
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_hint_attaches_when_global_blocks_inside_scope(self):
+        """A global-policy block while inside a hinted scope still surfaces the hint."""
+        tethered.activate(allow=["*.allowed.com"])
+        with tethered.scope(allow=["*.allowed.com"], hint="must call into the allowed.com surface"):
+            try:
+                socket.getaddrinfo("evil.test", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_hint == "must call into the allowed.com surface"
+                assert "Hint: must call into the allowed.com surface" in str(exc)
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_message_unchanged_when_hint_is_none(self):
+        """``EgressBlocked.__str__()`` is unchanged when ``scope_hint=None``."""
+        exc = tethered.EgressBlocked("evil.test", 443)
+        assert exc.scope_hint is None
+        assert "Hint:" not in str(exc)
+
+    def test_message_appends_hint_once(self):
+        """The hint appears exactly once in ``str(exc)``."""
+        exc = tethered.EgressBlocked("evil.test", 443, scope_hint="see docs")
+        assert exc.scope_hint == "see docs"
+        assert str(exc).count("Hint: see docs") == 1
+
+    def test_nested_hinted_scopes_innermost_wins(self):
+        """When nested hinted scopes are active, the deepest hinted scope's hint surfaces."""
+        tethered.activate(allow=["*.allowed.com"])
+        with (
+            tethered.scope(allow=["*.allowed.com"], hint="OUTER hint"),
+            tethered.scope(allow=["api.allowed.com"], hint="INNER hint"),
+        ):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_hint == "INNER hint"
+                assert "OUTER" not in str(exc)
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_inner_unhinted_falls_back_to_outer_hint(self):
+        """When the deepest scope has no hint, the next-deepest hinted scope wins."""
+        tethered.activate(allow=["*.allowed.com"])
+        with (
+            tethered.scope(allow=["*.allowed.com"], hint="OUTER hint"),
+            tethered.scope(allow=["api.allowed.com"]),  # no hint
+        ):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_hint == "OUTER hint"
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_invalid_hint_type_raises(self):
+        """Non-str, non-None ``hint`` is rejected at construction time."""
+        with pytest.raises(TypeError, match="hint must be a str or None"):
+            tethered.scope(allow=[], hint=123)
+        with pytest.raises(TypeError, match="hint must be a str or None"):
+            tethered.scope(allow=[], hint=object())
+
+    def test_empty_and_whitespace_only_hint_normalized_to_none(self):
+        """Empty or whitespace-only hint produces no Hint line on the exception."""
+        for value in ("", "   ", "\n\t  \n"):
+            s = tethered.scope(allow=["api.example.com"], hint=value)
+            assert s._scope_cfg.hint == ""
+        # End-to-end: scope with whitespace-only hint behaves like an unhinted scope.
+        tethered.activate(allow=["*.allowed.com"])
+        with tethered.scope(allow=["api.allowed.com"], hint="   "):
+            try:
+                socket.getaddrinfo("other.allowed.com", 80)
+            except tethered.EgressBlocked as exc:
+                assert exc.scope_hint is None
+                assert "Hint:" not in str(exc)
+            else:
+                pytest.fail("expected EgressBlocked")
+
+    def test_hint_whitespace_normalized(self):
+        """Embedded newlines and runs of whitespace collapse to single spaces."""
+        s = tethered.scope(
+            allow=["api.example.com"],
+            hint="line one\n\nline two\t  with   extra",
+        )
+        assert s._scope_cfg.hint == "line one line two with extra"
+
+    def test_hint_from_stack_helper_branches(self):
+        """Direct exercise of ``_hint_from_stack`` covering all return paths.
+
+        End-to-end tests above already exercise this via the audit hook, but
+        coverage tooling on Python 3.13 occasionally fails to attribute lines
+        executed from ``sys.audit``-invoked callbacks.  This test calls the
+        helper synchronously so every branch is unambiguously measured.
+        """
+        sc_outer = _ScopeConfig(policy=AllowPolicy(["x"]), hint="OUTER")
+        sc_inner = _ScopeConfig(policy=AllowPolicy(["x"]), hint="INNER")
+        sc_unhinted = _ScopeConfig(policy=AllowPolicy(["x"]))
+        assert _hint_from_stack(()) is None
+        assert _hint_from_stack((sc_unhinted,)) is None
+        assert _hint_from_stack((sc_outer, sc_inner)) == "INNER"
+        assert _hint_from_stack((sc_outer, sc_unhinted)) == "OUTER"
 
 
 class TestFailOpen:

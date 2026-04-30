@@ -53,6 +53,7 @@ tethered.scope(
     fail_closed: bool = False,
     on_blocked: Callable[[str, int | None], None] | None = None,
     label: str | None = None,
+    hint: str | None = None,
 )
 ```
 
@@ -64,6 +65,7 @@ tethered.scope(
 | `fail_closed` | Block when the policy check itself errors. Default `False`. |
 | `on_blocked` | Callback `(host, port) -> None` on every blocked connection. |
 | `label` | Human-readable name for this scope. Appears in log messages and as `EgressBlocked.scope_label` when this scope produces a block. Library authors should use it to identify call sites — e.g. `label="WeatherClient.get_forecast"`. Defaults to an auto-derived `"scope(<first 3 allow rules>)"` summary. |
+| `hint` | Actionable guidance attached to any `EgressBlocked` raised while this scope is the deepest hinted scope on the stack — e.g. `hint="mylib needs api.mylib.com:443 — see https://…/security"`. Surfaces as `EgressBlocked.scope_hint` and as a trailing `Hint: …` line on the message. Whitespace is normalized at construction (runs of any whitespace, including embedded newlines, collapse to a single space). `None`, empty, and whitespace-only inputs are equivalent to no hint. The hint travels with the scope through subprocess auto-propagation, so a child blocked by an inherited scope sees the same guidance. |
 
 Use as a **context manager** (`with tethered.scope(allow=[...]):`) or a **decorator** (`@tethered.scope(allow=[...])`). Supports both sync and async functions. Cleanup is automatic — no `deactivate()` call needed.
 
@@ -95,6 +97,7 @@ except tethered.EgressBlocked as e:
     print(e.port)           # 443
     print(e.resolved_from)  # original hostname if connecting by resolved IP
     print(e.scope_label)    # "scope(api.mylib.com:443)" if a scope blocked it; None for global blocks
+    print(e.scope_hint)     # actionable guidance from the deepest hinted scope, or None
 ```
 
 | Attribute | Type | Meaning |
@@ -103,8 +106,9 @@ except tethered.EgressBlocked as e:
 | `port` | `int \| None` | The port, when known (`None` for `getaddrinfo` / DNS-only events). |
 | `resolved_from` | `str \| None` | When connecting by a resolved IP, the original hostname tethered mapped that IP to. `None` for direct hostname connects or when no mapping is known. |
 | `scope_label` | `str \| None` | The label of the `scope()` that blocked the call (e.g. `"scope(api.mylib.com:443)"`), or `None` if the block came from the global `activate()` policy. Useful for libraries that wrap `EgressBlocked` and want to attribute the block to the right scope when multiple are nested. See [COOKBOOK.md#for-package-authors](COOKBOOK.md#for-package-authors). |
+| `scope_hint` | `str \| None` | The `hint=` set on the deepest hinted `scope()` on the stack at block-time, or `None` when no hinted scope was active. Named to mirror `scope_label`: both attributes are scope-derived, and `activate()` has no hint API by design. The deepest hinted scope wins regardless of which scope's rule produced the block — outer hints surface only when no closer scope set one. The hint also fires when the global `activate()` policy is what blocks (provided a hinted scope is active), so library guidance still surfaces in host-app-driven blocks. Wrapper exceptions can read `exc.scope_hint` to forward the guidance into their own UX without duplicating it in code. |
 
-When `scope_label` is non-`None`, the message includes a trailing `(blocked by <label>)` suffix so the source of the block is visible in tracebacks even without inspecting the attribute.
+When `scope_label` is non-`None`, the message includes a trailing `(blocked by <label>)` suffix so the source of the block is visible in tracebacks even without inspecting the attribute. When `scope_hint` is non-`None`, the message gains a trailing line of the form `Hint: <hint>` so the guidance is visible in tracebacks too.
 
 `EgressBlocked` is intentionally a `RuntimeError`, not an `OSError` — a policy violation is not a network error and should not be silently caught by HTTP libraries or retry logic. See [COOKBOOK.md](COOKBOOK.md#handling-blocked-connections) for handling patterns at framework boundaries (Django, FastAPI, Celery, retry decorators).
 
