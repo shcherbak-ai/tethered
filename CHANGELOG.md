@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-05-01
+
+### Added
+
+- `hint=` parameter on `tethered.scope()`. Library authors (and app developers using `scope()` to tighten request handlers, jobs, or third-party calls) can attach a one-line egress contract — typically the hosts the scope needs plus a docs URL — that surfaces whenever any `EgressBlocked` fires while the scope is on the stack. The hint is configuration metadata on the scope: dormant in normal operation, emerging only when something is actually blocked. The hint travels with the scope through subprocess auto-propagation alongside `label=`, so a child blocked by an inherited scope sees the same guidance. See [`docs/COOKBOOK.md`](docs/COOKBOOK.md#surface-actionable-guidance-via-hint).
+- `EgressBlocked.scope_hint` attribute. When a hinted `scope()` is on the stack at block-time, `EgressBlocked` carries the deepest hinted scope's hint and the default message gains a trailing `Hint: <text>` line. The deepest-hinted-scope rule applies regardless of which layer produced the block — your own scope, an inner scope, the host's global `activate()` policy, or an outer scope set by the host or a higher-level library — so a host that has tethered configured but forgot to allowlist your endpoints still sees actionable guidance. Outer hints fall through when the inner scope is unhinted.
+
 ## [0.5.0] — 2026-04-28
 
 ### Added
@@ -92,6 +99,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[0.5.1]: https://github.com/shcherbak-ai/tethered/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/shcherbak-ai/tethered/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/shcherbak-ai/tethered/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/shcherbak-ai/tethered/compare/v0.3.2...v0.3.3
