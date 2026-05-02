@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/assets/tethered_header.png" alt="tethered" width="100%">
 </p>
 
-<h1 align="center">Runtime network egress control for Python</h1>
+<h1 align="center">tethered — Runtime network egress control for Python</h1>
 
 <p align="center">
   One function call. Zero dependencies. No infrastructure changes.
