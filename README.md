@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://pypi.org/project/tethered/"><img src="https://img.shields.io/pypi/v/tethered?v=1" alt="PyPI"></a>
   <a href="https://pypi.org/project/tethered/"><img src="https://img.shields.io/pypi/pyversions/tethered?v=1" alt="Python"></a>
+  <a href="https://pepy.tech/projects/tethered"><img src="https://static.pepy.tech/personalized-badge/tethered?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=BLUE&left_text=downloads%2Fmonth" alt="PyPI Downloads"></a>
   <a href="https://github.com/shcherbak-ai/tethered/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <br>
   <a href="https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/SergiiShcherbak/20432f86c9102aa2b77ad9e4d4c21aa6/raw/tethered-coverage.json" alt="coverage"></a>
@@ -192,6 +193,19 @@ Activate **before** importing any third-party code — anything that runs in the
 ## Defense-in-depth
 
 > tethered is a **guardrail at the Python audit-event layer, not a sandbox**. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it. For hardened environments combine with OS-level controls (containers, seccomp, network namespaces). See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for the full threat model.
+
+## Performance
+
+The audit hook runs on every relevant socket event, but per-event cost is small — TCP handshake, TLS, and application logic dominate real-world connect time. The hook fires whenever tethered is engaged, whether you entered via `activate()` or `scope()`, so the per-call overheads below apply to both. Measured on CPython 3.13 / localhost / default benchmark settings (3,000 TCP-connect iterations × median-of-3, 5,000 per-event iterations):
+
+| Operation | Overhead added |
+|---|---|
+| `socket.connect` | ~25 µs |
+| `socket.getaddrinfo` | ~120 µs (~2×) — tethered re-resolves to populate the IP→hostname cache |
+| Any non-network audit event | ~150 ns (ambient tax) |
+| `with tethered.scope(...)` enter + exit | ~0.5 µs (context-manager cost, independent of `activate()`) |
+
+Numbers vary by hardware, OS, and Python version. Reproduce with [`python benchmarks/overhead.py`](https://github.com/shcherbak-ai/tethered/blob/main/benchmarks/overhead.py).
 
 ## Documentation
 

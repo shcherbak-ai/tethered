@@ -33,6 +33,8 @@ tests/
     test_guardian.py       # C extension tamper detection
 tests_examples/
     test_examples.py   # Runs each example/ script as a subprocess (requires network)
+benchmarks/
+    overhead.py        # Standalone microbenchmark — per-event overhead activated vs deactivated vs locked
 examples/
     *.py               # Runnable usage examples (httpx + api.github.com)
 docs/
@@ -100,6 +102,7 @@ SECURITY.md            # Threat model, what tethered does/doesn't protect agains
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` as a subprocess. They make real HTTP calls to `api.github.com`. Not included in coverage (subprocesses aren't measured). Kept in a separate directory to avoid affecting coverage thresholds.
 - **Adding a new example**: when adding `examples/<NN>_*.py`, register it in `EXAMPLE_SCRIPTS` in `tests_examples/test_examples.py`. The list is intentionally explicit (not a glob) so draft scripts don't enter the test rotation. Each registered example must exit with code 0 on the happy path, produce stdout, and print the literal token `(unexpected)` on any branch that should have been blocked by tethered — the test asserts `(unexpected)` is NOT present, so a tethered regression that allows a blocked call surfaces immediately.
 - Core tests that need DNS resolution (log-only, fail-open, IP map tests) are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
+- **Microbenchmark** (`benchmarks/overhead.py`): Standalone, zero-dep script measuring per-event wall-clock overhead — `socket.connect` (TCP, against a daemon-thread accept-and-close listener on 127.0.0.1), `socket.getaddrinfo`, `sys.audit` synthetic event, and `with tethered.scope(...)` enter+exit — across deactivated / activated / activated+scope / activated+locked. Run with `uv run python benchmarks/overhead.py` (default 5k per-event iterations, 3k TCP iterations with a median-of-3 to reject load-spike outliers on Windows where the connect baseline is ~700 µs vs ~30 µs on Linux) or `--iterations N`. Not part of the test suite; intended for ad-hoc measurement.
 
 ### Linting and formatting
 
