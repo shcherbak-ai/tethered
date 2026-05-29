@@ -374,7 +374,9 @@ def _normalize_host(host: str) -> str:
     # Only strip when host contains ":" (IPv6 indicator) to avoid
     # truncating non-IPv6 hostnames that happen to contain "%".
     if "%" in h and ":" in h:
-        h = h.split("%")[0]
+        # Re-strip: splitting on the scope-ID separator can leave trailing
+        # whitespace that the initial strip() (run before the split) missed.
+        h = h.split("%")[0].strip()
     return h
 
 
