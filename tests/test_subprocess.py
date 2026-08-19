@@ -23,6 +23,7 @@ import tethered._core as _core
 from tethered._core import (
     _CHILD_POLICY_ENV,
     _audit_hook,
+    _build_global_payload_dict,
     _build_per_launch_env,
     _compute_pth_path,
     _Config,
@@ -626,6 +627,131 @@ class TestLockedPayloadIntegrity:
         cfg = self._locked_cfg()
         with pytest.raises(tethered.SubprocessBlocked, match=r"strips _TETHERED_CHILD_POLICY"):
             _handle_subprocess(cfg, "os.posix_spawn", ("/bin/ls", ["ls"], {}))
+
+
+class TestPayloadDeterminism:
+    """The canonical payload must be reproducible across interpreters.
+
+    Regression tests for the false "substitution attempt" block: exact-host
+    rules live in frozensets, so an unsorted serialization followed
+    per-process hash randomization (PYTHONHASHSEED).  A process manager
+    (honcho-style) that captures ``os.environ`` into a plain dict and hands
+    it to a spawn-mode Python child then failed the locked-mode
+    payload-integrity check on the child's next launch — the child's
+    rebuilt canonical payload ordered the same entries differently.
+    """
+
+    _MIXED_RULES: ClassVar[list[str]] = [
+        "api.example.com:443",
+        "auth.example.com:443",
+        "billing.example.com:443",
+        "search.example.com:443",
+        "cache-host:1111",
+        "pool-host:2222",
+        "convert-host:3333",
+        "internal-host",
+        "*.example.org:443",
+        "*.wildcard.test",
+        "10.0.0.0/8:5432",
+        "192.168.0.1:80",
+    ]
+
+    def _payload(self, rules: list[str]) -> dict[str, object]:
+        return _build_global_payload_dict(
+            AllowPolicy(rules),
+            log_only=False,
+            fail_closed=False,
+            external_subprocess_policy="warn",
+            locked=True,
+        )
+
+    def test_allow_list_input_order_insensitive(self):
+        """Policies built from differently ordered rule lists serialize identically."""
+        assert self._payload(self._MIXED_RULES) == self._payload(list(reversed(self._MIXED_RULES)))
+
+    def test_allow_list_is_sorted(self):
+        """The serialized allow list is in sorted order (the canonical form)."""
+        allow = self._payload(self._MIXED_RULES)["allow"]
+        assert allow == sorted(allow)
+
+    def test_allow_list_round_trip_stable(self):
+        """Re-parsing a serialized allow list re-serializes to the identical payload."""
+        first = self._payload(self._MIXED_RULES)
+        second = self._payload(list(first["allow"]))
+        assert first == second
+
+    def test_payload_identical_across_hash_seeds(self):
+        """Two interpreters with different hash seeds serialize identical payload bytes."""
+        code = (
+            "import json, sys\n"
+            "from tethered._core import _build_global_payload_dict\n"
+            "from tethered._policy import AllowPolicy\n"
+            f"rules = {self._MIXED_RULES!r}\n"
+            "payload = _build_global_payload_dict(\n"
+            "    AllowPolicy(rules), log_only=False, fail_closed=False,\n"
+            "    external_subprocess_policy='warn', locked=True,\n"
+            ")\n"
+            "sys.stdout.write(json.dumps(payload))\n"
+        )
+        outputs = []
+        for seed in ("1", "2"):
+            env = {**os.environ, "PYTHONHASHSEED": seed}
+            env.pop(_CHILD_POLICY_ENV, None)
+            r = subprocess.run(  # nosec B603 B607
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=15,
+            )
+            assert r.returncode == 0, r.stderr
+            outputs.append(r.stdout)
+        assert outputs[0] == outputs[1]
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_locked_spawn_child_relaunches_with_parent_env_snapshot(self):
+        """A spawn child holding the parent's env snapshot can launch grandchildren.
+
+        The honcho / process-manager pattern: the parent activates locked
+        mode, captures ``os.environ`` into a plain dict, and hands it to a
+        spawn-mode Python child, which launches a grandchild with
+        ``env=<that dict>``.  The grandchild's env carries the PARENT's
+        serialization while the child's canonical payload is rebuilt by its
+        own interpreter — before deterministic ordering this raised a false
+        "substitution attempt" ``SubprocessBlocked``.  Run at two forced
+        hash seeds so at most one child can accidentally share the parent's
+        pre-fix ordering.
+        """
+        tethered.activate(
+            allow=self._MIXED_RULES,
+            locked=True,
+            lock_token=object(),
+            external_subprocess_policy="allow",
+        )
+        parent_payload = os.environ[_CHILD_POLICY_ENV]
+        child_code = (
+            "import os, subprocess, sys\n"
+            "snapshot = dict(os.environ)\n"
+            "snapshot['_TETHERED_CHILD_POLICY'] = "
+            "os.environ['TETHERED_TEST_PARENT_PAYLOAD']\n"
+            "subprocess.run([sys.executable, '-c', 'pass'], env=snapshot, check=True)\n"
+            "print('OK')\n"
+        )
+        for seed in ("1", "2"):
+            env = {
+                **os.environ,
+                "TETHERED_TEST_PARENT_PAYLOAD": parent_payload,
+                "PYTHONHASHSEED": seed,
+            }
+            r = subprocess.run(  # nosec B603 B607
+                [sys.executable, "-c", child_code],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            assert r.returncode == 0, f"seed {seed}: {r.stderr}"
+            assert "OK" in r.stdout
 
 
 class TestPthFsHook:

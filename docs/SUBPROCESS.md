@@ -84,7 +84,7 @@ subprocess.run([sys.executable, "-S", "-c", "pass"])  # raises SubprocessBlocked
 
 In **locked mode**, tethered adds three Python-level tamper checks to defend the auto-propagation channel against a dependency that knows tethered is installed:
 
-- **Payload-integrity check at every subprocess launch.** The child's policy must equal the parent's canonical payload. This catches:
+- **Payload-integrity check at every subprocess launch.** The child's policy must equal the parent's canonical payload. The canonical form is deterministic — the `allow` list is sorted — so every process holding the same policy serializes the identical payload regardless of per-process hash randomization, and env snapshots captured in one process (e.g. by a honcho-style process manager) stay valid when a spawn-mode child launches with them. This catches:
   - explicit `env={}` that strips `_TETHERED_CHILD_POLICY`;
   - explicit `env={..., "_TETHERED_CHILD_POLICY": "<permissive value>"}` substitution;
   - inherited env (`env=None`) where `os.environ` has been mutated to strip or substitute the var (via `os.environ.pop`, `os.environ[...] = ...`, or a direct `ctypes` call to libc `setenv`/`unsetenv` — the check inspects `os.environ` at launch time regardless of how it was set).

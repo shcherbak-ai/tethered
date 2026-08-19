@@ -24,7 +24,7 @@ from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
 try:
     from tethered import _guardian as _c_guardian
 except ImportError:  # pragma: no cover
-    _c_guardian = None  # ty: ignore[invalid-assignment]
+    _c_guardian = None
 
 logger = logging.getLogger("tethered")
 
@@ -1981,6 +1981,27 @@ def _serialize_network_rule(rule: Any) -> str:
     return f"{rule.network}:{rule.port}"
 
 
+def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
+    """Serialize a policy's allow rules as a deterministically ordered list.
+
+    Exact-host rules live in frozensets whose iteration order follows string
+    hashing — randomized per process (``PYTHONHASHSEED``) — so an unsorted
+    dump can differ between the parent that serialized a payload and the
+    spawn-mode child that rebuilds its canonical payload from it.  The
+    locked-mode payload-integrity check in :func:`_handle_subprocess`
+    compares ``allow`` lists order-sensitively (dict equality), so the
+    serialization must be reproducible across interpreters: sort the
+    combined list.  Sorting is round-trip stable — every entry is a
+    normalized string, so parse → re-serialize yields the identical list.
+    """
+    return sorted(
+        list(policy._exact_hosts_any_port)
+        + [f"{h}:{p}" for h, p in policy._exact_hosts]
+        + [r.pattern if r.port is None else f"{r.pattern}:{r.port}" for r in policy._host_rules]
+        + [_serialize_network_rule(r) for r in policy._network_rules]
+    )
+
+
 # Environment variable used to propagate the active tethered policy to child
 # processes.  The parent's activate() populates it; deactivate() clears it.
 # Spawn-mode children with tethered installed read it via tethered.pth →
@@ -2001,6 +2022,10 @@ def _build_global_payload_dict(
     """Build the canonical ``global`` payload child processes consume.
 
     This is the byte-checked inner half of ``_TETHERED_CHILD_POLICY``.
+    The ``allow`` list is sorted (:func:`_serialize_allow_list`) so the
+    canonical form is identical in every process that holds the same
+    policy — a spawn-mode child rebuilding it from the inherited payload
+    produces the exact same dict despite per-process hash randomization.
 
     ``on_blocked`` and ``lock_token`` are NOT propagated.  Callbacks can't
     cross process boundaries (function identity).  Lock tokens are identity-
@@ -2008,10 +2033,7 @@ def _build_global_payload_dict(
     mode (if requested) with its own fresh per-process token.
     """
     return {
-        "allow": list(policy._exact_hosts_any_port)
-        + [f"{h}:{p}" for h, p in policy._exact_hosts]
-        + [r.pattern if r.port is None else f"{r.pattern}:{r.port}" for r in policy._host_rules]
-        + [_serialize_network_rule(r) for r in policy._network_rules],
+        "allow": _serialize_allow_list(policy),
         "allow_localhost": policy._allow_localhost,
         "log_only": log_only,
         "fail_closed": fail_closed,
@@ -2030,10 +2052,7 @@ def _serialize_scope(scope_cfg: _ScopeConfig) -> dict[str, Any]:
     """
     policy = scope_cfg.policy
     return {
-        "allow": list(policy._exact_hosts_any_port)
-        + [f"{h}:{p}" for h, p in policy._exact_hosts]
-        + [r.pattern if r.port is None else f"{r.pattern}:{r.port}" for r in policy._host_rules]
-        + [_serialize_network_rule(r) for r in policy._network_rules],
+        "allow": _serialize_allow_list(policy),
         "allow_localhost": policy._allow_localhost,
         "log_only": scope_cfg.log_only,
         "fail_closed": scope_cfg.fail_closed,

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-08-19
+
+### Added
+
+- Standalone overhead microbenchmark ([`benchmarks/overhead.py`](benchmarks/overhead.py)) measuring per-event cost across deactivated / activated / activated+scope / activated+locked, and Hypothesis property tests for `AllowPolicy`.
+
+### Fixed
+
+- False "substitution attempt" `SubprocessBlocked` in locked mode under process managers (honcho, supervisord-style runners). The canonical `_TETHERED_CHILD_POLICY` payload serialized exact-host rules from frozensets, whose iteration order follows per-process hash randomization (`PYTHONHASHSEED`) — so a spawn-mode child rebuilding its canonical payload ordered the same entries differently than the parent that serialized it. Any launch passing an env dict captured in another process (e.g. a manager pickling `os.environ` snapshots to runner children) then failed the payload-integrity check and was blocked. The `allow` list is now sorted, making the canonical payload deterministic across interpreters. Workaround on affected versions (0.5.0–0.5.1): set `PYTHONHASHSEED` to a fixed value for all processes.
+- `_normalize_host` re-strips whitespace after IPv6 scope-ID removal — splitting on the `%` separator could leave trailing whitespace that the initial strip missed.
+
 ## [0.5.1] — 2026-05-01
 
 ### Added
@@ -99,6 +110,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[0.5.2]: https://github.com/shcherbak-ai/tethered/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/shcherbak-ai/tethered/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/shcherbak-ai/tethered/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/shcherbak-ai/tethered/compare/v0.3.3...v0.4.0
