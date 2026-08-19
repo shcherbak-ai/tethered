@@ -118,7 +118,7 @@ Raised when a subprocess launch is blocked by the `external_subprocess_policy` o
 
 ## `tethered.TetheredLocked`
 
-Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token. Subclass of `RuntimeError`.
+Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token — except when `activate()` re-requests a policy identical to the active one, which is an idempotent no-op (see [Locked mode](#locked-mode)). Subclass of `RuntimeError`.
 
 ## Locked mode
 
@@ -132,7 +132,7 @@ tethered.activate(allow=["*.stripe.com:443"], locked=True, lock_token=secret)
 tethered.deactivate(lock_token=secret)
 ```
 
-Calling `activate()` or `deactivate()` without the correct `lock_token` raises `TetheredLocked`. See [SECURITY.md](../SECURITY.md) for the full threat analysis, including what locked mode catches and what its residual bypasses are.
+Calling `activate()` or `deactivate()` without the correct `lock_token` raises `TetheredLocked` — with one deliberate exception: `activate()` whose requested policy is identical to the active one (same rules in any order, same flags) is an idempotent no-op. This keeps applications that call `activate(locked=True)` at import time working inside auto-activated child processes, where the `tethered.pth` bootstrap has already re-engaged the parent's policy before the app's own startup code runs. Nothing changes on the no-op path — `on_blocked` and `lock_token` from the no-op call are ignored, so untrusted code cannot use it to register a callback or swap in a token it controls. See [SECURITY.md](../SECURITY.md) for the full threat analysis, including what locked mode catches and what its residual bypasses are.
 
 In addition, locked mode hardens the subprocess auto-propagation channel against in-process tampering — payload-integrity checks at every subprocess launch, and Python-level FS-tamper protection on the `tethered.pth` file. See [SUBPROCESS.md](SUBPROCESS.md#locked-mode-hardening-of-the-auto-propagation-channel) for the details.
 

@@ -159,6 +159,41 @@ class TestAutoactivateIntegration:
         assert result.returncode == 0, result.stderr.decode()
         assert b"OK" in result.stdout
 
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_child_app_reactivate_identical_locked_policy_is_noop(self):
+        """An auto-activated child can re-run app startup code calling activate(locked=True).
+
+        The Django/import-time pattern: the parent activates locked mode and
+        spawns a Python child, which auto-activates via tethered.pth and then
+        imports application settings that call activate() with the same
+        policy and a fresh lock_token.  Before idempotent re-activation this
+        raised TetheredLocked in every spawn-mode child.
+        """
+        tethered.activate(
+            allow=["api.allowed.com:443", "db.internal:5432"],
+            locked=True,
+            lock_token=object(),
+        )
+        result = subprocess.run(  # nosec B603 B607
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import tethered\n"
+                    "tethered.activate(\n"
+                    "    allow=['db.internal:5432', 'api.allowed.com:443'],\n"
+                    "    locked=True,\n"
+                    "    lock_token=object(),\n"
+                    ")\n"
+                    "print('OK')"
+                ),
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        assert b"OK" in result.stdout
+
     def test_no_propagation_when_parent_inactive(self):
         """Without parent activation, the child also has no policy."""
         # The conftest _cleanup fixture clears any prior activation

@@ -75,12 +75,15 @@ class EgressBlocked(RuntimeError):
 
 
 class TetheredLocked(RuntimeError):
-    """Raised when deactivate() is called in locked mode."""
+    """Raised when a locked policy refuses deactivation or replacement."""
 
-    def __init__(self) -> None:
+    def __init__(self, message: str | None = None) -> None:
         super().__init__(
-            "tethered: deactivate() blocked — policy is locked. "
-            "Pass the same lock_token to deactivate() to unlock."
+            message
+            or (
+                "tethered: deactivate() blocked — policy is locked. "
+                "Pass the same lock_token to deactivate() to unlock."
+            )
         )
 
 
@@ -1743,6 +1746,37 @@ def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, bool]]:
     return entries
 
 
+def _is_idempotent_reactivation(requested_payload: dict[str, Any]) -> bool:
+    """Return True when a locked ``activate()`` re-requests the exact active policy.
+
+    Auto-activated children (``tethered.pth``) re-run application startup
+    code, so an app that calls ``activate(locked=True)`` at import time —
+    the natural placement for a process-wide control (e.g. Django settings)
+    — would otherwise crash with ``TetheredLocked`` in every spawn-mode
+    child.  A re-activation whose canonical payload
+    equals the active one changes nothing: no config swap, no guardian
+    re-snapshot, no token rotation.  Treating it as a no-op is therefore
+    safe — untrusted code gains nothing by re-requesting the policy that is
+    already enforced.  ``on_blocked`` and ``lock_token`` from the no-op
+    call are deliberately ignored (adopting a caller-supplied token would
+    let untrusted code unlock the policy).
+
+    Caller must hold ``_state_lock``.
+    """
+    current = _config
+    if current is None or not current.locked:
+        return False
+    if current._global_payload_dict != requested_payload:
+        return False
+    logger.info(
+        "tethered: activate() no-op — the requested policy is identical to "
+        "the active locked policy (inherited via auto-propagation or "
+        "activated earlier); on_blocked and lock_token from this call are "
+        "ignored"
+    )
+    return True
+
+
 def activate(
     *,
     allow: list[str],
@@ -1796,8 +1830,13 @@ def activate(
         TypeError: If ``lock_token`` is an internable type.
         ValueError: If ``locked=True`` is used without ``lock_token``,
             or if ``external_subprocess_policy`` is not a recognized value.
-        TetheredLocked: If a locked policy is active and the correct
-            ``lock_token`` is not provided.
+        TetheredLocked: If a locked policy is active, the correct
+            ``lock_token`` is not provided, and the requested policy
+            differs from the active one.  Re-activating with an identical
+            policy is an idempotent no-op (``on_blocked`` and
+            ``lock_token`` from the no-op call are ignored) — this keeps
+            apps that call ``activate(locked=True)`` at import time
+            working inside auto-activated child processes.
     """
     global _config, _guardian_token_id
 
@@ -1862,11 +1901,19 @@ def activate(
 
     token_id = id(lock_token) if lock_token is not None else 0
 
+    activate_locked_msg = (
+        "tethered: activate() blocked — a locked policy is active and the "
+        "requested policy differs from it. Pass the original lock_token to "
+        "replace a locked policy."
+    )
+
     with _state_lock:
         # Check lock: C guardian is source of truth when available
         if _c_guardian is not None and _c_guardian.is_active():
             if not _c_guardian.check_token(token_id):
-                raise TetheredLocked
+                if _is_idempotent_reactivation(global_payload_dict):
+                    return
+                raise TetheredLocked(activate_locked_msg)
         else:  # pragma: no cover — fallback when C guardian is unavailable
             old = _config
             if (
@@ -1874,7 +1921,9 @@ def activate(
                 and old.locked
                 and (lock_token is None or lock_token is not old.lock_token)
             ):
-                raise TetheredLocked
+                if _is_idempotent_reactivation(global_payload_dict):
+                    return
+                raise TetheredLocked(activate_locked_msg)
         with _ip_map_lock:
             _config = cfg
             _ip_to_hostname.clear()

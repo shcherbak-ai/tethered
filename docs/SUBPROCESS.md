@@ -135,4 +135,6 @@ The child re-activates with: `allow`, `allow_localhost`, `log_only`, `fail_close
 
 Not inherited: `on_blocked` (callbacks can't cross process boundaries), the parent's exact `lock_token` (identity-compared; can't survive serialization).
 
+Auto-activation runs before user code, so a child that re-runs application startup (e.g. a Django dev server under a process manager, a spawn-mode worker re-importing settings) will typically call `activate()` again. That call is an idempotent no-op when the requested policy is identical to the inherited one — including `locked=True` — so import-time `activate()` keeps working in children. A *differing* policy still raises `TetheredLocked` in locked mode.
+
 > **Important:** This is defense-in-depth for **Python child processes**, not a system sandbox. Non-Python executables can be monitored/blocked at the parent (`external_subprocess_policy`), but tethered cannot enforce egress rules *inside* them. For hard subprocess isolation, combine with OS-level controls (seccomp, containers).

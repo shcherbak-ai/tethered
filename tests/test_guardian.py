@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import _socket
+import logging
 import socket
 import sys
 import threading
@@ -88,6 +89,77 @@ class TestLockedMode:
         # because locked defaults to False when lock_token matches old config
         tethered.activate(allow=["evil.test"], lock_token=secret)
         tethered.deactivate()  # Should succeed (new policy is not locked)
+
+    def test_reactivate_locked_identical_policy_is_noop(self, caplog):
+        """activate() re-requesting the exact active locked policy is a no-op.
+
+        Auto-activated children re-run app startup code; apps calling
+        activate(locked=True) at import time must not crash there.
+        """
+        secret = object()
+        tethered.activate(
+            allow=["*.example.com", "db.internal:5432"], locked=True, lock_token=secret
+        )
+        before = _core._config
+        with caplog.at_level(logging.INFO, logger="tethered"):
+            tethered.activate(
+                allow=["*.example.com", "db.internal:5432"],
+                locked=True,
+                lock_token=object(),
+            )
+        assert _core._config is before
+        assert any("no-op" in r.message for r in caplog.records)
+        # Policy still enforces after the no-op
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_reactivate_locked_identical_rules_reordered_is_noop(self):
+        """Rule order doesn't matter — the canonical payload comparison is order-stable."""
+        secret = object()
+        tethered.activate(
+            allow=["a.example.com:443", "b.example.com:443"], locked=True, lock_token=secret
+        )
+        before = _core._config
+        tethered.activate(
+            allow=["b.example.com:443", "a.example.com:443"],
+            locked=True,
+            lock_token=object(),
+        )
+        assert _core._config is before
+
+    def test_reactivate_locked_noop_keeps_original_token(self):
+        """The no-op call's lock_token is ignored — only the original token unlocks."""
+        secret = object()
+        imposter = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=imposter)
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.deactivate(lock_token=imposter)
+        tethered.deactivate(lock_token=secret)  # original token still unlocks
+
+    def test_reactivate_locked_noop_ignores_on_blocked(self):
+        """The no-op call's on_blocked callback is not adopted."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        tethered.activate(
+            allow=["*.example.com"],
+            locked=True,
+            lock_token=object(),
+            on_blocked=lambda host, port: None,
+        )
+        assert _core._config.on_blocked is None
+
+    def test_reactivate_locked_different_flag_still_raises(self):
+        """Same rules but a differing flag (log_only) is not idempotent — still blocked."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        with pytest.raises(tethered.TetheredLocked, match=r"activate\(\) blocked"):
+            tethered.activate(
+                allow=["*.example.com"],
+                locked=True,
+                lock_token=object(),
+                log_only=True,
+            )
 
 
 class TestLockedRequiresCGuardian:
