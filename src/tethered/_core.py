@@ -605,7 +605,7 @@ def _handle_dns_lookup(
     These DNS resolution functions fire different audit events than getaddrinfo,
     so they must be intercepted separately to prevent DNS-based exfiltration.
 
-    Audit event args for gethostbyname: (host,)
+    Audit event args for gethostbyname: (host,) — also raised by gethostbyname_ex
     Audit event args for gethostbyaddr: (host,)
     Audit event args for getnameinfo: (sockaddr,) — a tuple starting with the host
 
@@ -705,6 +705,17 @@ def _handle_dns_lookup(
             global_allowed=global_allowed,
             scope_stack=scope_stack,
         )
+
+    # A forward lookup that the global policy and every enforcing scope let
+    # through establishes connect-time identity, as getaddrinfo does: record
+    # the name as a fallback candidate so that a connect to the address it
+    # returned is matched back to it by _fallback_resolve.  The IP map itself
+    # is not populated here — that needs a lookup of our own, and
+    # _c_guardian.resolve only accepts _handle_getaddrinfo and
+    # _fallback_resolve as callers.  Reverse lookups resolve an address, not
+    # a name, so there is nothing to record for them.
+    if event == "socket.gethostbyname" and global_allowed:
+        _remember_allowed_hostname(host_lower)
 
 
 def _handle_getaddrinfo(
@@ -882,7 +893,10 @@ def _fallback_resolve(target_ip: str, port: int | None) -> str | None:
     own ``getaddrinfo`` (whose results are returned to the application).
     Under load-balanced services with short TTLs (Microsoft Entra ID,
     M365, large CDNs) and gevent threadpool latency, the two queries can
-    return different IP sets, leaving the connect-time IP unmapped.
+    return different IP sets, leaving the connect-time IP unmapped.  It is
+    also how an address obtained through ``gethostbyname`` /
+    ``gethostbyname_ex`` is matched to its name: those lookups record a
+    candidate here but no mapping.
 
     Returns the matching hostname (and enriches :data:`_ip_to_hostname`
     so future connects to the same IP take the fast path) on hit; returns

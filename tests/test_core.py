@@ -937,24 +937,33 @@ def no_dns(monkeypatch):
 
 
 @contextlib.contextmanager
-def _deny_all(mode: str):
-    """Deny everything, loopback included, through one enforcement layer."""
+def _restricted(mode: str, allow: list[str], label: str = "restricted"):
+    """Apply ``allow`` (localhost exemption off) through one enforcement layer.
+
+    ``mode`` is ``"global"``, ``"locked"`` or ``"scope"`` (a scope on its own,
+    labelled ``label``).
+    """
     if mode == "scope":
-        with tethered.scope(allow=[], allow_localhost=False, label="deny-all"):
+        with tethered.scope(allow=allow, allow_localhost=False, label=label):
             yield
         return
     if mode == "locked":
         token = object()
         tethered.activate(
-            allow=[], allow_localhost=False, fail_closed=True, locked=True, lock_token=token
+            allow=allow, allow_localhost=False, fail_closed=True, locked=True, lock_token=token
         )
         try:
             yield
         finally:
             tethered.deactivate(lock_token=token)
         return
-    tethered.activate(allow=[], allow_localhost=False, fail_closed=True)
+    tethered.activate(allow=allow, allow_localhost=False, fail_closed=True)
     yield
+
+
+def _deny_all(mode: str):
+    """Deny everything, loopback included, through one enforcement layer."""
+    return _restricted(mode, [], label="deny-all")
 
 
 _DENY_MODES = ["global", "locked", "scope"]
@@ -1650,6 +1659,91 @@ class TestGetnameinfo:
             with pytest.raises(tethered.EgressBlocked) as exc_info:
                 _audit_hook("socket.getnameinfo", (sockaddr,))
             assert exc_info.value.host.startswith("<unreadable ")
+
+
+# Forward lookups that return one IPv4 address for a hostname.
+_FORWARD_LOOKUPS = [
+    pytest.param(socket.gethostbyname, id="gethostbyname"),
+    pytest.param(lambda host: socket.gethostbyname_ex(host)[2][0], id="gethostbyname_ex"),
+    pytest.param(
+        lambda host: socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0], id="getaddrinfo"
+    ),
+]
+
+
+class TestGethostbynameIdentity:
+    """A ``gethostbyname`` lookup supports the connect that follows it.
+
+    ``ip = gethostbyname(host); connect((ip, port))`` must behave like the same
+    sequence through ``getaddrinfo``: the address is matched back to the name
+    that made the lookup permissible.
+    """
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize("lookup", _FORWARD_LOOKUPS)
+    def test_lookup_then_connect_is_allowed(self, tcp_listener, mode, lookup):
+        with _restricted(mode, ["localhost"]):
+            ip = lookup("localhost")
+            assert ip.startswith("127.")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                client.settimeout(5)
+                client.connect((ip, tcp_listener))
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize("lookup", _FORWARD_LOOKUPS)
+    def test_port_rule_still_applies(self, tcp_listener, mode, lookup):
+        other_port = tcp_listener - 1
+        with _restricted(mode, [f"localhost:{other_port}"]):
+            ip = lookup("localhost")
+            with (
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+                pytest.raises(tethered.EgressBlocked) as exc_info,
+            ):
+                client.connect((ip, tcp_listener))
+        assert exc_info.value.resolved_from == "localhost"
+        assert exc_info.value.port == tcp_listener
+        assert exc_info.value.scope_label == ("restricted" if mode == "scope" else None)
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_port_rule_allows_matching_port(self, tcp_listener, mode):
+        with _restricted(mode, [f"localhost:{tcp_listener}"]):
+            ip = socket.gethostbyname("localhost")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                client.settimeout(5)
+                client.connect((ip, tcp_listener))
+
+    def test_allowed_lookup_records_a_candidate(self):
+        tethered.activate(allow=["*.invalid"])
+        _audit_hook("socket.gethostbyname", ("API.Example.invalid.",))
+        assert list(_core._allowed_hostnames) == ["api.example.invalid"]
+
+    def test_blocked_lookup_records_nothing(self):
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.gethostbyname", ("blocked.invalid",))
+        assert not _core._allowed_hostnames
+
+    def test_scope_blocked_lookup_records_nothing(self):
+        tethered.activate(allow=["*.invalid"])
+        with (
+            tethered.scope(allow=["api.invalid"], label="lib"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.gethostbyname", ("blocked.invalid",))
+        assert exc_info.value.scope_label == "lib"
+        assert not _core._allowed_hostnames
+
+    def test_global_log_only_denial_records_nothing(self):
+        tethered.activate(allow=["*.example.com"], log_only=True)
+        _audit_hook("socket.gethostbyname", ("blocked.invalid",))
+        assert not _core._allowed_hostnames
+
+    def test_reverse_lookups_and_ip_literals_record_nothing(self):
+        tethered.activate(allow=["192.0.2.0/24"])
+        _audit_hook("socket.gethostbyaddr", ("192.0.2.1",))
+        _audit_hook("socket.getnameinfo", (("192.0.2.1", 80),))
+        _audit_hook("socket.gethostbyname", ("192.0.2.1",))
+        assert not _core._allowed_hostnames
 
 
 class TestIPMapEviction:
