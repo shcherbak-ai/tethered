@@ -1,8 +1,8 @@
 """Type stub for the C guardian extension."""
 
 def activate(
+    core_namespace: dict[str, object],
     config: object,
-    exc_class: type,
     token: object,
     snapshot: list[tuple[object, str, int]],
 ) -> None: ...

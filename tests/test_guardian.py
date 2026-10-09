@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _socket
 import builtins
+import contextlib
 import copy
 import functools
 import gc
@@ -1031,8 +1032,9 @@ class TestReportedHelperSwaps:
 
         with monkeypatch.context() as patch:
             patch.setattr(_core, "_has_site_bypass_flag", lambda argv: False)
-            with pytest.raises((tethered.EgressBlocked, tethered.SubprocessBlocked)):
+            with pytest.raises(tethered.SubprocessBlocked, match="integrity") as excinfo:
                 sys.audit("subprocess.Popen", *launch)
+        assert excinfo.value.event == "subprocess.Popen"
         assert "TAMPER DETECTED" in capfd.readouterr().err
 
 
@@ -1069,7 +1071,7 @@ class TestSnapshotStaging:
         guardian = _core._c_guardian
         cfg = _core._Config(policy=_policy.AllowPolicy([]))
         with pytest.raises(expected):
-            guardian.activate(cfg, tethered.EgressBlocked, object(), snapshot)
+            guardian.activate(vars(_core), cfg, object(), snapshot)
         assert guardian.is_active() is False, label
         assert guardian.check_token(None) is True, label
 
@@ -1082,7 +1084,7 @@ class TestSnapshotStaging:
         before = _core._config
         replacement = _core._Config(policy=_policy.AllowPolicy(["evil.test"]))
         with pytest.raises(expected):
-            guardian.activate(replacement, tethered.EgressBlocked, secret, snapshot)
+            guardian.activate(vars(_core), replacement, secret, snapshot)
         assert guardian.is_active() is True, label
         assert _core._config is before
         # Still enforcing the original policy, still verifying the original snapshot.
@@ -1116,7 +1118,7 @@ class TestSnapshotStaging:
 
         def reset() -> None:
             # _core._config is None here, matching the config handed to the guardian.
-            guardian.activate(None, tethered.EgressBlocked, secret, snapshot)
+            guardian.activate(vars(_core), None, secret, snapshot)
 
         def tampered() -> bool:
             capfd.readouterr()
@@ -1246,6 +1248,412 @@ class TestPthTruncateGuard:
         _core._handle_pth_fs_op(cfg, "os.truncate", ())
         with pytest.raises(tethered.SubprocessBlocked):
             _core._handle_pth_fs_op(cfg, "os.truncate", (str(scratch_pth), 0))
+
+
+# ── Integrity verification on non-socket events (R30) ──────────────
+
+
+class _BareGuardian:
+    """The C guardian on its own, pinning one entry of a scratch namespace.
+
+    tethered itself stays inactive (``_core._config`` is ``None``), so the
+    Python hook has nothing to enforce and a test sees only what the
+    guardian decides.  ``tamper()`` breaks the pinned fact, ``mend()``
+    restores it.
+    """
+
+    def __init__(self) -> None:
+        self._original = object()
+        self._namespace = {"pinned": self._original}
+        self._token = object()
+        _core._c_guardian.activate(
+            vars(_core), None, self._token, [(self._namespace, "pinned", _core._PIN_ITEM)]
+        )
+
+    def tamper(self) -> None:
+        self._namespace["pinned"] = object()
+
+    def mend(self) -> None:
+        self._namespace["pinned"] = self._original
+
+    def close(self) -> None:
+        _core._c_guardian.deactivate(self._token)
+
+
+@pytest.fixture
+def bare_guardian():
+    guardian = _BareGuardian()
+    yield guardian
+    guardian.close()
+
+
+LAUNCH_EVENTS = [
+    "subprocess.Popen",
+    "os.system",
+    "os.exec",
+    "os.posix_spawn",
+    "os.spawn",
+    "os.startfile",
+    "os.startfile/2",
+    "_winapi.CreateProcess",
+    "_posixsubprocess.fork_exec",
+]
+
+POLICY_VAR = "_TETHERED_CHILD_POLICY"
+
+
+class _PathLike:
+    """A path-like the guardian cannot inspect without running ``__fspath__``."""
+
+    def __fspath__(self) -> str:
+        raise AssertionError("the guardian must not call __fspath__")
+
+    def __repr__(self) -> str:
+        return "PathLike()"
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestGuardianEventCoverage:
+    """Which audit events make the guardian verify, seen through the guardian alone."""
+
+    def test_policy_variable_name_matches_core(self):
+        assert _core._CHILD_POLICY_ENV == POLICY_VAR
+
+    # The guardian's event list lives in C (classify_event in _guardian.c)
+    # and must cover every event the Python hook enforces something on.
+    # These two tests fail when an event is added on the Python side only.
+
+    @pytest.mark.parametrize("event", sorted(_core._SUBPROCESS_EVENTS))
+    def test_every_python_side_launch_event_is_verified(self, event, bare_guardian):
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit(event, "prog", ["prog"], None, None)
+
+    @pytest.mark.parametrize("event", sorted(_core._PTH_FS_EVENTS))
+    def test_every_python_side_filesystem_event_is_verified(self, event, bare_guardian):
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit(event, "site-packages/tethered.pth", "w", 0)
+
+    @pytest.mark.parametrize("event", LAUNCH_EVENTS)
+    def test_launch_events_are_refused_after_tampering(self, event, bare_guardian, capfd):
+        sys.audit(event, "prog", ["prog"], None, None)  # intact: passes
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked, match="integrity") as excinfo:
+            sys.audit(event, "prog", ["prog"], None, None)
+        assert excinfo.value.event == event
+        assert not isinstance(excinfo.value, tethered.EgressBlocked)
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+        bare_guardian.mend()
+        sys.audit(event, "prog", ["prog"], None, None)
+
+    def test_launch_events_need_no_arguments_to_be_refused(self, bare_guardian):
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit("os.system")
+
+    @pytest.mark.parametrize(
+        "event, args",
+        [
+            ("open", ("{pth}", "w", 0)),
+            ("open", ("{pth}", "r", 0)),  # the guardian cannot tell a read from a write
+            ("open", ("{pth}", None, os.O_WRONLY)),
+            ("os.remove", ("{pth}", -1)),
+            ("os.chmod", ("{pth}", 0, -1)),
+            ("os.truncate", ("{pth}", 0)),
+            ("os.rename", ("{pth}", "elsewhere", -1, -1)),
+            ("os.rename", ("elsewhere", "{pth}", -1, -1)),
+        ],
+        ids=lambda value: value if isinstance(value, str) else None,
+    )
+    def test_filesystem_events_on_the_pth_are_refused_after_tampering(
+        self, event, args, bare_guardian, capfd
+    ):
+        pth = os.path.join("site-packages", "tethered.pth")
+        args = tuple(a.format(pth=pth) if isinstance(a, str) else a for a in args)
+        sys.audit(event, *args)  # intact: passes
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked, match="integrity") as excinfo:
+            sys.audit(event, *args)
+        assert excinfo.value.event == event
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "tethered.pth",
+            "site-packages/tethered.pth",
+            "C:\\Lib\\site-packages\\tethered.pth",
+            "SITE-PACKAGES/TETHERED.PTH",
+            "site-packages/Tethered.Pth",
+            # normpath() collapses these onto the file, so the Python guard matches them
+            "site-packages/tethered.pth/.",
+            "site-packages/tethered.pth/",
+            "site-packages/tethered.pth/sub/..",
+            b"site-packages/tethered.pth",
+            b"SITE-PACKAGES\\TETHERED.PTH",
+            # wider str kinds (UCS-2 and UCS-4 storage)
+            "/srv/данные/tethered.pth",
+            "/srv/\U0001f600/Tethered.pth",
+            # cannot be inspected without running code: verified to be safe
+            _PathLike(),
+            bytearray(b"site-packages/tethered.pth"),
+        ],
+        ids=repr,
+    )
+    def test_path_spellings_that_trigger_verification(self, path, bare_guardian):
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit("open", path, "w", 0)
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit("os.rename", "elsewhere", path, -1, -1)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "",
+            "site-packages/other.pth",
+            "site-packages/tethered.pt",
+            "site-packages/tethered_pth",
+            "site-packages/ethered.pth",
+            "/srv/данные/other.pth",
+            "/srv/\U0001f600/other.pth",
+            b"site-packages/other.pth",
+            b"",
+            7,  # a file descriptor cannot be matched against a path
+            None,
+        ],
+        ids=repr,
+    )
+    def test_other_paths_are_not_verified(self, path, bare_guardian):
+        """Ordinary file activity stays cheap — and is not refused after tampering."""
+        bare_guardian.tamper()
+        sys.audit("open", path, "w", 0)
+        sys.audit("os.remove", path, -1)
+        sys.audit("os.rename", path, path, -1, -1)
+        sys.audit("os.chmod", path, 0, -1)
+        sys.audit("os.truncate", path, 0)
+
+    def test_rename_checks_only_its_two_paths(self, bare_guardian):
+        bare_guardian.tamper()
+        sys.audit("os.rename", "a", "b", "tethered.pth", "tethered.pth")
+        sys.audit("open", "a", "tethered.pth", 0)  # the mode is not a path
+
+    @pytest.mark.parametrize("event", ["open", "os.remove", "os.rename", "os.chmod", "os.truncate"])
+    def test_filesystem_events_without_arguments_are_ignored(self, event, bare_guardian):
+        bare_guardian.tamper()
+        sys.audit(event)
+
+    @pytest.mark.parametrize("event", ["os.putenv", "os.unsetenv"])
+    @pytest.mark.parametrize(
+        "key",
+        [
+            POLICY_VAR,
+            POLICY_VAR.lower(),
+            "_Tethered_Child_Policy",
+            POLICY_VAR.encode(),
+            POLICY_VAR.lower().encode(),
+            # Windows folds a few non-ASCII letters onto ASCII ones; anything
+            # non-ASCII is verified instead of reasoned about.
+            "_TETHERED_CH\u0131LD_POL\u0131CY",
+            "\u00e9",
+            b"_TETHERED_CH\xc4\xb1LD_POLICY",
+            7,
+            None,
+        ],
+        ids=repr,
+    )
+    def test_environment_events_on_the_policy_variable_are_refused_after_tampering(
+        self, event, key, bare_guardian, capfd
+    ):
+        sys.audit(event, key, "value")  # intact: passes
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked, match="integrity") as excinfo:
+            sys.audit(event, key, "value")
+        assert excinfo.value.event == event
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    @pytest.mark.parametrize("event", ["os.putenv", "os.unsetenv"])
+    def test_environment_events_without_a_key_are_verified(self, event, bare_guardian):
+        bare_guardian.tamper()
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit(event)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "PATH",
+            "",
+            POLICY_VAR + "_X",
+            POLICY_VAR[:-1],
+            "X" + POLICY_VAR[1:],
+            POLICY_VAR.replace("_", "-"),
+            b"PATH",
+            (POLICY_VAR + "_X").encode(),
+        ],
+        ids=repr,
+    )
+    def test_other_environment_variables_are_not_verified(self, key, bare_guardian):
+        bare_guardian.tamper()
+        sys.audit("os.putenv", key, "value")
+        sys.audit("os.unsetenv", key)
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            "o",
+            "os",
+            "os.",
+            "opener",
+            "os.listdir",
+            "os.rmdir",
+            "os.mkdir",
+            "os.removexattr",
+            "os.renames",
+            "os.execv",
+            "os.spawnv",
+            "os.putenv2",
+            "s",
+            "subprocess.Popen2",
+            "subprocess.run",
+            "sockets.connect",
+            "_winapi.CreateFile",
+            "_posixsubprocess.fork",
+            "import",
+            "exec",
+            "",
+        ],
+        ids=repr,
+    )
+    def test_unguarded_events_are_ignored(self, event, bare_guardian):
+        bare_guardian.tamper()
+        sys.audit(event, "tethered.pth", POLICY_VAR)
+
+    def test_socket_events_still_raise_egress_blocked(self, bare_guardian, capfd):
+        sys.audit("socket.tethered_test_probe")
+        bare_guardian.tamper()
+        with pytest.raises(tethered.EgressBlocked):
+            sys.audit("socket.tethered_test_probe")
+        with pytest.raises(tethered.EgressBlocked, match=r"evil\.test"):
+            sys.audit("socket.getaddrinfo", "evil.test", 80, 0, 0, 0)
+        with pytest.raises(tethered.EgressBlocked, match=r"203\.0\.113\.9"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        with pytest.raises(tethered.EgressBlocked, match="unknown"):
+            sys.audit("socket.sendto", None, None)
+        with pytest.raises(tethered.EgressBlocked, match="unknown"):
+            sys.audit("socket.connect", None)
+        # A host that cannot be encoded for the message must not derail the refusal.
+        with pytest.raises(tethered.EgressBlocked, match="unknown"):
+            sys.audit("socket.getaddrinfo", "bad\udc80host", 80, 0, 0, 0)
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+
+@contextlib.contextmanager
+def _replaced_pth_guard(monkeypatch: pytest.MonkeyPatch):
+    """Swap the Python-side ``tethered.pth`` guard for a no-op, as tampering code would."""
+    with monkeypatch.context() as patch:
+        patch.setattr(_core, "_handle_pth_fs_op", lambda *args, **kwargs: None)
+        yield
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestReplacedGuardsCannotDecide:
+    """With tethered active: a replaced Python-side guard no longer gets the last word."""
+
+    @staticmethod
+    def _operations(pth, other):
+        return {
+            "open-w": lambda: open(pth, "w"),
+            "open-a": lambda: open(pth, "a"),
+            "os.open": lambda: os.open(pth, os.O_WRONLY),
+            "remove": lambda: os.remove(pth),
+            "unlink": lambda: pth.unlink(),
+            "rename-away": lambda: os.rename(pth, other.with_name("moved.pth")),
+            "replace-onto": lambda: os.replace(other, pth),
+            "chmod": lambda: os.chmod(pth, 0o600),
+            "truncate": lambda: os.truncate(pth, 0),
+            "write_text": lambda: pth.write_text("gone"),
+        }
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "open-w",
+            "open-a",
+            "os.open",
+            "remove",
+            "unlink",
+            "rename-away",
+            "replace-onto",
+            "chmod",
+            "truncate",
+            "write_text",
+        ],
+    )
+    def test_pth_operations_are_refused(self, operation, capfd, scratch_pth, monkeypatch):
+        """The review's R30 reproduction, for every guarded filesystem operation."""
+        other = scratch_pth.with_name("other.txt")
+        other.write_text("other")
+        run = self._operations(scratch_pth, other)[operation]
+        _activate_locked()
+        capfd.readouterr()
+        with (
+            _replaced_pth_guard(monkeypatch),
+            pytest.raises(tethered.SubprocessBlocked, match="integrity"),
+        ):
+            run()
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+        assert scratch_pth.read_text() == PTH_LINE
+        assert other.read_text() == "other"
+
+    def test_intact_policy_leaves_the_decision_to_the_python_guard(self, capfd, scratch_pth):
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            open(scratch_pth, "w")  # noqa: SIM115
+        assert scratch_pth.read_text() == PTH_LINE  # reading is allowed
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_unrelated_files_stay_usable_after_tampering(self, capfd, scratch_pth, monkeypatch):
+        other = scratch_pth.with_name("other.txt")
+        _activate_locked()
+        with _replaced_pth_guard(monkeypatch):
+            other.write_text("data")
+            os.chmod(other, 0o600)
+            os.truncate(other, 0)
+            os.rename(other, other.with_name("renamed.txt"))
+            os.remove(other.with_name("renamed.txt"))
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_policy_variable_writes_are_refused_after_tampering(self, capfd, monkeypatch):
+        _activate_locked()
+        before = os.environ[POLICY_VAR]
+        operations = [
+            lambda: os.environ.__setitem__(POLICY_VAR, "{}"),
+            lambda: os.environ.pop(POLICY_VAR),
+            lambda: os.putenv(POLICY_VAR, "{}"),
+            lambda: os.unsetenv(POLICY_VAR),
+            lambda: os.putenv(POLICY_VAR.lower(), "{}"),
+        ]
+        with _replaced_pth_guard(monkeypatch):
+            for operation in operations:
+                with pytest.raises(tethered.SubprocessBlocked, match="integrity"):
+                    operation()
+            os.environ["TETHERED_TEST_UNRELATED"] = "1"
+            del os.environ["TETHERED_TEST_UNRELATED"]
+        assert os.environ[POLICY_VAR] == before
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    def test_refuses_even_when_subprocess_blocked_cannot_be_built(
+        self, capfd, scratch_pth, monkeypatch
+    ):
+        _activate_locked()
+        with monkeypatch.context() as patch:
+            patch.setattr(tethered.SubprocessBlocked, "__init__", object())
+            with pytest.raises(RuntimeError, match="integrity violation") as excinfo:
+                os.truncate(scratch_pth, 0)
+            assert type(excinfo.value) is RuntimeError
+        assert scratch_pth.read_text() == PTH_LINE
+        assert "TAMPER DETECTED" in capfd.readouterr().err
 
 
 @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")

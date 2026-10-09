@@ -102,8 +102,16 @@ static PyObject        *guardian_config = NULL;    /* strong ref to _Config */
  * side stores the token or its id(). */
 static PyObject        *guardian_token = NULL;
 static ATOMIC_INT       tamper_alerted = 0;
-static PyObject        *core_module = NULL;
-static PyObject        *egress_blocked_cls = NULL; /* strong ref */
+/* tethered._core's module namespace (strong ref to the dict), handed over
+ * by activate().  It is the dict _core's own functions resolve their
+ * globals through, so it is never looked up via sys.modules. */
+static PyObject        *core_namespace = NULL;
+static PyObject        *config_key = NULL;         /* interned "_config" */
+/* Exception classes raised on a failed verification (strong refs):
+ * EgressBlocked for socket events, SubprocessBlocked for the launch,
+ * filesystem and environment events. */
+static PyObject        *egress_blocked_cls = NULL;
+static PyObject        *subprocess_blocked_cls = NULL;
 
 /* Cached ContextVar object (strong ref) */
 static PyObject        *in_hook_var = NULL;        /* _in_hook ContextVar */
@@ -133,7 +141,7 @@ static THREAD_LOCAL int resolving_depth = 0;
  * that is interrupted by a re-activation or deactivation (only possible if
  * a lookup runs Python code — see verify_integrity) keeps reading valid
  * memory and fails closed.  The snapshot is generated from the namespaces
- * of tethered._core and tethered._policy (about 550 entries at the time of
+ * of tethered._core and tethered._policy (about 450 entries at the time of
  * writing), so leave headroom for those modules to grow.
  *
  * snapshot_epoch changes whenever the array is replaced or cleared.
@@ -156,25 +164,25 @@ write_tamper_alert(void)
     (void)write(2, msg, (unsigned int)strlen(msg));
 }
 
-/* ── Raise EgressBlocked ─────────────────────────────────────────── */
+/* ── Refusing an audited operation ───────────────────────────────── */
 
 /*
- * Always returns -1 with an exception set, so the audited operation is
- * refused.  Instantiating EgressBlocked runs Python code, and the class is
- * itself among the things that may have been tampered with: if it cannot
- * produce an exception instance, fall back to a plain RuntimeError.
+ * Raise cls(*ctor_args) — consuming the reference to ctor_args — and
+ * return -1, so the audited operation is refused.  Instantiating the class
+ * runs Python code, and the class is itself among the things that may have
+ * been tampered with: if no exception instance comes out of it, refuse with
+ * a plain RuntimeError naming `what` instead.
  */
 static int
-raise_blocked(const char *host)
+raise_refusal(PyObject *cls, PyObject *ctor_args, const char *what)
 {
     int raised = 0;
-    PyObject *cls = egress_blocked_cls;
 
-    if (cls != NULL) {
+    if (cls != NULL && ctor_args != NULL) {
         /* Own reference: the call below can run code that deactivates the
          * guardian and drops the global. */
         Py_INCREF(cls);
-        PyObject *exc = PyObject_CallFunction(cls, "sO", host, Py_None);
+        PyObject *exc = PyObject_CallObject(cls, ctor_args);
         if (exc != NULL && PyExceptionInstance_Check(exc)) {
             PyErr_SetObject((PyObject *)Py_TYPE(exc), exc);
             raised = 1;
@@ -182,12 +190,36 @@ raise_blocked(const char *host)
         Py_XDECREF(exc);
         Py_DECREF(cls);
     }
+    Py_XDECREF(ctor_args);
     if (!raised) {
         PyErr_Clear();
         PyErr_Format(PyExc_RuntimeError,
-                     "Blocked by tethered (integrity violation): %s", host);
+                     "Blocked by tethered (integrity violation): %s", what);
     }
     return -1;
+}
+
+/* Refuse a socket event: EgressBlocked(host, None). */
+static int
+raise_blocked(const char *host)
+{
+    return raise_refusal(egress_blocked_cls,
+                         Py_BuildValue("(sO)", host, Py_None), host);
+}
+
+/* Refuse a launch, filesystem or environment event:
+ * SubprocessBlocked(event, description).  These are not egress events;
+ * SubprocessBlocked is what the Python-side guards raise for them. */
+static int
+raise_refused(const char *event)
+{
+    return raise_refusal(
+        subprocess_blocked_cls,
+        Py_BuildValue("(sN)", event,
+                      PyUnicode_FromFormat(
+                          "%s refused: locked policy integrity violated",
+                          event)),
+        event);
 }
 
 /* Helper: raise EgressBlocked from a Python-callable function (returns NULL). */
@@ -197,6 +229,20 @@ raise_blocked_py(const char *desc)
     write_tamper_alert();
     (void)raise_blocked(desc);
     return NULL;
+}
+
+/* UTF-8 text of a str for an error message, or `fallback`.  Never leaves
+ * an exception set. */
+static const char *
+utf8_or(PyObject *obj, const char *fallback)
+{
+    if (obj != NULL && PyUnicode_Check(obj)) {
+        const char *s = PyUnicode_AsUTF8(obj);
+        if (s != NULL)
+            return s;
+        PyErr_Clear(); /* e.g. lone surrogates */
+    }
+    return fallback;
 }
 
 /* ── Integrity verification ──────────────────────────────────────── */
@@ -261,18 +307,20 @@ entry_holds(const SnapshotEntry *e)
 static int
 verify_integrity(void)
 {
-    /* Check _config identity */
-    if (core_module != NULL) {
-        PyObject *current = PyObject_GetAttrString(core_module, "_config");
-        if (current != NULL) {
-            int same = (current == guardian_config);
-            Py_DECREF(current);
-            if (!same) return 0;
-        } else {
-            PyErr_Clear();
-            return 0; /* _config not accessible — treat as tampered */
-        }
-    }
+    /* _core._config must still be the config this guardian was activated
+     * with.  Looked up in the module namespace itself, like every other
+     * module-level pin. */
+    PyObject *ns = core_namespace;
+    if (ns == NULL || config_key == NULL)
+        return 0;
+    Py_INCREF(ns);
+    PyObject *current = PyDict_GetItemWithError(ns, config_key); /* borrowed */
+    int same = (current != NULL && current == guardian_config);
+    if (current == NULL && PyErr_Occurred())
+        PyErr_Clear();
+    Py_DECREF(ns);
+    if (!same)
+        return 0; /* replaced or deleted — tampered */
 
     /*
      * Check all snapshot entries.
@@ -302,19 +350,19 @@ verify_integrity(void)
  * Verify that the _in_hook ContextVar matches C-owned trusted state.
  *
  * _in_hook should only be True when resolving_depth > 0 (i.e., we are
- * inside _guardian.resolve()).  Only relevant for socket events.
+ * inside _guardian.resolve()).  Only consulted for socket events.
  *
  * Returns 1 if consistent, 0 if tampered.
  */
 static int
-check_contextvar_consistency(int is_socket)
+check_contextvar_consistency(void)
 {
     /* Use PyContextVar_Get (direct C API) instead of PyObject_CallMethod —
      * this is the audit-event hot path, and method dispatch through Python
      * adds measurable overhead.  The ContextVar carries a registered default
      * of False, so passing NULL for default_value yields a strong reference
      * to the default when the var is unset in this context. */
-    if (is_socket && in_hook_var != NULL) {
+    if (in_hook_var != NULL) {
         PyObject *val = NULL;
         if (PyContextVar_Get(in_hook_var, NULL, &val) == 0 && val != NULL) {
             int is_true = PyObject_IsTrue(val);
@@ -329,20 +377,228 @@ check_contextvar_consistency(int is_socket)
     return 1; /* consistent */
 }
 
-/* ── Subprocess event check ──────────────────────────────────────── */
+/* ── Which events are guarded ────────────────────────────────────── */
+
+/*
+ * The guardian verifies integrity on exactly the events the Python hook
+ * enforces something on — a Python-side guard that has been replaced must
+ * not get to decide.  Keep these lists in step with _core.py
+ * (_SUBPROCESS_EVENTS, _PTH_FS_EVENTS, and the environment events).
+ */
+enum {
+    EVENT_IGNORED = 0,
+    EVENT_SOCKET,     /* socket.*: always verified */
+    EVENT_LAUNCH,     /* process launch: always verified */
+    EVENT_FS,         /* args[0] is a path: verified if it names tethered.pth */
+    EVENT_FS_RENAME,  /* args[0] and args[1] are paths: likewise */
+    EVENT_ENV         /* args[0] is a variable name: verified if it is ours */
+};
 
 static int
-is_subprocess_event(const char *event)
+classify_event(const char *event)
 {
-    return (strcmp(event, "subprocess.Popen") == 0 ||
-            strcmp(event, "os.system") == 0 ||
-            strcmp(event, "os.exec") == 0 ||
-            strcmp(event, "os.posix_spawn") == 0 ||
-            strcmp(event, "os.spawn") == 0 ||
-            strcmp(event, "os.startfile") == 0);
+    switch (event[0]) {
+    case 's':
+        if (strncmp(event, "socket.", 7) == 0)
+            return EVENT_SOCKET;
+        if (strcmp(event, "subprocess.Popen") == 0)
+            return EVENT_LAUNCH;
+        return EVENT_IGNORED;
+
+    case 'o':
+        if (strcmp(event, "open") == 0)
+            return EVENT_FS;
+        if (event[1] != 's' || event[2] != '.')
+            return EVENT_IGNORED;
+        event += 3; /* past "os." */
+        if (strcmp(event, "remove") == 0 ||
+            strcmp(event, "chmod") == 0 ||
+            strcmp(event, "truncate") == 0)
+            return EVENT_FS;
+        if (strcmp(event, "rename") == 0)
+            return EVENT_FS_RENAME;
+        if (strcmp(event, "putenv") == 0 ||
+            strcmp(event, "unsetenv") == 0)
+            return EVENT_ENV;
+        if (strcmp(event, "system") == 0 ||
+            strcmp(event, "exec") == 0 ||
+            strcmp(event, "posix_spawn") == 0 ||
+            strcmp(event, "spawn") == 0 ||
+            strcmp(event, "startfile") == 0 ||
+            strcmp(event, "startfile/2") == 0)
+            return EVENT_LAUNCH;
+        return EVENT_IGNORED;
+
+    case '_':
+        if (strcmp(event, "_winapi.CreateProcess") == 0 ||
+            strcmp(event, "_posixsubprocess.fork_exec") == 0)
+            return EVENT_LAUNCH;
+        return EVENT_IGNORED;
+
+    default:
+        return EVENT_IGNORED;
+    }
+}
+
+/*
+ * Pre-filters for the filesystem and environment events.  `open` fires
+ * constantly, so the full verification runs only when the event could
+ * concern tethered.pth or the child-policy variable.  The filters are
+ * deliberately at least as inclusive as the Python-side matching: a miss
+ * here means the (possibly replaced) Python guard decides alone.
+ */
+
+#define PTH_NAME      "tethered.pth"
+#define POLICY_VAR    "_tethered_child_policy"  /* compared case-insensitively */
+
+/* Does text[0..len) contain `needle` (lower-case ASCII), ignoring ASCII
+ * case?  `kind` is a PyUnicode kind; bytes are read as 1-byte text. */
+static int
+text_mentions(int kind, const void *text, Py_ssize_t len, const char *needle)
+{
+    Py_ssize_t m = (Py_ssize_t)strlen(needle);
+
+    for (Py_ssize_t i = 0; i + m <= len; i++) {
+        Py_ssize_t j = 0;
+        while (j < m) {
+            Py_UCS4 ch = PyUnicode_READ(kind, text, i + j);
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 'a' - 'A';
+            if (ch != (Py_UCS4)(unsigned char)needle[j])
+                break;
+            j++;
+        }
+        if (j == m)
+            return 1;
+    }
+    return 0;
+}
+
+/* Make the str's kind/data readable.  Returns 0 if that is not possible
+ * (never happens for strings created by Python code); clears the error. */
+static int
+unicode_readable(PyObject *str)
+{
+#if PY_VERSION_HEX < 0x030C0000
+    if (PyUnicode_READY(str) < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+#else
+    (void)str;
+#endif
+    return 1;
+}
+
+/*
+ * Could this path argument refer to tethered.pth?
+ *
+ * The Python guard compares normcase(normpath(abspath(path))) with the
+ * cached location.  normpath only drops components ("x/tethered.pth/.",
+ * "x/y/../tethered.pth"), and case folding never produces these ASCII
+ * letters from other characters, so every path the guard can match
+ * contains the file name as a substring — which is what is tested here,
+ * not merely the final component.
+ *
+ * A file descriptor (int) cannot be matched and is skipped.  Any other
+ * object — a path-like passed to io.FileIO, say — cannot be inspected
+ * without running its __fspath__, so it is treated as a match.
+ */
+static int
+path_mentions_pth(PyObject *path)
+{
+    if (PyUnicode_Check(path)) {
+        if (!unicode_readable(path))
+            return 1;
+        return text_mentions(PyUnicode_KIND(path), PyUnicode_DATA(path),
+                             PyUnicode_GET_LENGTH(path), PTH_NAME);
+    }
+    if (PyBytes_Check(path))
+        return text_mentions(PyUnicode_1BYTE_KIND, PyBytes_AS_STRING(path),
+                             PyBytes_GET_SIZE(path), PTH_NAME);
+    if (PyLong_Check(path) || path == Py_None)
+        return 0;
+    return 1;
+}
+
+static int
+fs_event_concerns_pth(int kind, PyObject *args)
+{
+    if (!PyTuple_Check(args))
+        return 1; /* unexpected shape — verify */
+    Py_ssize_t paths = (kind == EVENT_FS_RENAME) ? 2 : 1;
+    for (Py_ssize_t i = 0; i < paths && i < PyTuple_GET_SIZE(args); i++) {
+        if (path_mentions_pth(PyTuple_GET_ITEM(args, i)))
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Is this os.putenv / os.unsetenv key the child-policy variable?
+ *
+ * The key is a str on Windows and bytes on POSIX.  Windows treats variable
+ * names case-insensitively, so the comparison ignores ASCII case
+ * everywhere.  A key with non-ASCII characters is treated as a match
+ * rather than reasoned about: Windows folds a few of them onto ASCII
+ * letters.
+ */
+static int
+env_key_is_policy_var(PyObject *args)
+{
+    if (!PyTuple_Check(args) || PyTuple_GET_SIZE(args) < 1)
+        return 1; /* unexpected shape — verify */
+
+    PyObject *key = PyTuple_GET_ITEM(args, 0);
+    const unsigned char *text;
+    Py_ssize_t len;
+
+    if (PyUnicode_Check(key)) {
+        if (!unicode_readable(key) || !PyUnicode_IS_ASCII(key))
+            return 1;
+        text = (const unsigned char *)PyUnicode_1BYTE_DATA(key);
+        len = PyUnicode_GET_LENGTH(key);
+    }
+    else if (PyBytes_Check(key)) {
+        text = (const unsigned char *)PyBytes_AS_STRING(key);
+        len = PyBytes_GET_SIZE(key);
+        for (Py_ssize_t i = 0; i < len; i++) {
+            if (text[i] >= 0x80)
+                return 1;
+        }
+    }
+    else {
+        return 1;
+    }
+
+    return len == (Py_ssize_t)strlen(POLICY_VAR) &&
+           text_mentions(PyUnicode_1BYTE_KIND, text, len, POLICY_VAR);
 }
 
 /* ── The C audit hook ────────────────────────────────────────────── */
+
+/* A socket event failed a check: refuse it, naming the host if we can. */
+static int
+refuse_socket_event(const char *event, PyObject *args, const char *fallback)
+{
+    PyObject *subject = NULL;
+
+    if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
+        subject = PyTuple_GET_ITEM(args, 0);
+        if (strcmp(event, "socket.connect") == 0 ||
+            strcmp(event, "socket.sendto") == 0 ||
+            strcmp(event, "socket.sendmsg") == 0) {
+            /* args: (socket, address) — name the address's host */
+            subject = NULL;
+            if (PyTuple_GET_SIZE(args) >= 2) {
+                PyObject *addr = PyTuple_GET_ITEM(args, 1);
+                if (PyTuple_Check(addr) && PyTuple_GET_SIZE(addr) >= 1)
+                    subject = PyTuple_GET_ITEM(addr, 0);
+            }
+        }
+    }
+    return raise_blocked(utf8_or(subject, fallback));
+}
 
 static int
 guardian_hook(const char *event, PyObject *args, void *userData)
@@ -352,57 +608,45 @@ guardian_hook(const char *event, PyObject *args, void *userData)
     if (!ATOMIC_LOAD(guardian_active))
         return 0;
 
-    int is_socket = (strncmp(event, "socket.", 7) == 0);
-    if (!is_socket && !is_subprocess_event(event))
+    int kind = classify_event(event);
+    if (kind == EVENT_IGNORED)
         return 0;
 
-    /* Fast path: legitimate recursion from our own resolve() */
-    if (is_socket && resolving_depth > 0)
-        return 0;
+    if (kind == EVENT_SOCKET) {
+        /* Fast path: legitimate recursion from our own resolve() */
+        if (resolving_depth > 0)
+            return 0;
 
-    /* Check ContextVar consistency BEFORE integrity check.
-     * Detects _in_hook.set(True) without corresponding C-owned trusted state. */
-    if (!check_contextvar_consistency(is_socket)) {
-        write_tamper_alert();
-
-        const char *host = "unknown (ContextVar tamper)";
-        if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
-            PyObject *h = PyTuple_GET_ITEM(args, 0);
-            if (PyUnicode_Check(h)) {
-                const char *s = PyUnicode_AsUTF8(h);
-                if (s) host = s;
-            }
+        /* Check ContextVar consistency BEFORE integrity check.  Detects
+         * _in_hook.set(True) without corresponding C-owned trusted state. */
+        if (!check_contextvar_consistency()) {
+            write_tamper_alert();
+            return refuse_socket_event(event, args,
+                                       "unknown (ContextVar tamper)");
         }
-        return raise_blocked(host);
+
+        if (verify_integrity())
+            return 0; /* All good — Python hook handles enforcement */
+
+        /* TAMPER DETECTED — block ALL network access */
+        write_tamper_alert();
+        return refuse_socket_event(event, args, "unknown");
     }
+
+    /* Launch, filesystem and environment events. */
+    if ((kind == EVENT_FS || kind == EVENT_FS_RENAME) &&
+        !fs_event_concerns_pth(kind, args))
+        return 0;
+    if (kind == EVENT_ENV && !env_key_is_policy_var(args))
+        return 0;
 
     if (verify_integrity())
-        return 0; /* All good — Python hook handles enforcement */
+        return 0; /* All good — the Python-side guard decides */
 
-    /* TAMPER DETECTED — block ALL network/subprocess access */
+    /* TAMPER DETECTED — the Python-side guard cannot be trusted with
+     * this operation: refuse it. */
     write_tamper_alert();
-
-    /* Extract context for the error message */
-    const char *host = "unknown";
-    if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
-        PyObject *h = PyTuple_GET_ITEM(args, 0);
-        if (is_socket &&
-            (strcmp(event, "socket.connect") == 0 ||
-             strcmp(event, "socket.sendto") == 0 ||
-             strcmp(event, "socket.sendmsg") == 0)) {
-            if (PyTuple_GET_SIZE(args) >= 2) {
-                PyObject *addr = PyTuple_GET_ITEM(args, 1);
-                if (PyTuple_Check(addr) && PyTuple_GET_SIZE(addr) >= 1)
-                    h = PyTuple_GET_ITEM(addr, 0);
-            }
-        }
-        if (PyUnicode_Check(h)) {
-            const char *s = PyUnicode_AsUTF8(h);
-            if (s) host = s;
-        }
-    }
-
-    return raise_blocked(host);
+    return raise_refused(event);
 }
 
 /* ── Snapshot management ─────────────────────────────────────────── */
@@ -620,31 +864,97 @@ install_snapshot(SnapshotEntry *staging, Py_ssize_t count)
     PyMem_Free(staging);
 }
 
-/* ── Helper: cache a function's __code__ from core_module ────────── */
+/* ── Helpers: read what the guardian needs from _core's namespace ── */
 
+/* Return a new reference to namespace[name]; KeyError if it is missing. */
 static PyObject *
-cache_func_code(const char *func_name)
+namespace_get(PyObject *ns, const char *name)
 {
-    PyObject *func = PyObject_GetAttrString(core_module, func_name);
-    if (func == NULL) return NULL;
-    PyObject *code = PyObject_GetAttrString(func, "__code__");
+    PyObject *value = PyDict_GetItemString(ns, name); /* borrowed */
+    if (value == NULL) {
+        PyErr_Format(PyExc_KeyError,
+                     "tethered._core has no '%s' — cannot activate the guardian",
+                     name);
+        return NULL;
+    }
+    Py_INCREF(value);
+    return value;
+}
+
+/* Return a new reference to the __code__ of the function namespace[name]. */
+static PyObject *
+namespace_get_code(PyObject *ns, const char *name)
+{
+    PyObject *func = namespace_get(ns, name);
+    if (func == NULL)
+        return NULL;
+    if (!PyFunction_Check(func)) {
+        PyErr_Format(PyExc_TypeError,
+                     "tethered._core.%s must be a Python function", name);
+        Py_DECREF(func);
+        return NULL;
+    }
+    PyObject *code = PyFunction_GET_CODE(func);
+    Py_INCREF(code);
     Py_DECREF(func);
-    return code; /* caller owns the reference; may be NULL on error */
+    return code;
 }
 
 /* ── Python-callable functions ───────────────────────────────────── */
+
+/* Everything an activation holds a reference to, besides the snapshot. */
+typedef struct {
+    PyObject *namespace;
+    PyObject *config;
+    PyObject *token;
+    PyObject *egress_cls;
+    PyObject *subprocess_cls;
+    PyObject *in_hook;
+    PyObject *caller_codes[EXPECTED_CALLER_COUNT];
+} Holdings;
+
+static void
+release_holdings(Holdings *h)
+{
+    Py_CLEAR(h->namespace);
+    Py_CLEAR(h->config);
+    Py_CLEAR(h->token);
+    Py_CLEAR(h->egress_cls);
+    Py_CLEAR(h->subprocess_cls);
+    Py_CLEAR(h->in_hook);
+    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
+        Py_CLEAR(h->caller_codes[i]);
+}
+
+/* Exchange the live holdings with *h.  Pointer moves only: no Python code
+ * runs and nothing can fail.  Afterwards *h holds what was live before. */
+static void
+swap_holdings(Holdings *h)
+{
+    PyObject *tmp;
+#define SWAP(live, held) do { tmp = (live); (live) = (held); (held) = tmp; } while (0)
+    SWAP(core_namespace, h->namespace);
+    SWAP(guardian_config, h->config);
+    SWAP(guardian_token, h->token);
+    SWAP(egress_blocked_cls, h->egress_cls);
+    SWAP(subprocess_blocked_cls, h->subprocess_cls);
+    SWAP(in_hook_var, h->in_hook);
+    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
+        SWAP(expected_caller_codes[i], h->caller_codes[i]);
+#undef SWAP
+}
 
 static PyObject *
 py_activate(PyObject *self, PyObject *args)
 {
     (void)self;
+    PyObject *ns;
     PyObject *config;
-    PyObject *exc_class;
     PyObject *token;
     PyObject *snapshot_items;
 
-    if (!PyArg_ParseTuple(args, "OOOO",
-                          &config, &exc_class, &token, &snapshot_items))
+    if (!PyArg_ParseTuple(args, "O!OOO",
+                          &PyDict_Type, &ns, &config, &token, &snapshot_items))
         return NULL;
 
     /* If guardian is already active, verify the token before replacing */
@@ -662,14 +972,9 @@ py_activate(PyObject *self, PyObject *args)
      * inactive.
      */
 
-    /* Module caches and the audit hook are process-lifetime: setting them
-     * up for an activation that then fails is harmless (the hook is a
-     * no-op while the guardian is inactive). */
-    if (core_module == NULL) {
-        core_module = PyImport_ImportModule("tethered._core");
-        if (core_module == NULL)
-            return NULL;
-    }
+    /* The _socket module cache and the audit hook are process-lifetime:
+     * setting them up for an activation that then fails is harmless (the
+     * hook is a no-op while the guardian is inactive). */
     if (csocket_module == NULL) {
         csocket_module = PyImport_ImportModule("_socket");
         if (csocket_module == NULL)
@@ -682,21 +987,33 @@ py_activate(PyObject *self, PyObject *args)
         hook_installed = 1;
     }
 
-    PyObject *new_in_hook = NULL;
-    PyObject *new_codes[EXPECTED_CALLER_COUNT] = { NULL, NULL };
+    Holdings next = { NULL, NULL, NULL, NULL, NULL, NULL, { NULL, NULL } };
     SnapshotEntry *staging = NULL;
     SnapshotEntry *retired = NULL;
     Py_ssize_t staging_count = 0;
     Py_ssize_t retired_count = 0;
 
-    new_in_hook = PyObject_GetAttrString(core_module, "_in_hook");
-    if (new_in_hook == NULL)
+    Py_INCREF(ns);
+    next.namespace = ns;
+    Py_INCREF(config);
+    next.config = config;
+    Py_INCREF(token);
+    next.token = token;
+
+    next.egress_cls = namespace_get(ns, "EgressBlocked");
+    if (next.egress_cls == NULL)
+        goto fail;
+    next.subprocess_cls = namespace_get(ns, "SubprocessBlocked");
+    if (next.subprocess_cls == NULL)
+        goto fail;
+    next.in_hook = namespace_get(ns, "_in_hook");
+    if (next.in_hook == NULL)
         goto fail;
 
     /* Expected __code__ objects for caller verification of resolve(). */
     for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
-        new_codes[i] = cache_func_code(expected_caller_names[i]);
-        if (new_codes[i] == NULL)
+        next.caller_codes[i] = namespace_get_code(ns, expected_caller_names[i]);
+        if (next.caller_codes[i] == NULL)
             goto fail;
     }
 
@@ -710,31 +1027,12 @@ py_activate(PyObject *self, PyObject *args)
 
     /*
      * ── Commit ──
-     * Pointer swaps only: no allocation, no Python code, nothing that can
+     * Pointer moves only: no allocation, no Python code, nothing that can
      * fail, so no audit event can observe a mixture of old and new state.
-     * References held by the previous activation are parked in locals and
-     * released afterwards.
+     * What the previous activation held ends up in `next` and `retired`.
      */
     install_snapshot(staging, staging_count);
-    staging = NULL;
-
-    PyObject *old_config = guardian_config;
-    PyObject *old_exc = egress_blocked_cls;
-    PyObject *old_token = guardian_token;
-    PyObject *old_in_hook = in_hook_var;
-    PyObject *old_codes[EXPECTED_CALLER_COUNT];
-
-    Py_INCREF(config);
-    guardian_config = config;
-    Py_INCREF(exc_class);
-    egress_blocked_cls = exc_class;
-    Py_INCREF(token);
-    guardian_token = token;
-    in_hook_var = new_in_hook;
-    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
-        old_codes[i] = expected_caller_codes[i];
-        expected_caller_codes[i] = new_codes[i];
-    }
+    swap_holdings(&next);
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
 
@@ -742,20 +1040,13 @@ py_activate(PyObject *self, PyObject *args)
      * This can run arbitrary finalizers; the guardian is fully consistent
      * by now. */
     free_entries(retired, retired_count);
-    Py_XDECREF(old_config);
-    Py_XDECREF(old_exc);
-    Py_XDECREF(old_token);
-    Py_XDECREF(old_in_hook);
-    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
-        Py_XDECREF(old_codes[i]);
+    release_holdings(&next);
 
     Py_RETURN_NONE;
 
 fail:
     free_entries(staging, staging_count);
-    Py_XDECREF(new_in_hook);
-    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
-        Py_XDECREF(new_codes[i]);
+    release_holdings(&next);
     return NULL;
 }
 
@@ -785,31 +1076,15 @@ py_deactivate(PyObject *self, PyObject *args)
         return NULL;
 
     /* Commit: pointer moves only (see py_activate). */
+    Holdings previous = { NULL, NULL, NULL, NULL, NULL, NULL, { NULL, NULL } };
     ATOMIC_STORE(guardian_active, 0);
-    PyObject *old_config = guardian_config;
-    PyObject *old_exc = egress_blocked_cls;
-    PyObject *old_token = guardian_token;
-    PyObject *old_in_hook = in_hook_var;
-    PyObject *old_codes[EXPECTED_CALLER_COUNT];
-    guardian_config = NULL;
-    egress_blocked_cls = NULL;
-    guardian_token = NULL;
-    in_hook_var = NULL;
-    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
-        old_codes[i] = expected_caller_codes[i];
-        expected_caller_codes[i] = NULL;
-    }
+    swap_holdings(&previous);
     /* csocket_module kept alive — harmless, avoids re-import */
     ATOMIC_STORE(tamper_alerted, 0);
 
     /* Release (may run finalizers; the guardian is already inactive). */
     free_entries(retired, retired_count);
-    Py_XDECREF(old_config);
-    Py_XDECREF(old_exc);
-    Py_XDECREF(old_token);
-    Py_XDECREF(old_in_hook);
-    for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
-        Py_XDECREF(old_codes[i]);
+    release_holdings(&previous);
 
     Py_RETURN_NONE;
 }
@@ -896,7 +1171,9 @@ py_resolve(PyObject *self, PyObject *args)
 
 static PyMethodDef guardian_methods[] = {
     {"activate",    py_activate,    METH_VARARGS,
-     "Activate with config, exception class, token, and integrity snapshot."},
+     "activate(core_namespace, config, token, snapshot): lock the policy.\n\n"
+     "core_namespace is tethered._core's module dict; the guardian reads\n"
+     "the exception classes and resolver callers from it."},
     {"deactivate",  py_deactivate,  METH_VARARGS,
      "Deactivate (requires the lock token object, compared by identity)."},
     {"is_active",   py_is_active,   METH_NOARGS,
@@ -913,7 +1190,8 @@ static struct PyModuleDef guardian_module = {
     "tethered._guardian",
     "C-level integrity verifier for tethered locked mode.\n\n"
     "Snapshots identity of all critical Python objects at activation.\n"
-    "On tamper detection, blocks ALL network access (fail-closed).\n"
+    "On tamper detection, blocks ALL network access and refuses the\n"
+    "guarded launch, filesystem and environment operations (fail-closed).\n"
     "Owns trusted reentrancy state for DNS resolution.",
     -1,
     guardian_methods
@@ -922,5 +1200,10 @@ static struct PyModuleDef guardian_module = {
 PyMODINIT_FUNC
 PyInit__guardian(void)
 {
+    if (config_key == NULL) {
+        config_key = PyUnicode_InternFromString("_config");
+        if (config_key == NULL)
+            return NULL;
+    }
     return PyModule_Create(&guardian_module);
 }

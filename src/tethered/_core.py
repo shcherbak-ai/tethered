@@ -467,6 +467,11 @@ _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 # attacker must first delete or rename it — both of which ARE in this set
 # and get refused.  Adding ``os.link`` / ``os.symlink`` would catch nothing
 # extra in the locked-mode threat model.
+#
+# The C guardian verifies the integrity snapshot on these same events before
+# this hook runs (``classify_event`` in ``_guardian.c``), so a replaced
+# ``_handle_pth_fs_op`` cannot wave an operation through.  An event added
+# here must be added there too; ``tests/test_guardian.py`` checks that.
 _PTH_FS_EVENTS = frozenset(("os.remove", "os.rename", "open", "os.chmod", "os.truncate"))
 
 
@@ -3034,7 +3039,7 @@ def activate(
         if locked:
             snapshot = _build_integrity_snapshot(cfg)
             try:
-                _c_guardian.activate(cfg, EgressBlocked, lock_token, snapshot)
+                _c_guardian.activate(globals(), cfg, lock_token, snapshot)
             except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
                 raise TetheredLocked from None
         elif _c_guardian.is_active():
