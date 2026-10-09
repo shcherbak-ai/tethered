@@ -11,9 +11,17 @@
 
 ## Django / FastAPI middleware
 
+Django — a middleware class:
+
 ```python
 # middleware.py
+import logging
+
 import tethered
+from django.http import HttpResponse
+
+logger = logging.getLogger(__name__)
+
 
 class EgressBlockedMiddleware:
     def __init__(self, get_response):
@@ -25,6 +33,26 @@ class EgressBlockedMiddleware:
         except tethered.EgressBlocked as e:
             logger.error("Egress blocked: %s:%s (resolved_from=%s)", e.host, e.port, e.resolved_from)
             return HttpResponse("Service unavailable", status=503)
+```
+
+FastAPI — an exception handler:
+
+```python
+# main.py
+import logging
+
+import tethered
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+app = FastAPI()
+
+
+@app.exception_handler(tethered.EgressBlocked)
+async def egress_blocked_handler(request: Request, exc: tethered.EgressBlocked) -> JSONResponse:
+    logger.error("Egress blocked: %s:%s (resolved_from=%s)", exc.host, exc.port, exc.resolved_from)
+    return JSONResponse({"detail": "Service unavailable"}, status_code=503)
 ```
 
 ## Celery tasks
@@ -39,15 +67,27 @@ def sync_data():
 
 ## Retry decorators
 
+Retrying a policy block is pointless, and catching `EgressBlocked` around the retry wrapper is too late: a wrapper that retries on any exception has already retried it. Exclude it inside the retry policy itself:
+
 ```python
-# Catch EgressBlocked before your retry logic — retrying a policy block is pointless
-try:
-    response = retry_with_backoff(make_request)
-except tethered.EgressBlocked:
-    raise  # don't retry policy violations
-except ConnectionError:
-    handle_network_failure()
+import time
+
+import tethered
+
+
+def retry_with_backoff(fn, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except tethered.EgressBlocked:
+            raise  # policy violation — a retry cannot succeed
+        except ConnectionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(2**attempt)
 ```
+
+With a retry library, pass the exception types to retry explicitly (for example `ConnectionError`, `TimeoutError`) instead of retrying on every exception. `EgressBlocked` is a `RuntimeError`, so a policy limited to network errors never retries it.
 
 ## For package authors
 
