@@ -241,6 +241,21 @@ _scopes: contextvars.ContextVar[tuple[_ScopeConfig, ...]] = contextvars.ContextV
     "tethered_scopes", default=()
 )
 
+# Number of scope entries currently active anywhere in the process, over all
+# contexts.  A scope stack is context-local, so code running in another thread
+# cannot see it; this count is how the audit hook knows that a lookup made in a
+# context without scopes may still be on a scope's behalf (see _audit_hook).
+# Written only through ``_adjust_scope_count``; read without the lock.
+_active_scope_count: int = 0
+_scope_count_lock = threading.Lock()
+
+
+def _adjust_scope_count(delta: int) -> None:
+    """Add ``delta`` to the process-wide count of active scope entries."""
+    global _active_scope_count
+    with _scope_count_lock:
+        _active_scope_count = max(0, _active_scope_count + delta)
+
 
 def _validate_allow(allow: object) -> None:
     """Validate the ``allow`` parameter for activate() and scope()."""
@@ -479,7 +494,20 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         cfg = _config
         scope_stack = _scopes.get()
 
-        if cfg is None and not scope_stack:
+        # Nothing to enforce in this context: return at once.  One exception:
+        # while a scope is active somewhere else in the process, a
+        # getaddrinfo made here may be on that scope's behalf —
+        # loop.getaddrinfo() runs socket.getaddrinfo in an executor thread,
+        # which does not carry the caller's context.  That event falls
+        # through to _handle_getaddrinfo, which with no config and no scopes
+        # enforces nothing and only records the IP -> hostname mapping, so
+        # the connect that follows in the scope's own context is matched to
+        # the name and judged by that context's scopes.
+        if (
+            cfg is None
+            and not scope_stack
+            and (not _active_scope_count or event != "socket.getaddrinfo")
+        ):
             return
 
         if event == "socket.getaddrinfo":
@@ -800,6 +828,11 @@ def _handle_getaddrinfo(
     1. Block DNS resolution for disallowed hostnames (prevents DNS exfiltration).
     2. Resolve allowed hostnames and store IP -> hostname mappings for later
        use in _handle_connect.
+
+    Also called with no config and no scopes, for a lookup made in a context
+    that has neither while a scope is active elsewhere in the process (see
+    ``_audit_hook``).  Then there is nothing to enforce and only the second
+    responsibility applies: the name and its addresses are recorded.
 
     The host may be ``str`` or ``bytes``.  ``None`` and empty hosts name the
     local machine and are not checked.
@@ -2104,6 +2137,7 @@ class scope:
         _install_hook()
         current = _scopes.get()
         self._token = _scopes.set((*current, self._scope_cfg))
+        _adjust_scope_count(1)
         logger.debug("tethered: entered %s", self._scope_cfg.label)
         return self
 
@@ -2114,6 +2148,7 @@ class scope:
         exc_tb: Any,
     ) -> None:
         assert self._token is not None  # nosec B101
+        _adjust_scope_count(-1)
         _scopes.reset(self._token)
         self._token = None
         logger.debug("tethered: exited %s", self._scope_cfg.label)
@@ -2137,10 +2172,12 @@ class scope:
                 _install_hook()
                 current = _scopes.get()
                 token = _scopes.set((*current, scope_cfg))
+                _adjust_scope_count(1)
                 logger.debug("tethered: entered %s", scope_cfg.label)
                 try:
                     return await fn(*args, **kwargs)
                 finally:
+                    _adjust_scope_count(-1)
                     _scopes.reset(token)
                     logger.debug("tethered: exited %s", scope_cfg.label)
 
@@ -2151,10 +2188,12 @@ class scope:
             _install_hook()
             current = _scopes.get()
             token = _scopes.set((*current, scope_cfg))
+            _adjust_scope_count(1)
             logger.debug("tethered: entered %s", scope_cfg.label)
             try:
                 return fn(*args, **kwargs)
             finally:
+                _adjust_scope_count(-1)
                 _scopes.reset(token)
                 logger.debug("tethered: exited %s", scope_cfg.label)
 

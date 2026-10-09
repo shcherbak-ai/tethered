@@ -102,8 +102,8 @@ def _cleanup():
     """Reset tethered state after each test.
 
     Ensures the C guardian is deactivated, the global config is cleared,
-    the IP-to-hostname map is emptied, the scope stack is reset, and the
-    propagation env var is removed.
+    the IP-to-hostname map is emptied, the scope stack and the active-scope
+    count are reset, and the propagation env var is removed.
     """
     yield
     # Deactivate C guardian first (using stored token_id)
@@ -114,6 +114,7 @@ def _cleanup():
         _ip_to_hostname.clear()
         _core._allowed_hostnames.clear()
     _scopes.set(())
+    _core._active_scope_count = 0
     os.environ.pop(_CHILD_POLICY_ENV, None)
 
 

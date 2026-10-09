@@ -15,6 +15,7 @@ import pytest
 
 import tethered
 import tethered._core as _core
+from tethered import _autoactivate
 from tethered._core import (
     _IP_MAP_MAX_SIZE,
     _audit_hook,
@@ -3121,14 +3122,21 @@ class TestScopeDecorator:
             guarded()
 
     def test_async_decorator(self):
-        """@scope() works on async functions."""
+        """@scope() works on async functions.
 
-        @tethered.scope(allow=["*.example.com"])
+        The lookup is made in the coroutine's own context, where the scope is
+        visible, and ``scope_label`` proves the scope produced the block.  (A
+        ``loop.getaddrinfo`` here would run in an executor thread that does
+        not carry the scope, and only the conftest guard would refuse it.)
+        """
+
+        @tethered.scope(allow=["*.example.com"], label="async-decorator")
         async def guarded():
-            await asyncio.get_event_loop().getaddrinfo("evil.test", 80)
+            socket.getaddrinfo("evil.test", 80)
 
-        with pytest.raises(tethered.EgressBlocked):
+        with pytest.raises(tethered.EgressBlocked) as exc_info:
             asyncio.run(guarded())
+        assert exc_info.value.scope_label == "async-decorator"
 
     def test_decorator_preserves_name(self):
         """@scope() preserves __name__ via functools.wraps."""
@@ -3210,9 +3218,37 @@ class TestScopeAsync:
 
     @pytest.mark.asyncio
     async def test_async_context_manager(self):
-        """scope() as context manager inside an async function."""
-        with tethered.scope(allow=["*.example.com"]), pytest.raises(tethered.EgressBlocked):
-            await asyncio.get_event_loop().getaddrinfo("evil.test", 80)
+        """scope() as context manager inside an async function.
+
+        The lookup is made in the task's own context, where the scope is
+        visible.  ``scope_label`` proves the scope produced the block: the
+        conftest guard raises ``EgressBlocked`` too, without a label.
+        """
+        with (
+            tethered.scope(allow=["*.example.com"], label="async-cm"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            socket.getaddrinfo("evil.test", 80)
+        assert exc_info.value.scope_label == "async-cm"
+
+    @pytest.mark.asyncio
+    async def test_executor_lookup_is_recorded_but_not_checked_by_the_scope(self):
+        """``loop.getaddrinfo`` runs in an executor thread that does not carry the scope.
+
+        The scope's DNS-time check cannot run there (a documented limit), so
+        the lookup itself goes through.  It is recorded, though, and the
+        connect that follows in the scope's own context is judged by the scope
+        under the name it was resolved from.
+        """
+        loop = asyncio.get_running_loop()
+        with tethered.scope(allow=[], allow_localhost=False, label="deny-all"):
+            await loop.getaddrinfo("localhost", 80, family=socket.AF_INET)
+            with _ip_map_lock:
+                assert "localhost" in _ip_to_hostname.get("127.0.0.1", ())
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.connect", (None, ("127.0.0.1", 80)))
+        assert exc_info.value.scope_label == "deny-all"
+        assert exc_info.value.resolved_from == "localhost"
 
     @pytest.mark.asyncio
     async def test_async_context_isolation(self):
@@ -3238,6 +3274,304 @@ class TestScopeAsync:
         await asyncio.gather(task_a(), task_b())
         assert results["a_blocked_b"] is True
         assert results["b_blocked_a"] is True
+
+
+def _run_on_selector_loop(main):
+    """Run ``main()`` to completion on a fresh ``asyncio.SelectorEventLoop``.
+
+    Connect-time enforcement needs a selector loop: the Proactor loop (the
+    Windows default) connects without raising a ``socket.connect`` audit event.
+    """
+    if sys.version_info >= (3, 12):
+        return asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
+    loop = asyncio.SelectorEventLoop()
+    try:
+        return loop.run_until_complete(main())
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
+
+
+@contextlib.asynccontextmanager
+async def _loopback_server():
+    """An asyncio TCP server on 127.0.0.1 that closes each connection; yields its port."""
+    server = await asyncio.start_server(lambda reader, writer: writer.close(), "127.0.0.1", 0)
+    try:
+        yield server.sockets[0].getsockname()[1]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _in_thread(fn, *args):
+    """Run ``fn(*args)`` in a new thread whose context has no scope stack; re-raise its error.
+
+    The empty context is explicit because Python 3.14 can start threads with a
+    copy of the caller's context (``sys.flags.thread_inherit_context``), and
+    these tests are about code that does not see the caller's scopes.
+    """
+    errors: list[BaseException] = []
+
+    def target():
+        try:
+            contextvars.Context().run(fn, *args)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=target)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    if errors:
+        raise errors[0]
+
+
+class TestScopeUnderAsyncio:
+    """A scope holds for asyncio connections made by hostname.
+
+    ``loop.getaddrinfo`` runs ``socket.getaddrinfo`` in an executor thread,
+    which does not carry the caller's context.  The lookup is recorded there
+    anyway while any scope is active, so the connect — which does run in the
+    scope's context — is matched to the hostname and judged by the scope.
+
+    Every block asserts ``scope_label``: the conftest guard also raises
+    ``EgressBlocked`` in threads where it sees no tethered state, and must not
+    be able to satisfy these tests.
+    """
+
+    def test_scope_alone_allows_the_host_it_names(self):
+        async def main():
+            async with _loopback_server() as port:
+                with tethered.scope(allow=["localhost"], allow_localhost=False, label="lib"):
+                    _reader, writer = await asyncio.open_connection(
+                        "localhost", port, family=socket.AF_INET
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+
+        _run_on_selector_loop(main)
+        assert _core._active_scope_count == 0
+
+    def test_scope_alone_blocks_a_host_it_does_not_name(self):
+        async def main():
+            async with _loopback_server() as port:
+                with (
+                    tethered.scope(allow=["other.invalid"], allow_localhost=False, label="lib"),
+                    pytest.raises(tethered.EgressBlocked) as exc_info,
+                ):
+                    await asyncio.open_connection("localhost", port, family=socket.AF_INET)
+            return exc_info.value
+
+        exc = _run_on_selector_loop(main)
+        assert exc.scope_label == "lib"
+        assert exc.resolved_from == "localhost"
+
+    def test_global_policy_and_scope_both_allow(self):
+        async def main():
+            async with _loopback_server() as port:
+                # Activated here, not before the loop exists: on Windows a
+                # selector loop needs a loopback socket pair to start.
+                tethered.activate(allow=["localhost"], allow_localhost=False)
+                try:
+                    with tethered.scope(allow=["localhost"], allow_localhost=False, label="lib"):
+                        _reader, writer = await asyncio.open_connection(
+                            "localhost", port, family=socket.AF_INET
+                        )
+                        writer.close()
+                        await writer.wait_closed()
+                finally:
+                    tethered.deactivate()
+
+        _run_on_selector_loop(main)
+
+    def test_global_policy_allows_but_scope_blocks(self):
+        async def main():
+            async with _loopback_server() as port:
+                tethered.activate(allow=["localhost"], allow_localhost=False)
+                try:
+                    with (
+                        tethered.scope(allow=["other.invalid"], allow_localhost=False, label="lib"),
+                        pytest.raises(tethered.EgressBlocked) as exc_info,
+                    ):
+                        await asyncio.open_connection("localhost", port, family=socket.AF_INET)
+                finally:
+                    tethered.deactivate()
+            return exc_info.value
+
+        exc = _run_on_selector_loop(main)
+        assert exc.scope_label == "lib"
+        assert exc.resolved_from == "localhost"
+
+    def test_global_policy_blocks_the_lookup_inside_an_allowing_scope(self):
+        """The global policy is process-wide, so it is enforced in the executor thread."""
+
+        async def main():
+            async with _loopback_server() as port:
+                tethered.activate(allow=["other.invalid"], allow_localhost=False)
+                try:
+                    with (
+                        tethered.scope(allow=["localhost"], allow_localhost=False, label="lib"),
+                        pytest.raises(tethered.EgressBlocked) as exc_info,
+                    ):
+                        await asyncio.open_connection("localhost", port, family=socket.AF_INET)
+                finally:
+                    tethered.deactivate()
+            return exc_info.value
+
+        exc = _run_on_selector_loop(main)
+        assert exc.host == "localhost"
+        assert exc.scope_label is None
+
+    # ── The mechanism, without an event loop ──
+
+    def test_lookup_in_another_thread_is_recorded_while_a_scope_is_active(self, fake_dns):
+        fake_dns.table["api.example.com"] = ["203.0.113.7"]
+        lookup = ("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        with tethered.scope(allow=["api.example.com"], allow_localhost=False, label="lib"):
+            _in_thread(_audit_hook, *lookup)
+            with _ip_map_lock:
+                assert _ip_to_hostname["203.0.113.7"] == ("api.example.com",)
+            assert "api.example.com" in _core._allowed_hostnames
+            _audit_hook("socket.connect", (None, ("203.0.113.7", 443)))
+
+    def test_recorded_lookup_is_judged_by_the_connecting_scope(self, fake_dns):
+        fake_dns.table["other.example.com"] = ["203.0.113.7"]
+        lookup = ("socket.getaddrinfo", ("other.example.com", 443, 0, 0, 0))
+        with tethered.scope(allow=["api.example.com"], allow_localhost=False, label="lib"):
+            _in_thread(_audit_hook, *lookup)  # no scope there: recorded, not refused
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.connect", (None, ("203.0.113.7", 443)))
+        assert exc_info.value.scope_label == "lib"
+        assert exc_info.value.resolved_from == "other.example.com"
+
+    def test_nothing_is_enforced_in_the_thread_without_scopes(self, fake_dns):
+        def unscoped():
+            _audit_hook("socket.getaddrinfo", ("other.example.com", 443, 0, 0, 0))
+            _audit_hook("socket.getaddrinfo", (b"\xff", 443, 0, 0, 0))
+            _audit_hook("socket.gethostbyname", ("other.example.com",))
+            _audit_hook("socket.gethostbyaddr", ("203.0.113.9",))
+            _audit_hook("socket.connect", (None, ("203.0.113.9", 443)))
+
+        with tethered.scope(allow=[], allow_localhost=False):
+            _in_thread(unscoped)
+        # Only the readable getaddrinfo led to a lookup of tethered's own.
+        assert [call[0] for call in fake_dns.calls] == ["other.example.com"]
+
+    def test_no_scope_anywhere_keeps_the_immediate_return(self, no_dns):
+        _core._install_hook()
+        assert _core._active_scope_count == 0
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        assert no_dns == []
+        assert not _core._allowed_hostnames
+
+    def test_recording_stops_when_the_last_scope_exits(self, no_dns):
+        with tethered.scope(allow=[]):
+            pass
+        _in_thread(_audit_hook, "socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        assert no_dns == []
+
+
+class TestActiveScopeCount:
+    """``_active_scope_count`` tracks scope entries across every context."""
+
+    def test_context_manager_and_nesting(self):
+        assert _core._active_scope_count == 0
+        with tethered.scope(allow=[]):
+            assert _core._active_scope_count == 1
+            with tethered.scope(allow=[]):
+                assert _core._active_scope_count == 2
+            assert _core._active_scope_count == 1
+        assert _core._active_scope_count == 0
+
+    def test_exception_in_block(self):
+        with pytest.raises(ValueError, match="boom"), tethered.scope(allow=[]):
+            raise ValueError("boom")
+        assert _core._active_scope_count == 0
+
+    def test_failed_reentry_is_not_counted(self):
+        s = tethered.scope(allow=[])
+        with s:
+            with pytest.raises(RuntimeError, match="already entered"), s:
+                pass  # pragma: no cover
+            assert _core._active_scope_count == 1
+        assert _core._active_scope_count == 0
+
+    def test_sync_decorator(self):
+        seen: list[int] = []
+
+        @tethered.scope(allow=[])
+        def guarded(fail: bool) -> None:
+            seen.append(_core._active_scope_count)
+            if fail:
+                raise ValueError("boom")
+
+        guarded(False)
+        with pytest.raises(ValueError, match="boom"):
+            guarded(True)
+        assert seen == [1, 1]
+        assert _core._active_scope_count == 0
+
+    def test_async_decorator(self):
+        seen: list[int] = []
+
+        @tethered.scope(allow=[])
+        async def guarded(fail: bool) -> None:
+            seen.append(_core._active_scope_count)
+            if fail:
+                raise ValueError("boom")
+
+        asyncio.run(guarded(False))
+        with pytest.raises(ValueError, match="boom"):
+            asyncio.run(guarded(True))
+        assert seen == [1, 1]
+        assert _core._active_scope_count == 0
+
+    def test_scopes_in_other_threads_are_counted(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def hold_scope():
+            with tethered.scope(allow=[]):
+                entered.set()
+                release.wait(timeout=10)
+
+        worker = threading.Thread(target=hold_scope)
+        worker.start()
+        try:
+            assert entered.wait(timeout=10)
+            assert _scopes.get() == ()  # not on this thread's stack ...
+            assert _core._active_scope_count == 1  # ... but counted process-wide
+        finally:
+            release.set()
+            worker.join(timeout=10)
+        assert _core._active_scope_count == 0
+
+    def test_concurrent_enter_and_exit_balance(self):
+        def churn():
+            for _ in range(300):
+                with tethered.scope(allow=[]), tethered.scope(allow=[]):
+                    pass
+
+        workers = [threading.Thread(target=churn) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+        assert _core._active_scope_count == 0
+
+    def test_inherited_scopes_are_counted(self):
+        _autoactivate._inherit_scopes(
+            [
+                {"allow": ["api.example.com"], "label": "one"},
+                {"allow": ["api.example.com"], "label": "two"},
+                "not-a-scope",
+            ]
+        )
+        assert len(_scopes.get()) == 2
+        assert _core._active_scope_count == 2
+
+    def test_never_negative(self):
+        _core._adjust_scope_count(-3)
+        assert _core._active_scope_count == 0
 
 
 class TestScopeThreading:

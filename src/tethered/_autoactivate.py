@@ -141,6 +141,9 @@ def _inherit_scopes(scopes_payload: list) -> None:
     _core._install_hook()
     current = _core._scopes.get()
     _core._scopes.set((*current, *inherited))
+    # Count them as active scopes: lookups made on this context's behalf in
+    # other threads (asyncio's executor) are then still recorded.
+    _core._adjust_scope_count(len(inherited))
 
 
 _autoactivate_from_env()
