@@ -384,6 +384,23 @@ _SUBPROCESS_EVENTS = frozenset(
         "os.posix_spawn",
         "os.spawn",
         "os.startfile",
+        # Launches that never raise ``subprocess.Popen``: Windows
+        # ``multiprocessing`` / ``ProcessPoolExecutor`` workers, and POSIX
+        # spawn / forkserver workers on CPython 3.14+ (the first version to
+        # raise ``_posixsubprocess.fork_exec``).  ``subprocess.Popen`` raises
+        # them too, right after its own event.
+        "_winapi.CreateProcess",
+        "_posixsubprocess.fork_exec",
+    )
+)
+
+# Events ``subprocess.Popen`` raises after ``subprocess.Popen`` for the same
+# launch.  Handled only when they come from somewhere else.
+_POPEN_NESTED_EVENTS = frozenset(
+    (
+        "_winapi.CreateProcess",
+        "_posixsubprocess.fork_exec",
+        "os.posix_spawn",
     )
 )
 
@@ -574,11 +591,12 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         return
 
     # Subprocess launches: parent-side enforcement (warn/block), locked-mode
-    # payload-integrity check, and per-launch scope-env injection.  Routed
-    # whenever there is anything to enforce — global config OR an active
-    # scope chain.  Scope-only firing (cfg is None) is what makes scope
-    # propagation work for libraries doing self-defense without app-level
-    # activate().
+    # payload-integrity check, and establishing the child's policy payload
+    # in the launch environment.  Covers subprocess.Popen and the launches
+    # that never raise it (multiprocessing workers).  Routed whenever there
+    # is anything to enforce — global config OR an active scope chain.
+    # Scope-only firing (cfg is None) is what makes scope propagation work
+    # for libraries doing self-defense without app-level activate().
     if event in _SUBPROCESS_EVENTS:
         cfg = _config
         scope_stack = _scopes.get()
@@ -1728,29 +1746,38 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
 _FRAME_WALK_DEPTH_CAP = 12
 
 
-def _find_execute_child_frame() -> Any | None:
-    """Walk back from the caller and return ``subprocess._execute_child``'s frame.
+def _find_launch_frame(co_name: str, module: str) -> Any | None:
+    """Walk back from the caller's caller for the frame of ``module``'s ``co_name``.
 
     The frame is identified by a defensive shape check: ``co_name`` matches,
     the frame's code declares an ``env`` local, AND the frame's globals
-    belong to the ``subprocess`` module (rejects user code that happens to
-    define a same-named function).  Returns ``None`` if no matching frame is
-    found within :data:`_FRAME_WALK_DEPTH_CAP` frames — caller decides
-    whether that is fail-closed (locked mode) or warn-and-degrade.
+    belong to ``module`` (rejects user code that happens to define a
+    same-named function).  Returns ``None`` if no matching frame is found
+    within :data:`_FRAME_WALK_DEPTH_CAP` frames.
     """
-    f = sys._getframe(1)  # start from the caller of this function
+    f = sys._getframe(2)  # start from the caller of the function that asked
     depth = 0
     while f is not None and depth < _FRAME_WALK_DEPTH_CAP:
         code = f.f_code
         if (
-            code.co_name == "_execute_child"
+            code.co_name == co_name
             and "env" in code.co_varnames
-            and f.f_globals.get("__name__") == "subprocess"
+            and f.f_globals.get("__name__") == module
         ):
             return f
         f = f.f_back
         depth += 1
     return None
+
+
+def _find_execute_child_frame() -> Any | None:
+    """Walk back from the caller and return ``subprocess._execute_child``'s frame.
+
+    Returns ``None`` if the frame is not on the stack (see
+    :func:`_find_launch_frame` for how it is recognized) — caller decides
+    whether that is fail-closed (locked mode) or treat-as-external.
+    """
+    return _find_launch_frame("_execute_child", "subprocess")
 
 
 def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
@@ -1817,9 +1844,15 @@ def _snapshot_env(env: Any) -> list[tuple[Any, Any]] | None:
 
     Reads through the mapping interface, so every mapping a launch API
     accepts is seen the way that API sees it — ``dict``,
-    ``collections.UserDict``, ``types.MappingProxyType``, ``os.environ``.
-    Returns ``None`` when the object cannot be read.
+    ``collections.UserDict``, ``types.MappingProxyType``, ``os.environ`` —
+    and also takes the ``b"NAME=value"`` sequence ``_posixsubprocess.fork_exec``
+    receives.  Returns ``None`` when the object cannot be read.
     """
+    if isinstance(env, (list, tuple)):
+        try:
+            return [(name, value) for name, _, value in (e.partition(b"=") for e in env)]
+        except Exception:
+            return None
     try:
         return list(env.items())
     except Exception:
@@ -2008,6 +2041,68 @@ def _inject_launch_env(
     return None
 
 
+def _same_path(a: Any, b: Any) -> bool:
+    """Return True if two ``str`` paths name the same file, compared lexically."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def _resolve_winapi_launch(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], dict[Any, Any] | None]:
+    """Describe a ``_winapi.CreateProcess`` launch in the ``subprocess.Popen`` audit layout.
+
+    The event carries ``(application_name, command_line, current_directory)``
+    and not the environment.  Besides ``subprocess`` the stdlib caller is
+    ``multiprocessing.popen_spawn_win32.Popen.__init__``, whose ``env`` local
+    holds it: ``None`` (inherit) or, inside a virtual environment, a private
+    copy of ``os.environ`` plus ``__PYVENV_LAUNCHER__ = sys.executable``,
+    passed while launching ``sys._base_executable`` — the base interpreter
+    then behaves as ``sys.executable`` (bpo-35797), so that launch is
+    reported as one of ``sys.executable``.
+
+    Returns ``(popen_args, private_env)``.  ``private_env`` is that private
+    copy when there is one: ``CreateProcess`` reads the mapping after the
+    audit event, so completing it in place reaches the child (rebinding the
+    local would not — the argument is already passed).  For any other caller
+    the environment is unknown and the launch is treated as inheriting the
+    process environment.
+    """
+    executable, cmdline, cwd = (*args, None, None, None)[:3]
+    env = None
+    frame = _find_launch_frame("__init__", "multiprocessing.popen_spawn_win32")
+    if frame is not None:
+        env = frame.f_locals.get("env")
+        if type(env) is not dict:
+            env = None
+        elif _same_path(executable, getattr(sys, "_base_executable", None)) and _same_path(
+            env.get("__PYVENV_LAUNCHER__"), sys.executable
+        ):
+            executable = sys.executable
+    return (executable, cmdline, cwd, env), env
+
+
+def _resolve_fork_exec_launch(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Describe a ``_posixsubprocess.fork_exec`` launch in the ``subprocess.Popen`` audit layout.
+
+    The event (CPython 3.14+) carries ``(exec_list, args, env)``: the
+    candidate executable paths in the order they are tried, the argv, and
+    the environment as a sequence of ``b"NAME=value"`` entries or ``None``
+    (inherit).  ``multiprocessing`` spawn / forkserver / resource-tracker
+    launches pass a single executable and ``None``.
+    """
+    exec_list, argv, env = (*args, None, None, None)[:3]
+    executable = exec_list[0] if isinstance(exec_list, (list, tuple)) and exec_list else None
+    return (executable, argv, None, env)
+
+
+def _describe_launch(event: str, args: tuple[Any, ...], launch_args: tuple[Any, ...]) -> str:
+    """Describe a launch for logs, covering the events without a ``subprocess.Popen`` shape."""
+    if event in ("_winapi.CreateProcess", "_posixsubprocess.fork_exec"):
+        target = launch_args[0] or launch_args[1] or "<unknown>"
+        return f"{event}({_env_text(target) or target})"
+    return _describe_subprocess_launch(event, args)
+
+
 def _handle_subprocess(
     cfg: _Config | None,
     event: str,
@@ -2038,11 +2133,29 @@ def _handle_subprocess(
                 )
         return
 
+    # ── What is being launched, and with which environment ─────────────
+    # ``subprocess.Popen`` raises a second event for the same launch
+    # (``os.posix_spawn`` / ``_posixsubprocess.fork_exec`` /
+    # ``_winapi.CreateProcess``); with ``_execute_child`` on the stack that
+    # launch was already handled.  From any other caller — multiprocessing
+    # and ProcessPoolExecutor workers never raise ``subprocess.Popen`` — the
+    # native events are translated to the ``subprocess.Popen`` layout so one
+    # classifier and one set of rules serve every route.
+    launch_event, launch_args, private_env = event, args, None
+    if event in _POPEN_NESTED_EVENTS:
+        if _find_execute_child_frame() is not None:
+            return
+        if event == "_winapi.CreateProcess":
+            launch_event = "subprocess.Popen"
+            launch_args, private_env = _resolve_winapi_launch(args)
+        elif event == "_posixsubprocess.fork_exec":
+            launch_event = "subprocess.Popen"
+            launch_args = _resolve_fork_exec_launch(args)
     # Auto-inheriting Python child launches are covered by tethered.pth →
     # _autoactivate — provided their environment carries the payload, which
     # is what the rest of this function establishes.
-    is_python = _is_auto_inheriting_python_launch(event, args)
-    _has_env, env_value = _extract_subprocess_env(event, args)
+    is_python = _is_auto_inheriting_python_launch(launch_event, launch_args)
+    _has_env, env_value = _extract_subprocess_env(launch_event, launch_args)
 
     # ── The environment the child will actually receive ────────────────
     # ``payload`` (from the immutable ``_serialized_payload``) is the only
@@ -2077,7 +2190,9 @@ def _handle_subprocess(
             if not cfg.locked:
                 _propagate_policy_to_env(cfg)
             elif state != "same-global":
-                _refuse_launch(event, _describe_subprocess_launch(event, args), "os.environ", state)
+                _refuse_launch(
+                    event, _describe_launch(event, args, launch_args), "os.environ", state
+                )
         # Scopes never live in os.environ; they need the per-launch copy.
         needs_rewrite = popen and bool(scope_stack)
     elif cfg.locked or is_python:
@@ -2086,7 +2201,7 @@ def _handle_subprocess(
         state = "unreadable" if pairs is None else _launch_env_state(pairs, expected, payload)
         acceptable = state in ("exact", "same-global")
         if cfg.locked and not acceptable:
-            _refuse_launch(event, _describe_subprocess_launch(event, args), "env", state)
+            _refuse_launch(event, _describe_launch(event, args, launch_args), "env", state)
         needs_rewrite = state != "exact"
 
     # ── Python children: make the environment right ────────────────────
@@ -2108,7 +2223,7 @@ def _handle_subprocess(
             # mapping, or a failed frame write.  Locked mode fails closed
             # (better safe than silent); otherwise the launch is no longer
             # one tethered can vouch for.
-            desc = _describe_subprocess_launch(event, args)
+            desc = _describe_launch(event, args, launch_args)
             if cfg.locked:
                 logger.warning(
                     "tethered: blocked subprocess launch in locked mode — %s: %s", failure, desc
@@ -2125,6 +2240,13 @@ def _handle_subprocess(
                 failure,
             )
             reason = " — its environment could not be given the launch-site policy"
+        elif private_env is not None:
+            # multiprocessing's own copy of os.environ: complete it in place.
+            if needs_rewrite:
+                for key in [k for k in private_env if _is_policy_env_key(k)]:
+                    del private_env[key]
+                private_env[_CHILD_POLICY_ENV] = payload
+            return
         elif acceptable:
             # No env channel to write to on this route.  The child gets the
             # at-rest global; an active scope does not travel (documented).
@@ -2139,7 +2261,7 @@ def _handle_subprocess(
     if sp == "allow":
         return
 
-    desc = _describe_subprocess_launch(event, args) + reason
+    desc = _describe_launch(event, args, launch_args) + reason
 
     if sp == "warn":
         logger.warning("tethered: external subprocess launch detected: %s", desc)

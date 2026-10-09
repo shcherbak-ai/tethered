@@ -3995,3 +3995,408 @@ class TestLaunchEnvPerformance:
         per_us = _mean_microseconds(lambda: _audit_hook("os.putenv", ("PATH", "/usr/bin")), 2000)
         # Expected: ~0.5µs; ceiling 100µs.
         assert per_us < 100, f"os.putenv audit dispatch took {per_us:.2f}µs / call"
+
+
+def _policy_state_worker() -> dict:
+    """multiprocessing worker: report the policy the tethered.pth bootstrap activated."""
+    import tethered._core as _c
+
+    cfg = _c._config
+    return {"active": cfg is not None, "locked": bool(cfg and cfg.locked)}
+
+
+def _call_in_mp_spawn_frame(fn, env):
+    """Call ``fn()`` from a frame shaped like multiprocessing's Windows spawn ``Popen.__init__``.
+
+    ``multiprocessing.popen_spawn_win32.Popen.__init__`` is where
+    ``_winapi.CreateProcess`` is called from when a worker is spawned, and its
+    ``env`` local is the environment ``CreateProcess`` receives.  Returns the
+    local afterwards.
+    """
+    namespace = {"__name__": "multiprocessing.popen_spawn_win32", "fn": fn}
+    exec(  # nosec B102 — controlled local source for the test fixture
+        "def __init__(env):\n    fn()\n    return env\n",
+        namespace,
+    )
+    return namespace["__init__"](env)
+
+
+# A multiprocessing spawn raises an audit event on Windows (every supported
+# version: ``_winapi.CreateProcess``) and, on POSIX, from CPython 3.14
+# (``_posixsubprocess.fork_exec``).  Before 3.14 a POSIX spawn is invisible.
+_requires_audited_spawn = pytest.mark.skipif(
+    sys.platform != "win32" and sys.version_info < (3, 14),
+    reason="POSIX multiprocessing spawn raises no audit event before CPython 3.14",
+)
+
+
+class TestLaunchesThatBypassPopen:
+    """Launches that never raise ``subprocess.Popen`` get the same treatment.
+
+    ``multiprocessing`` and ``ProcessPoolExecutor`` start spawn-mode workers
+    through ``_winapi.CreateProcess`` (Windows) or
+    ``_posixsubprocess.fork_exec`` (POSIX; audited from CPython 3.14).
+    Nothing in the subprocess handler ran for them: in a locked parent whose
+    ``os.environ`` had lost the policy variable, ``subprocess.run`` was
+    refused while a pool worker started with no policy.
+
+    Both event layouts are exercised with synthetic events on every
+    platform; the real pools run where the platform raises the event.
+    """
+
+    _MP_TIMEOUT = 60
+    _SCOPE = _ScopeConfig(policy=AllowPolicy(["api.example.com"]), label="bypass")
+    # Stands in for ``sys._base_executable`` / another interpreter.
+    _OTHER = os.path.join(os.path.dirname(sys.executable), "base", os.path.basename(sys.executable))
+    _MP_CMDLINE = (
+        '"%s" "-c" "from multiprocessing.spawn import spawn_main; '
+        'spawn_main(parent_pid=1, pipe_handle=2)" "--multiprocessing-fork"'
+    )
+
+    def _winapi_args(self, executable: str | None, cmdline_exe: str | None = None) -> tuple:
+        return (executable, self._MP_CMDLINE % (cmdline_exe or executable), None)
+
+    def _venv_spawn(self, cfg, env, monkeypatch, scope_stack=()):
+        """multiprocessing in a venv: launch the base interpreter with the launcher variable."""
+        monkeypatch.setattr(sys, "_base_executable", self._OTHER, raising=False)
+        args = self._winapi_args(self._OTHER)
+        return _call_in_mp_spawn_frame(
+            lambda: _handle_subprocess(cfg, "_winapi.CreateProcess", args, scope_stack), env
+        )
+
+    @staticmethod
+    def _fork_exec_args(executable: str = sys.executable, env: object = None) -> tuple:
+        path = os.fsencode(executable)
+        return ([path], [path, "-c", "pass"], env)
+
+    # ── one launch, one handling ───────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            ("_winapi.CreateProcess", ("C:\\tools\\curl.exe", "curl evil.test", None)),
+            ("_posixsubprocess.fork_exec", ([b"/usr/bin/curl"], ["curl", "evil.test"], None)),
+            ("os.posix_spawn", ("/usr/bin/curl", ["curl", "evil.test"], {})),
+        ],
+    )
+    def test_event_raised_inside_subprocess_popen_is_not_handled_twice(self, event, args):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        # From _execute_child: the subprocess.Popen event already handled this launch.
+        _call_in_execute_child(lambda: _handle_subprocess(cfg, event, args), None)
+        # From anywhere else it is a launch in its own right.
+        with pytest.raises(tethered.SubprocessBlocked):
+            _handle_subprocess(cfg, event, args)
+
+    def test_audit_hook_dispatches_the_native_launch_events(self):
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            _audit_hook("_winapi.CreateProcess", ("C:\\tools\\curl.exe", "curl evil.test", None))
+        with pytest.raises(tethered.SubprocessBlocked):
+            _audit_hook("_posixsubprocess.fork_exec", ([b"/usr/bin/curl"], ["curl"], None))
+
+    # ── _winapi.CreateProcess called directly ──────────────────────────
+
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    def test_direct_create_process_of_an_external_program(self, policy, caplog):
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        args = ("C:\\tools\\curl.exe", "curl evil.test", None)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(
+                    tethered.SubprocessBlocked,
+                    match=r"_winapi\.CreateProcess\(C:\\tools\\curl\.exe\)",
+                ):
+                    _handle_subprocess(cfg, "_winapi.CreateProcess", args)
+            else:
+                _handle_subprocess(cfg, "_winapi.CreateProcess", args)
+        assert any("external subprocess launch" in r.message for r in caplog.records) is (
+            policy != "allow"
+        )
+
+    @pytest.mark.parametrize("application_name", [sys.executable, None])
+    def test_direct_create_process_of_python_is_a_python_launch(
+        self, application_name, monkeypatch
+    ):
+        """The event has no environment: it is taken as inherited, and repaired."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        args = self._winapi_args(application_name, sys.executable)
+        _handle_subprocess(cfg, "_winapi.CreateProcess", args)
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_create_process_event_without_arguments_is_external(self):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"_winapi\.CreateProcess\(<unknown>\)"
+        ):
+            _handle_subprocess(cfg, "_winapi.CreateProcess", ())
+
+    def test_scope_without_activate_ignores_native_launch_events(self):
+        _handle_subprocess(
+            None, "_winapi.CreateProcess", self._winapi_args(sys.executable), (self._SCOPE,)
+        )
+        _handle_subprocess(None, "_posixsubprocess.fork_exec", self._fork_exec_args(), ())
+
+    # ── multiprocessing on Windows, outside a venv: env is None ────────
+
+    def test_spawn_worker_inheriting_a_cleaned_environment_gets_it_repaired(self, monkeypatch):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        args = self._winapi_args(sys.executable)
+        env = _call_in_mp_spawn_frame(
+            lambda: _handle_subprocess(cfg, "_winapi.CreateProcess", args), None
+        )
+        assert env is None
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_locked_spawn_worker_inheriting_a_stripped_environment_is_refused(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        args = self._winapi_args(sys.executable)
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"_winapi\.CreateProcess\(.*os\.environ strips"
+        ):
+            _call_in_mp_spawn_frame(
+                lambda: _handle_subprocess(cfg, "_winapi.CreateProcess", args), None
+            )
+
+    def test_spawn_with_another_executable_is_external(self):
+        """``multiprocessing.set_executable()`` pointing at a different interpreter."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        args = self._winapi_args(self._OTHER)
+        with pytest.raises(tethered.SubprocessBlocked):
+            _call_in_mp_spawn_frame(
+                lambda: _handle_subprocess(cfg, "_winapi.CreateProcess", args), None
+            )
+
+    def test_unexpected_env_object_in_the_spawn_frame_is_not_touched(self, monkeypatch):
+        """Only the plain dict multiprocessing builds itself is completed in place."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        env = _as_mapping("UserDict", {"PATH": "C:\\Windows"})
+        args = self._winapi_args(sys.executable)
+        _call_in_mp_spawn_frame(lambda: _handle_subprocess(cfg, "_winapi.CreateProcess", args), env)
+        assert dict(env) == {"PATH": "C:\\Windows"}
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    # ── multiprocessing on Windows, inside a venv: env is a private dict ─
+
+    def test_venv_spawn_worker_env_is_completed_in_place(self, monkeypatch):
+        """The base interpreter + ``__PYVENV_LAUNCHER__`` is a launch of ``sys.executable``."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env = {"PATH": "C:\\Windows", "__PYVENV_LAUNCHER__": sys.executable}
+        result = self._venv_spawn(cfg, env, monkeypatch)
+        assert result is env  # CreateProcess already holds this very mapping
+        assert env[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        assert env["PATH"] == "C:\\Windows"
+
+    def test_venv_spawn_worker_env_ends_with_one_canonical_key(self, monkeypatch):
+        monkeypatch.setattr(_core, "_ENV_NAMES_IGNORE_CASE", True)
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env = {
+            "__PYVENV_LAUNCHER__": sys.executable,
+            _CHILD_POLICY_ENV: _PERMISSIVE_PAYLOAD,
+            _CHILD_POLICY_ENV.lower(): _PERMISSIVE_PAYLOAD,
+        }
+        self._venv_spawn(cfg, env, monkeypatch)
+        assert [k for k in env if k.upper() == _CHILD_POLICY_ENV] == [_CHILD_POLICY_ENV]
+        assert env[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_venv_spawn_worker_env_carrying_the_payload_is_left_alone(self, monkeypatch):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env = {
+            "__PYVENV_LAUNCHER__": sys.executable,
+            _CHILD_POLICY_ENV: _core._canonical_payload(cfg),
+        }
+        before = dict(env)
+        self._venv_spawn(cfg, env, monkeypatch)
+        assert env == before
+
+    def test_venv_spawn_worker_does_not_receive_scopes(self, monkeypatch):
+        """Documented limit: pool workers get the global policy, not the launch-site scope."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env = {"__PYVENV_LAUNCHER__": sys.executable}
+        self._venv_spawn(cfg, env, monkeypatch, (self._SCOPE,))
+        assert env[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_locked_venv_spawn_worker_with_a_stripped_env_is_refused(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        env = {"PATH": "C:\\Windows", "__PYVENV_LAUNCHER__": sys.executable}
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"_winapi\.CreateProcess\(.*env strips"
+        ):
+            self._venv_spawn(cfg, env, monkeypatch)
+        assert _CHILD_POLICY_ENV not in env
+
+    def test_locked_venv_spawn_worker_with_the_payload_is_allowed(self, monkeypatch):
+        cfg = _launch_cfg(locked=True, external_subprocess_policy="block")
+        env = {
+            "__PYVENV_LAUNCHER__": sys.executable,
+            _CHILD_POLICY_ENV: _core._canonical_payload(cfg),
+        }
+        self._venv_spawn(cfg, env, monkeypatch)
+
+    def test_base_interpreter_without_the_launcher_variable_is_external(self, monkeypatch):
+        """Without ``__PYVENV_LAUNCHER__`` the base interpreter is just another interpreter."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env = {"PATH": "C:\\Windows"}
+        with pytest.raises(tethered.SubprocessBlocked):
+            self._venv_spawn(cfg, env, monkeypatch)
+        assert env == {"PATH": "C:\\Windows"}
+
+    # ── _posixsubprocess.fork_exec (CPython 3.14+) ─────────────────────
+
+    def test_fork_exec_of_python_inheriting_a_cleaned_environment_gets_it_repaired(
+        self, monkeypatch
+    ):
+        """multiprocessing spawn / forkserver / resource tracker: one executable, no env."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        _handle_subprocess(cfg, "_posixsubprocess.fork_exec", self._fork_exec_args())
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_locked_fork_exec_inheriting_a_stripped_environment_is_refused(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        with pytest.raises(
+            tethered.SubprocessBlocked,
+            match=r"_posixsubprocess\.fork_exec\(.*os\.environ strips",
+        ):
+            _handle_subprocess(cfg, "_posixsubprocess.fork_exec", self._fork_exec_args())
+
+    def test_fork_exec_of_another_program_is_external(self):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        args = ([b"/usr/bin/curl"], [b"curl", b"evil.test"], None)
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"_posixsubprocess\.fork_exec\(/usr/bin/curl\)"
+        ):
+            _handle_subprocess(cfg, "_posixsubprocess.fork_exec", args)
+
+    @pytest.mark.parametrize("args", [((), ["python"], None), (None, None, None), ()])
+    def test_fork_exec_without_a_usable_executable_is_external(self, args):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            _handle_subprocess(cfg, "_posixsubprocess.fork_exec", args)
+
+    def test_fork_exec_env_list_is_read_like_a_mapping(self):
+        """The event carries the environment as ``b"NAME=value"`` entries."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        entry = _CHILD_POLICY_ENV.encode() + b"=" + _core._canonical_payload(cfg).encode()
+        _handle_subprocess(
+            cfg,
+            "_posixsubprocess.fork_exec",
+            self._fork_exec_args(env=[b"PATH=/usr/bin", entry]),
+        )
+        with pytest.raises(tethered.SubprocessBlocked, match=r"cannot be rewritten"):
+            _handle_subprocess(
+                cfg, "_posixsubprocess.fork_exec", self._fork_exec_args(env=(b"PATH=/usr/bin",))
+            )
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ([b"PATH=/usr/bin"], r"env strips"),
+            (
+                [
+                    _CHILD_POLICY_ENV.encode() + b"=" + _PERMISSIVE_PAYLOAD.encode(),
+                    _CHILD_POLICY_ENV.encode() + b"=" + _PERMISSIVE_PAYLOAD.encode(),
+                ],
+                r"more than one spelling",
+            ),
+            ([_CHILD_POLICY_ENV.encode() + b"={not json"], r"not valid JSON"),
+            (["PATH=/usr/bin"], r"could not be read as a mapping"),
+        ],
+        ids=["stripped", "duplicate", "corrupt", "unreadable"],
+    )
+    def test_locked_fork_exec_env_list_is_validated(self, env, expected, monkeypatch):
+        monkeypatch.setattr(_core, "_ENV_NAMES_IGNORE_CASE", False)
+        cfg = _launch_cfg(locked=True)
+        with pytest.raises(tethered.SubprocessBlocked, match=expected):
+            _handle_subprocess(cfg, "_posixsubprocess.fork_exec", self._fork_exec_args(env=env))
+
+    # ── real pools ─────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    @pytest.mark.parametrize("locked", [False, True])
+    def test_multiprocessing_pool_keeps_working(self, policy, locked, caplog):
+        """Ordinary multiprocessing, in a venv, under every policy, locked and unlocked."""
+        if locked and _core._c_guardian is None:
+            pytest.skip("C guardian extension not available")
+        lock = {"locked": True, "lock_token": object()} if locked else {}
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy=policy, **lock)
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            mp.get_context("spawn").Pool(processes=1) as pool,
+        ):
+            state = pool.apply_async(_policy_state_worker).get(timeout=self._MP_TIMEOUT)
+        assert state == {"active": True, "locked": locked}
+        assert not [r.message for r in caplog.records if " launch" in r.message]
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_process_pool_executor_keeps_working(self):
+        tethered.activate(
+            allow=["*.example.com"],
+            locked=True,
+            lock_token=object(),
+            external_subprocess_policy="block",
+        )
+        with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as executor:
+            state = executor.submit(_policy_state_worker).result(timeout=self._MP_TIMEOUT)
+        assert state == {"active": True, "locked": True}
+
+    @_requires_audited_spawn
+    def test_spawn_worker_is_protected_after_a_whitelist_cleanup(self, monkeypatch):
+        """An ordinary environment cleanup followed by multiprocessing."""
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        _whitelist_cleanup(monkeypatch)
+        assert _CHILD_POLICY_ENV not in os.environ
+        with mp.get_context("spawn").Pool(processes=1) as pool:
+            state = pool.apply_async(_policy_state_worker).get(timeout=self._MP_TIMEOUT)
+        assert state["active"] is True
+
+    @_requires_audited_spawn
+    def test_process_pool_worker_is_protected_after_the_variable_left_os_environ(self):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        os.environ.pop(_CHILD_POLICY_ENV)
+        with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as executor:
+            state = executor.submit(_policy_state_worker).result(timeout=self._MP_TIMEOUT)
+        assert state["active"] is True
+
+    @_requires_audited_spawn
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_locked_parent_refuses_a_spawn_worker_like_a_subprocess(self):
+        """The report's reproduction: ``subprocess.run`` was refused, the worker ran unprotected."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        os.environ.pop(_CHILD_POLICY_ENV)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"strips _TETHERED_CHILD_POLICY"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"], capture_output=True, timeout=30
+            )
+        process = mp.get_context("spawn").Process(target=_policy_state_worker)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"strips _TETHERED_CHILD_POLICY"):
+            process.start()
+
+    @_requires_audited_spawn
+    def test_set_executable_to_another_interpreter_is_external(self):
+        import multiprocessing.spawn as mp_spawn
+
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        original = mp_spawn.get_executable()
+        mp.set_executable(self._OTHER)
+        try:
+            process = mp.get_context("spawn").Process(target=_policy_state_worker)
+            with pytest.raises(tethered.SubprocessBlocked):
+                process.start()
+        finally:
+            mp.set_executable(original)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="_winapi is Windows-only")
+    def test_direct_create_process_call_is_subject_to_the_policy(self):
+        import _winapi
+
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked, match=r"_winapi\.CreateProcess"):
+            _winapi.CreateProcess(
+                os.environ["COMSPEC"], "cmd /c exit 0", None, None, False, 0, None, None, None
+            )
