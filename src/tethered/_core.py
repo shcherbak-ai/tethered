@@ -925,10 +925,40 @@ def _handle_connect(
         )
 
 
+# Longest program name a launch description quotes from a Windows command
+# line (MAX_PATH); a longer first token is cut.
+_LAUNCH_DESC_PROGRAM_MAX = 260
+
+
+def _cmdline_program(cmdline: str) -> str:
+    """Return the program-name token of a Windows command line, for log messages.
+
+    Best effort: the quoted run when the line starts with a quote, else
+    everything up to the first whitespace, on one line and cut to
+    ``_LAUNCH_DESC_PROGRAM_MAX``.  The arguments are left out on purpose —
+    the POSIX description names the executable only, and command lines
+    routinely carry credentials that don't belong in logs or exception text.
+    """
+    line = cmdline.lstrip()
+    if line.startswith('"'):
+        token = line[1:].partition('"')[0]
+    else:
+        token = line.split(None, 1)[0] if line else ""
+    token = " ".join(token.split())
+    if len(token) > _LAUNCH_DESC_PROGRAM_MAX:
+        token = token[:_LAUNCH_DESC_PROGRAM_MAX] + "..."
+    return token or "<unknown>"
+
+
 def _describe_subprocess_launch(event: str, args: tuple[Any, ...]) -> str:
     """Build a human-readable description of a subprocess launch for logging."""
     if event == "subprocess.Popen":
-        exe = args[0] if args else "<unknown>"
+        exe = args[0] if args else None
+        if exe is None:
+            # Windows without ``executable=``: the event's executable is None
+            # and only the command line (args[1]) names the program.
+            cmdline = args[1] if len(args) >= 2 else None
+            exe = _cmdline_program(cmdline) if isinstance(cmdline, str) else "<unknown>"
         return f"subprocess.Popen({exe})"
     if event == "os.system":
         cmd = args[0] if args else "<unknown>"
