@@ -1278,6 +1278,108 @@ class TestInterpretersSharingTheGil:
         ]
         assert result["after"] == [False, "ok", "ok"]
 
+    def test_the_lock_outlives_the_interpreter_that_took_it(self, tmp_path):
+        """Destroying the owner leaves the process locked, and nobody inherits the lock.
+
+        The guardian knows the owner by its interpreter ID.  By the address
+        of its state, the next interpreter created — which is likely to be
+        given that memory — would pass for the owner and, with a copy of
+        tethered that nothing pins, reach anything.
+
+        Run in a child process: this lock can never be released again.
+        """
+        result_file = tmp_path / "result.json"
+        child = subprocess.run(  # nosec B603
+            [sys.executable, "-c", _DESTROY_THE_OWNER, str(result_file), str(tmp_path / "later")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert child.returncode == 0, child.stderr
+        assert "TAMPER DETECTED" not in child.stderr
+        result = json.loads(result_file.read_text())
+        refused = f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}"
+        assert result["later interpreters"] == [refused] * 4
+        assert result["main"] == [True, False, refused, "TetheredLocked"]
+
+
+# Child process of test_the_lock_outlives_the_interpreter_that_took_it:
+# ``sys.argv`` holds the result file and the file later interpreters append to.
+_DESTROY_THE_OWNER = '''
+import json, sys
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered
+import tethered._core as core
+
+result_file, later_file = sys.argv[1:]
+
+def create(shared_gil):
+    if sys.version_info >= (3, 13):
+        return interps.create("legacy" if shared_gil else "isolated")
+    if sys.version_info >= (3, 12):
+        return interps.create(isolated=not shared_gil)
+    return interps.create()
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+def connect():
+    try:
+        sys.audit("socket.connect", None, ("127.0.0.1", 9))
+    except RuntimeError as exc:
+        return str(exc)
+    return "ok"
+
+def deactivate():
+    try:
+        tethered.deactivate()
+    except RuntimeError as exc:
+        return type(exc).__name__
+    return "ok"
+
+# A later interpreter drops whatever policy of its own it started with, so
+# that only the guardian stands between it and the connection.
+LATER = """
+import sys
+core = sys.modules.get("tethered._core")
+if core is not None:
+    core._config = None
+try:
+    sys.audit("socket.connect", None, ("127.0.0.1", 9))
+except RuntimeError as exc:
+    found = str(exc)
+else:
+    found = "ok"
+with open(%r, "a", encoding="utf-8") as f:
+    f.write(found + "\\\\n")
+""" % later_file
+
+owner = create(True)
+run(owner, "import tethered\\n"
+           "tethered.activate(allow=[], locked=True, lock_token=object())\\n")
+interps.destroy(owner)
+for shared_gil in (False, True, False, True):
+    later = create(shared_gil)
+    run(later, LATER)
+    interps.destroy(later)
+
+with open(later_file, encoding="utf-8") as f:
+    later_results = f.read().splitlines()
+out = {
+    "later interpreters": later_results,
+    "main": [core._c_guardian.is_active(), core._c_guardian.verify(), connect(), deactivate()],
+}
+with open(result_file, "w") as f:
+    json.dump(out, f)
+'''
+
 
 class TestOtherStartupFailures:
     """Only the lock is treated differently: every other strict failure still stops startup.

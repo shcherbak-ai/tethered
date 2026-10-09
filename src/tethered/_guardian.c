@@ -32,10 +32,10 @@
  * not — it consists of objects of the interpreter that locked the policy.
  * An interpreter with its own GIL (3.12+) runs the hook concurrently with
  * that one, so for an event raised anywhere else the hook reads atomics
- * (guardian_active, guardian_interp, guardian_log_only) and nothing more of
+ * (guardian_active, guardian_owner_id, guardian_log_only) and nothing more of
  * the state.  While a policy is locked, such an interpreter is refused
  * every operation tethered guards: it cannot be verified and holds no
- * policy the guardian can vouch for (see guardian_interp and
+ * policy the guardian can vouch for (see guardian_owner_id and
  * other_interpreter_event).  The one exception is a log-only policy, which
  * refuses no connection or lookup anywhere (see guardian_log_only).
  *
@@ -98,39 +98,22 @@ typedef struct {
 
 /* ── Atomics compat ──────────────────────────────────────────────── */
 
-/*
- * ATOMIC_PTR is for a pointer that threads of other interpreters read
- * without holding this interpreter's GIL (see guardian_interp).  It is
- * always stored before an ATOMIC_STORE and loaded after an ATOMIC_LOAD of
- * guardian_active, which is what orders the two; the pointer access itself
- * only has to be free of tearing.  MSVC without C11 atomics gets that from
- * an aligned volatile pointer.
- */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
     && !defined(__STDC_NO_ATOMICS__)
 #  include <stdatomic.h>
 #  define ATOMIC_INT     _Atomic int
 #  define ATOMIC_STORE(v, x) atomic_store(&(v), (x))
 #  define ATOMIC_LOAD(v)     atomic_load(&(v))
-#  define ATOMIC_PTR(T)  _Atomic(T)
-#  define ATOMIC_PTR_STORE(v, x) atomic_store(&(v), (x))
-#  define ATOMIC_PTR_LOAD(v)     atomic_load(&(v))
 #elif defined(_MSC_VER)
 #  include <intrin.h>
 #  define ATOMIC_INT     volatile int
 #  define ATOMIC_STORE(v, x) _InterlockedExchange((volatile long *)&(v), (x))
 #  define ATOMIC_LOAD(v)     _InterlockedOr((volatile long *)&(v), 0)
-#  define ATOMIC_PTR(T)  T volatile
-#  define ATOMIC_PTR_STORE(v, x) ((v) = (x))
-#  define ATOMIC_PTR_LOAD(v)     (v)
 #else
    /* GCC/Clang built-ins */
 #  define ATOMIC_INT     volatile int
 #  define ATOMIC_STORE(v, x) __atomic_store_n(&(v), (x), __ATOMIC_SEQ_CST)
 #  define ATOMIC_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_SEQ_CST)
-#  define ATOMIC_PTR(T)  T volatile
-#  define ATOMIC_PTR_STORE(v, x) __atomic_store_n(&(v), (x), __ATOMIC_SEQ_CST)
-#  define ATOMIC_PTR_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_SEQ_CST)
 #endif
 
 /* ── C-level state ───────────────────────────────────────────────── */
@@ -183,7 +166,8 @@ static const char      *expected_caller_names[EXPECTED_CALLER_COUNT] = {
 static THREAD_LOCAL int resolving_depth = 0;
 
 /*
- * The interpreter that locked the policy (the "owning" interpreter).
+ * The interpreter that locked the policy (the "owning" interpreter),
+ * identified by its interpreter ID.
  *
  * A C audit hook is process-wide: it also runs for events raised in other
  * interpreters.  Those have their own modules and, since 3.12, possibly
@@ -197,26 +181,61 @@ static THREAD_LOCAL int resolving_depth = 0;
  * whatever Python hook it has is its own to remove), and it cannot hand it
  * the policy.  So while a policy is locked, every other interpreter is
  * refused the operations tethered guards — see other_interpreter_event(),
- * which works from guardian_active, this pointer, the event's own arguments
+ * which works from guardian_active, this ID, the event's own arguments
  * and objects of the interpreter the event was raised in, and nothing else.
  *
  * "Other" is relative to whoever took the lock.  This module can only be
  * loaded by interpreters that share the main GIL; if such a subinterpreter
  * locks a policy, the main interpreter is the one that is refused.
  *
+ * The ID, not the address of the interpreter state.  CPython gives an ID
+ * to one interpreter per process and never again, whereas the memory of a
+ * destroyed interpreter's state is what the next one created is likely to
+ * get — and that one would then pass for the owner, with a copy of
+ * tethered that nothing pins.  With the ID, destroying the owning
+ * interpreter leaves nobody who is the owner: the lock can no longer be
+ * released, and every interpreter is refused what tethered guards for the
+ * rest of the process.
+ *
+ * An int, so that it fits the atomic the hook reads anyway.  An interpreter
+ * whose ID an int cannot hold has no usable ID (current_interpreter_id): it
+ * cannot take a lock and is never the owner.
+ *
  * Written before guardian_active is set, read by the hook only after it
  * has seen guardian_active set, and never changed while it is set: the
  * module's functions refuse a caller from another interpreter (see
- * locked_elsewhere).  Compared, never dereferenced.
+ * locked_elsewhere).
  */
-static ATOMIC_PTR(PyInterpreterState *) guardian_interp = NULL;
+#define NO_INTERPRETER_ID (-1)
+static ATOMIC_INT guardian_owner_id = NO_INTERPRETER_ID;
+
+/* The calling interpreter's ID, or NO_INTERPRETER_ID when an int cannot
+ * hold it.  Leaves no exception. */
+static int
+current_interpreter_id(void)
+{
+    int64_t id = PyInterpreterState_GetID(PyInterpreterState_Get());
+
+    if (id < 0)
+        PyErr_Clear(); /* (it fails only when given no interpreter) */
+    return (id >= 0 && id <= INT_MAX) ? (int)id : NO_INTERPRETER_ID;
+}
+
+/* Does the calling interpreter hold the lock?  To be asked once
+ * guardian_active has been seen set. */
+static int
+holds_the_lock(void)
+{
+    int id = current_interpreter_id();
+
+    return id != NO_INTERPRETER_ID && id == ATOMIC_LOAD(guardian_owner_id);
+}
 
 /* Is a policy locked by an interpreter other than the calling one? */
 static int
 locked_elsewhere(void)
 {
-    return ATOMIC_LOAD(guardian_active) &&
-           PyInterpreterState_Get() != ATOMIC_PTR_LOAD(guardian_interp);
+    return ATOMIC_LOAD(guardian_active) && !holds_the_lock();
 }
 
 /*
@@ -1023,8 +1042,8 @@ guardian_hook(const char *event, PyObject *args, void *userData)
         return 0;
 
     /* Not the interpreter that holds the lock: none of the guardian's
-     * objects may be touched from here (see guardian_interp). */
-    if (PyInterpreterState_Get() != ATOMIC_PTR_LOAD(guardian_interp))
+     * objects may be touched from here (see guardian_owner_id). */
+    if (!holds_the_lock())
         return other_interpreter_event(event, args);
 
     int kind = classify_event(event);
@@ -1544,6 +1563,14 @@ py_activate(PyObject *self, PyObject *args)
      * inactive.
      */
 
+    /* The lock is held under the interpreter's ID (see guardian_owner_id). */
+    int owner_id = current_interpreter_id();
+    if (owner_id == NO_INTERPRETER_ID) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "tethered: this interpreter has no ID a lock can be held under");
+        return NULL;
+    }
+
     /* Without its hook the guardian would enforce nothing: no hook, no
      * activation. */
     if (ensure_hook_installed() < 0)
@@ -1626,7 +1653,7 @@ py_activate(PyObject *self, PyObject *args)
     staging = NULL; /* owned by the live snapshot now */
     swap_holdings(&next);
     /* (On a re-activation this stores the value it already has.) */
-    ATOMIC_PTR_STORE(guardian_interp, PyInterpreterState_Get());
+    ATOMIC_STORE(guardian_owner_id, owner_id);
     ATOMIC_STORE(guardian_log_only, log_only);
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
