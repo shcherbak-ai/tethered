@@ -8,10 +8,12 @@ import contextlib
 import copy
 import functools
 import gc
+import inspect
 import json
 import logging
 import os
 import pickle
+import site
 import socket
 import sys
 import threading
@@ -645,6 +647,10 @@ _UNPINNED_GLOBALS = {
     "tethered._core": {
         "_config": "the active config; the guardian tracks its identity separately",
         "_hook_installed": "flips False -> True when the audit hook is installed",
+        "_active_scope_count": "number of scopes entered anywhere in the process (int)",
+        "_proactor_warning_pending": "cleared once the Proactor-loop warning has been logged",
+        "_pth_path_cache": "bootstrap path cached for scope-only use (None until computed)",
+        "_env_dirty": "set when the policy variable changed behind os.environ's back",
         **_MODULE_METADATA,
     },
     "tethered._policy": dict(_MODULE_METADATA),
@@ -1029,8 +1035,16 @@ def _noop_like(func: types.FunctionType) -> types.FunctionType:
 
     ``__code__`` can only be assigned a code object with a matching number
     of free variables, and none of the module-level functions is a closure.
+    The replacement is a generator when ``func`` is one: assigning a code
+    object of the other kind is deprecated from Python 3.13.
     """
     assert not func.__code__.co_freevars
+    if inspect.isgeneratorfunction(func):
+
+        def noop_generator(*args, **kwargs):
+            yield from ()
+
+        return noop_generator
     return lambda *args, **kwargs: None
 
 
@@ -1221,15 +1235,20 @@ PTH_LINE = "import tethered._autoactivate\n"
 def scratch_pth(tmp_path, monkeypatch):
     """Point tethered at a scratch ``site-packages`` holding a ``tethered.pth``.
 
-    ``_compute_pth_path()`` derives the path from ``tethered.__file__``, so
-    policies activated while this fixture is in effect guard the scratch
-    file and no test can damage the real one.
+    ``_compute_pth_path()`` accepts only a hook in a directory ``site``
+    processes and prefers the one beside ``tethered.__file__``, so the scratch
+    directory is presented as the interpreter's one site directory.  Policies
+    activated while this fixture is in effect guard the scratch file and no
+    test can damage the real one.  Only ``site`` and the package's
+    ``__file__`` are patched — names the locked-mode snapshot does not pin.
     """
     site_packages = tmp_path / "site-packages"
     (site_packages / "tethered").mkdir(parents=True)
     pth = site_packages / "tethered.pth"
     pth.write_text(PTH_LINE)
     monkeypatch.setattr(tethered, "__file__", str(site_packages / "tethered" / "__init__.py"))
+    monkeypatch.setattr(site, "getsitepackages", lambda prefixes=None: [str(site_packages)])
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
     return pth
 
 
@@ -1960,7 +1979,7 @@ class TestResolverWindow:
         assert calls == []
         with _ip_map_lock:
             # The genuine resolver answered, from the hosts file.
-            assert _ip_to_hostname.get("127.0.0.1") == "localhost"
+            assert _ip_to_hostname.get("127.0.0.1") == ("localhost",)
             assert "203.0.113.66" not in _ip_to_hostname
         assert "TAMPER DETECTED" not in capfd.readouterr().err
 
