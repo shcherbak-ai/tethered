@@ -32,6 +32,25 @@ logger = logging.getLogger("tethered")
 _IP_MAP_MAX_SIZE = 4096
 
 
+def _rebuild_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseException:
+    """Recreate a pickled or copied policy exception without calling ``__init__``.
+
+    ``BaseException.__reduce__`` rebuilds an exception as ``cls(*self.args)``.
+    ``EgressBlocked`` and ``SubprocessBlocked`` hand ``RuntimeError`` a single
+    formatted message but take other positional parameters themselves, so
+    that call raises ``TypeError`` — in the process *receiving* the pickle.
+    A blocked call in a pool worker then breaks the pool
+    (``ProcessPoolExecutor``) or never delivers a result
+    (``multiprocessing.Pool``) instead of raising in the parent.
+
+    ``BaseException.__new__`` stores ``args`` by itself, and the attributes
+    travel as pickle state, so nothing is lost by skipping ``__init__`` —
+    which also keeps this correct for subclasses, whatever signature their
+    constructor has.
+    """
+    return cls.__new__(cls, *args)
+
+
 class EgressBlocked(RuntimeError):
     """Raised when a network connection is blocked by tethered policy."""
 
@@ -73,6 +92,10 @@ class EgressBlocked(RuntimeError):
             msg += f"\nHint: {scope_hint}"
         super().__init__(msg)
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Picklable and copyable with every attribute — see _rebuild_exception.
+        return _rebuild_exception, (type(self), self.args), self.__dict__
+
 
 class TetheredLocked(RuntimeError):
     """Raised when a locked policy refuses deactivation or replacement."""
@@ -97,6 +120,10 @@ class SubprocessBlocked(RuntimeError):
             f"Blocked by tethered: {description} — refused by tethered policy "
             f"(external_subprocess_policy or locked-mode tamper check)"
         )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Picklable and copyable with every attribute — see _rebuild_exception.
+        return _rebuild_exception, (type(self), self.args), self.__dict__
 
 
 # ── Immutable config bundle ───────────────────────────────────────
