@@ -1776,28 +1776,70 @@ def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
     return True
 
 
+def _snapshot_env(env: Any) -> list[tuple[Any, Any]] | None:
+    """Read a launch environment once and return its ``(name, value)`` pairs.
+
+    Reads through the mapping interface, so every mapping a launch API
+    accepts is seen the way that API sees it — ``dict``,
+    ``collections.UserDict``, ``types.MappingProxyType``, ``os.environ``.
+    Returns ``None`` when the object cannot be read.
+    """
+    try:
+        return list(env.items())
+    except Exception:
+        try:
+            return list(zip(env.keys(), env.values(), strict=True))
+        except Exception:
+            return None
+
+
 def _build_per_launch_env(
     event: str,
     args: tuple[Any, ...],
     scope_stack: tuple[_ScopeConfig, ...],
     cfg: _Config | None,
-) -> dict[str, str]:
+) -> dict[Any, Any] | None:
     """Build the per-launch env dict to inject into ``_execute_child``.
 
-    Copies the existing env (the explicit ``env=`` arg if it was a dict, else
-    ``os.environ``) and overwrites ``_TETHERED_CHILD_POLICY`` with a
-    nested-format payload that carries the canonical global plus the active
-    scope chain.  All other env vars are preserved verbatim — never
-    fabricate a child env from scratch.
+    Copies the effective launch environment — the explicit ``env=`` mapping
+    whatever its type, or ``os.environ`` when the child would inherit — and
+    overwrites ``_TETHERED_CHILD_POLICY`` with a nested-format payload that
+    carries the canonical global plus the active scope chain.  All other env
+    vars are preserved verbatim — never fabricate a child env from scratch —
+    and the caller's mapping is never mutated.  Returns ``None`` when the
+    caller's mapping cannot be read: an environment tethered cannot copy is
+    never replaced by the parent's.
     """
-    has_env, env_value = _extract_subprocess_env(event, args)
-    if has_env and isinstance(env_value, dict):
-        new_env: dict[str, str] = dict(env_value)
-    else:
-        new_env = dict(os.environ)
+    _has_env, env_value = _extract_subprocess_env(event, args)
+    pairs = _snapshot_env(os.environ if env_value is None else env_value)
+    if pairs is None:
+        return None
+    new_env = dict(pairs)
     global_dict = cfg._global_payload_dict if cfg is not None else None
     new_env[_CHILD_POLICY_ENV] = _build_env_payload(global_dict, scope_stack)
     return new_env
+
+
+def _inject_launch_env(
+    event: str,
+    args: tuple[Any, ...],
+    scope_stack: tuple[_ScopeConfig, ...],
+    cfg: _Config | None,
+) -> str | None:
+    """Give ``subprocess.Popen._execute_child`` a constructed environment for this launch.
+
+    Returns ``None`` on success, else the reason it could not be put in
+    place — the caller decides what that means (locked mode fails closed).
+    """
+    frame = _find_execute_child_frame()
+    if frame is None:
+        return "could not locate subprocess._execute_child frame"
+    new_env = _build_per_launch_env(event, args, scope_stack, cfg)
+    if new_env is None:
+        return "the launch environment could not be read as a mapping"
+    if not _inject_scope_env(frame, new_env):
+        return "frame-locals mutation failed"
+    return None
 
 
 def _handle_subprocess(
@@ -1894,42 +1936,32 @@ def _handle_subprocess(
     #     ``-S``-flag launches that disable ``site.py``).
     if _is_auto_inheriting_python_launch(event, args):
         if scope_stack:
-            frame = _find_execute_child_frame()
-            if frame is None:
-                # No subprocess._execute_child frame in the stack — could be
-                # a debugger wrapper, a future CPython refactor, or a
-                # platform without the standard implementation.  Locked mode
-                # fails closed (better safe than silent).  Otherwise warn
-                # once and let the launch proceed with the at-rest global
-                # payload from os.environ.
+            failure = _inject_launch_env(event, args, scope_stack, cfg)
+            if failure is not None:
+                # The per-launch environment could not be put in place: no
+                # subprocess._execute_child frame in the stack (a debugger
+                # wrapper, a future CPython refactor, a platform without the
+                # standard implementation), an ``env=`` that cannot be read
+                # as a mapping, or a failed frame write.  Locked mode fails
+                # closed (better safe than silent).  Otherwise warn and let
+                # the launch proceed with whatever its environment carries.
                 if cfg is not None and cfg.locked:
                     desc = _describe_subprocess_launch(event, args)
                     logger.warning(
-                        "tethered: blocked subprocess launch in locked mode — "
-                        "could not locate subprocess._execute_child frame for "
-                        "scope env injection: %s",
+                        "tethered: blocked subprocess launch in locked mode — %s: %s",
+                        failure,
                         desc,
                     )
                     raise SubprocessBlocked(
                         event,
-                        f"{desc} — could not locate subprocess._execute_child frame; "
-                        "scope subprocess propagation unavailable on this build "
-                        "and locked mode requires fail-closed behavior",
+                        f"{desc} — {failure}; scope subprocess propagation "
+                        "unavailable and locked mode requires fail-closed behavior",
                     )
                 logger.warning(
-                    "tethered: scope subprocess propagation unavailable on this "
-                    "build (no subprocess._execute_child frame in the call stack); "
-                    "child will inherit only the global policy"
+                    "tethered: scope subprocess propagation unavailable (%s); "
+                    "the child will not inherit the active scope",
+                    failure,
                 )
-            else:
-                new_env = _build_per_launch_env(event, args, scope_stack, cfg)
-                if not _inject_scope_env(frame, new_env) and cfg is not None and cfg.locked:
-                    desc = _describe_subprocess_launch(event, args)
-                    raise SubprocessBlocked(
-                        event,
-                        f"{desc} — frame-locals mutation failed; locked mode "
-                        "requires fail-closed behavior",
-                    )
         return
 
     # Non-auto-inheriting launch (os.system, external executable, Python

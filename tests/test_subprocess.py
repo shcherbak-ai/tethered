@@ -2792,3 +2792,192 @@ class TestScopeSubprocessPerformance:
         per_us = self._measure(call, iterations=2000)
         # Expected: ~1µs; ceiling 100µs.
         assert per_us < 100, f"_audit_hook socket path took {per_us:.2f}µs / call"
+
+
+# ── Launch-environment tests ──────────────────────────────────────────
+# What the child process actually receives: the mapping the caller passed,
+# the process environment, and the policy payload tethered puts into them.
+
+# Prints the child's tethered state as JSON.  ``tethered._core`` is only in
+# ``sys.modules`` when the tethered.pth bootstrap ran.
+_CHILD_STATE_PROBE = (
+    "import json, os, sys\n"
+    "core = sys.modules.get('tethered._core')\n"
+    "cfg = core._config if core else None\n"
+    "print(json.dumps({\n"
+    "    'active': cfg is not None,\n"
+    "    'locked': bool(cfg and cfg.locked),\n"
+    "    'allow': core._build_child_policy_payload(cfg)['allow'] if cfg else None,\n"
+    "    'scopes': len(core._scopes.get()) if core else 0,\n"
+    "    'sentinel': os.environ.get('TETHERED_SENTINEL'),\n"
+    "    'parent_only': os.environ.get('TETHERED_PARENT_ONLY'),\n"
+    "}))\n"
+)
+
+_ENV_MAPPING_KINDS = ("dict", "UserDict", "MappingProxyType")
+
+
+def _minimal_child_env() -> dict[str, str]:
+    """The sanitized environment an application would hand a child (no policy variable)."""
+    keep = {"PATH", "SYSTEMROOT", "PATHEXT", "TEMP", "TMP"}
+    return {k: v for k, v in os.environ.items() if k.upper() in keep}
+
+
+def _as_mapping(kind: str, data: dict):
+    """Wrap ``data`` in one of the mapping types launch APIs accept."""
+    import collections
+    import types
+
+    if kind == "UserDict":
+        return collections.UserDict(data)
+    if kind == "MappingProxyType":
+        return types.MappingProxyType(dict(data))
+    return dict(data)
+
+
+def _launch_probe(**popen_kwargs) -> dict:
+    """Launch a real child of ``sys.executable`` and return the state it reports."""
+    r = subprocess.run(  # nosec B603
+        [sys.executable, "-c", _CHILD_STATE_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        **popen_kwargs,
+    )
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def _call_in_execute_child(fn, env):
+    """Call ``fn()`` from a frame shaped like ``subprocess.Popen._execute_child``.
+
+    Returns that frame's ``env`` local afterwards — the object the real
+    ``_execute_child`` would hand to the OS.  Audit hooks run untraced, so
+    coverage of the hook's code comes from direct calls like this one.
+    """
+    namespace = {"__name__": "subprocess", "fn": fn}
+    exec(  # nosec B102 — controlled local source for the test fixture
+        "def _execute_child(env):\n    fn()\n    return env\n",
+        namespace,
+    )
+    return namespace["_execute_child"](env)
+
+
+class TestLaunchEnvMappingCopy:
+    """The injected environment is a copy of whatever mapping the caller supplied.
+
+    Regression tests for scope propagation replacing a non-``dict`` ``env=``
+    with the parent's ``os.environ``: variables the caller withheld reached
+    the child and variables the caller added vanished.
+    """
+
+    _SCOPE = _ScopeConfig(policy=AllowPolicy(["api.allowed.com"]), label="mapping-copy")
+
+    def _cfg(self) -> _Config:
+        return _Config(policy=AllowPolicy(["*.allowed.com"]))
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_copies_the_callers_mapping(self, kind, monkeypatch):
+        monkeypatch.setenv("TETHERED_PARENT_ONLY", "1")
+        env_arg = _as_mapping(kind, {"TETHERED_SENTINEL": "from-caller"})
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", ("/x", [], None, env_arg), (self._SCOPE,), self._cfg()
+        )
+        assert type(new_env) is dict
+        assert new_env["TETHERED_SENTINEL"] == "from-caller"
+        assert "TETHERED_PARENT_ONLY" not in new_env
+        assert json.loads(new_env[_CHILD_POLICY_ENV])["scopes"][0]["label"] == "mapping-copy"
+        # The caller's mapping is never mutated.
+        assert dict(env_arg) == {"TETHERED_SENTINEL": "from-caller"}
+
+    def test_copies_os_environ_passed_explicitly(self, monkeypatch):
+        """``env=os.environ`` is a mapping like any other, and is left untouched."""
+        monkeypatch.setenv("TETHERED_SENTINEL", "from-environ")
+        monkeypatch.setenv(_CHILD_POLICY_ENV, "untouched")
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", ("/x", [], None, os.environ), (self._SCOPE,), self._cfg()
+        )
+        assert new_env["TETHERED_SENTINEL"] == "from-environ"
+        assert new_env[_CHILD_POLICY_ENV] != "untouched"
+        assert os.environ[_CHILD_POLICY_ENV] == "untouched"
+
+    def test_copies_mapping_without_items(self):
+        """Windows ``CreateProcess`` reads ``keys()`` / ``values()``; so does the copy."""
+
+        class KeysAndValues:
+            def keys(self):
+                return ["TETHERED_SENTINEL"]
+
+            def values(self):
+                return ["from-caller"]
+
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", ("/x", [], None, KeysAndValues()), (self._SCOPE,), self._cfg()
+        )
+        assert new_env["TETHERED_SENTINEL"] == "from-caller"
+        assert _CHILD_POLICY_ENV in new_env
+
+    def test_unreadable_env_is_not_replaced_by_the_parents(self):
+        """An object that is not a mapping yields no environment at all."""
+        assert (
+            _build_per_launch_env(
+                "subprocess.Popen", ("/x", [], None, object()), (self._SCOPE,), self._cfg()
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_handler_injects_the_copy_into_execute_child(self, kind):
+        """The ``_execute_child`` frame ends up with the copy, not the parent's environment."""
+        env_arg = _as_mapping(kind, {"TETHERED_SENTINEL": "from-caller"})
+        args = (sys.executable, [sys.executable, "-c", "pass"], None, env_arg)
+        injected = _call_in_execute_child(
+            lambda: _handle_subprocess(self._cfg(), "subprocess.Popen", args, (self._SCOPE,)),
+            env_arg,
+        )
+        assert injected is not env_arg
+        assert set(injected) == {"TETHERED_SENTINEL", _CHILD_POLICY_ENV}
+        assert _CHILD_POLICY_ENV not in env_arg
+
+    def test_unreadable_env_unlocked_warns(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: object())
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _handle_subprocess(
+                self._cfg(),
+                "subprocess.Popen",
+                (sys.executable, [sys.executable, "-c", "pass"], None, object()),
+                (self._SCOPE,),
+            )
+        assert any("could not be read as a mapping" in r.message for r in caplog.records)
+
+    def test_unreadable_env_locked_fails_closed(self, monkeypatch):
+        payload = json.dumps({"global": {"allow": [], "locked": True}, "scopes": []})
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: object())
+        cfg = _Config(
+            policy=AllowPolicy([]),
+            locked=True,
+            _serialized_payload=payload,
+            _global_payload_dict={"allow": [], "locked": True},
+        )
+        with pytest.raises(tethered.SubprocessBlocked, match=r"could not be read as a mapping"):
+            _handle_subprocess(
+                cfg,
+                "subprocess.Popen",
+                (sys.executable, [sys.executable, "-c", "pass"], None, object()),
+                (self._SCOPE,),
+            )
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_child_sees_the_callers_env_not_the_parents(self, kind, monkeypatch):
+        """End to end: the sentinel survives and a parent-only variable does not appear."""
+        tethered.activate(allow=["*.allowed.com"])
+        monkeypatch.setenv("TETHERED_PARENT_ONLY", "1")
+        base = _minimal_child_env()
+        base["TETHERED_SENTINEL"] = "from-caller"
+        with tethered.scope(allow=["api.allowed.com"]):
+            state = _launch_probe(env=_as_mapping(kind, base))
+        assert state["sentinel"] == "from-caller"
+        assert state["parent_only"] is None
+        assert state["active"] is True
+        assert state["scopes"] == 1
