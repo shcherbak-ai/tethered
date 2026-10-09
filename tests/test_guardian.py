@@ -13,8 +13,10 @@ import json
 import logging
 import os
 import pickle
+import shutil
 import site
 import socket
+import subprocess
 import sys
 import threading
 import types
@@ -1311,6 +1313,119 @@ class TestPthTruncateGuard:
             _core._handle_pth_fs_op(cfg, "os.truncate", (str(scratch_pth), 0))
 
 
+def test_cpython_ignores_a_pth_import_line_beside_a_start_file(tmp_path):
+    """Pins the CPython behaviour the ``tethered.start`` guard is written for.
+
+    PEP 829: from Python 3.15 a ``<name>.start`` file, even an empty one,
+    switches off the ``import`` lines of the ``<name>.pth`` beside it.
+    Python 3.18 is to ignore those lines altogether; when this starts
+    failing there, the ``tethered.pth`` bootstrap no longer runs.
+    """
+    (tmp_path / "probe.pth").write_text("import sys; sys.stdout.write('pth line ran')\n")
+    (tmp_path / "probe.start").write_text("")
+    result = subprocess.run(
+        [sys.executable, "-c", f"import site; site.addsitedir({str(tmp_path)!r})"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == ("" if sys.version_info >= (3, 15) else "pth line ran")
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestStartFileGuard:
+    """Locked mode refuses creating ``tethered.start`` beside ``tethered.pth``."""
+
+    @staticmethod
+    def _creations(start, source):
+        return {
+            "open-w": lambda: open(start, "w"),
+            "open-x": lambda: open(start, "x"),
+            "open-a": lambda: open(start, "a"),
+            "os.open": lambda: os.open(start, os.O_CREAT | os.O_RDONLY),
+            "touch": lambda: start.touch(),
+            "write_text": lambda: start.write_text(""),
+            "rename": lambda: os.rename(source, start),
+            "replace": lambda: os.replace(source, start),
+            "link": lambda: os.link(source, start),
+            "hardlink_to": lambda: start.hardlink_to(source),
+            "symlink": lambda: os.symlink(source, start),
+            "copyfile": lambda: shutil.copyfile(source, start),
+            "copy": lambda: shutil.copy(source, start),
+            "copy2": lambda: shutil.copy2(source, start),
+            "move": lambda: shutil.move(source, start),
+            "bytes-path": lambda: open(os.fsencode(start), "w"),
+        }
+
+    @pytest.mark.parametrize(
+        "how",
+        [
+            "open-w",
+            "open-x",
+            "open-a",
+            "os.open",
+            "touch",
+            "write_text",
+            "rename",
+            "replace",
+            "link",
+            "hardlink_to",
+            "symlink",
+            "copyfile",
+            "copy",
+            "copy2",
+            "move",
+            "bytes-path",
+        ],
+    )
+    def test_creating_it_is_refused(self, how, scratch_pth, capfd):
+        start = scratch_pth.with_name("tethered.start")
+        source = scratch_pth.with_name("empty.txt")
+        source.write_text("")
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused creation") as excinfo:
+            self._creations(start, source)[how]()
+        assert "tethered.start" in excinfo.value.description
+        assert not os.path.lexists(start)
+        assert source.read_text() == ""
+        assert scratch_pth.read_text() == PTH_LINE
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_copy2_onto_the_pth_is_refused(self, scratch_pth):
+        """On Windows ``shutil.copy2`` replaces its destination without an ``open`` event."""
+        source = scratch_pth.with_name("empty.txt")
+        source.write_text("")
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match=r"refused (overwrite|write-open)"):
+            shutil.copy2(source, scratch_pth)
+        assert scratch_pth.read_text() == PTH_LINE
+
+    def test_other_start_files_can_be_created(self, scratch_pth):
+        _activate_locked()
+        scratch_pth.with_name("other.start").write_text("pkg.mod:func\n")
+        elsewhere = scratch_pth.parent.parent / "tethered.start"
+        elsewhere.write_text("")
+        shutil.copy2(elsewhere, scratch_pth.with_name("copy.start"))
+        os.link(elsewhere, scratch_pth.with_name("link.start"))
+        assert not os.path.lexists(scratch_pth.with_name("tethered.start"))
+
+    def test_an_existing_one_can_be_read_and_removed(self, scratch_pth):
+        """Taking the file away can only bring the bootstrap back."""
+        start = scratch_pth.with_name("tethered.start")
+        start.write_text("")
+        _activate_locked()
+        assert start.read_text() == ""
+        shutil.copy2(start, scratch_pth.with_name("copy.txt"))
+        os.remove(start)
+        assert not start.exists()
+
+    def test_not_refused_outside_locked_mode(self, scratch_pth):
+        tethered.activate(allow=["*.example.com"])
+        start = scratch_pth.with_name("tethered.start")
+        start.write_text("")
+        assert start.exists()
+
+
 # ── Integrity verification on non-socket events (R30) ──────────────
 
 
@@ -1413,6 +1528,9 @@ class TestGuardianEventCoverage:
         with pytest.raises(tethered.SubprocessBlocked):
             sys.audit("os.system")
 
+    # tethered.start is guarded with tethered.pth: beside it, it switches the
+    # hook's import line off from Python 3.15 (PEP 829).
+    @pytest.mark.parametrize("name", ["tethered.pth", "tethered.start"])
     @pytest.mark.parametrize(
         "event, args",
         [
@@ -1424,13 +1542,19 @@ class TestGuardianEventCoverage:
             ("os.truncate", ("{pth}", 0)),
             ("os.rename", ("{pth}", "elsewhere", -1, -1)),
             ("os.rename", ("elsewhere", "{pth}", -1, -1)),
+            ("os.link", ("{pth}", "elsewhere", -1, -1)),
+            ("os.link", ("elsewhere", "{pth}", -1, -1)),
+            ("os.symlink", ("{pth}", "elsewhere", -1)),
+            ("os.symlink", ("elsewhere", "{pth}", -1)),
+            ("_winapi.CopyFile2", ("{pth}", "elsewhere", 0)),
+            ("_winapi.CopyFile2", ("elsewhere", "{pth}", 0)),
         ],
         ids=lambda value: value if isinstance(value, str) else None,
     )
     def test_filesystem_events_on_the_pth_are_refused_after_tampering(
-        self, event, args, bare_guardian, capfd
+        self, event, args, name, bare_guardian, capfd
     ):
-        pth = os.path.join("site-packages", "tethered.pth")
+        pth = os.path.join("site-packages", name)
         args = tuple(a.format(pth=pth) if isinstance(a, str) else a for a in args)
         sys.audit(event, *args)  # intact: passes
         bare_guardian.tamper()
@@ -1456,6 +1580,14 @@ class TestGuardianEventCoverage:
             # wider str kinds (UCS-2 and UCS-4 storage)
             "/srv/данные/tethered.pth",
             "/srv/\U0001f600/Tethered.pth",
+            # the name that overrides the hook from Python 3.15
+            "tethered.start",
+            "site-packages/tethered.start",
+            "C:\\Lib\\site-packages\\Tethered.Start",
+            "site-packages/tethered.start/sub/..",
+            b"SITE-PACKAGES\\TETHERED.START",
+            "/srv/данные/tethered.start",
+            "/srv/\U0001f600/tethered.start",
             # cannot be inspected without running code: verified to be safe
             _PathLike(),
             bytearray(b"site-packages/tethered.pth"),
@@ -1477,9 +1609,14 @@ class TestGuardianEventCoverage:
             "site-packages/tethered.pt",
             "site-packages/tethered_pth",
             "site-packages/ethered.pth",
+            "site-packages/other.start",
+            "site-packages/tethered.star",
+            "site-packages/tethered_start",
             "/srv/данные/other.pth",
             "/srv/\U0001f600/other.pth",
+            "/srv/\U0001f600/other.start",
             b"site-packages/other.pth",
+            b"site-packages/other.start",
             b"",
             7,  # a file descriptor cannot be matched against a path
             None,
@@ -1494,13 +1631,19 @@ class TestGuardianEventCoverage:
         sys.audit("os.rename", path, path, -1, -1)
         sys.audit("os.chmod", path, 0, -1)
         sys.audit("os.truncate", path, 0)
+        sys.audit("os.link", path, path, -1, -1)
+        sys.audit("os.symlink", path, path, -1)
+        sys.audit("_winapi.CopyFile2", path, path, 0)
 
-    def test_rename_checks_only_its_two_paths(self, bare_guardian):
+    def test_only_the_path_arguments_are_checked(self, bare_guardian):
         bare_guardian.tamper()
         sys.audit("os.rename", "a", "b", "tethered.pth", "tethered.pth")
+        sys.audit("os.link", "a", "b", "tethered.start", "tethered.start")
+        sys.audit("os.symlink", "a", "b", "tethered.start")
+        sys.audit("_winapi.CopyFile2", "a", "b", "tethered.pth")
         sys.audit("open", "a", "tethered.pth", 0)  # the mode is not a path
 
-    @pytest.mark.parametrize("event", ["open", "os.remove", "os.rename", "os.chmod", "os.truncate"])
+    @pytest.mark.parametrize("event", sorted(_core._PTH_FS_EVENTS))
     def test_filesystem_events_without_arguments_are_ignored(self, event, bare_guardian):
         bare_guardian.tamper()
         sys.audit(event)
@@ -1652,6 +1795,7 @@ class TestReplacedGuardsCannotDecide:
 
     @staticmethod
     def _operations(pth, other):
+        start = pth.with_name("tethered.start")
         return {
             "open-w": lambda: open(pth, "w"),
             "open-a": lambda: open(pth, "a"),
@@ -1663,6 +1807,13 @@ class TestReplacedGuardsCannotDecide:
             "chmod": lambda: os.chmod(pth, 0o600),
             "truncate": lambda: os.truncate(pth, 0),
             "write_text": lambda: pth.write_text("gone"),
+            "copy2-onto": lambda: shutil.copy2(other, pth),
+            "start-open-w": lambda: open(start, "w"),
+            "start-touch": lambda: start.touch(),
+            "start-replace-onto": lambda: os.replace(other, start),
+            "start-link": lambda: os.link(other, start),
+            "start-symlink": lambda: os.symlink(other, start),
+            "start-copy2": lambda: shutil.copy2(other, start),
         }
 
     @pytest.mark.parametrize(
@@ -1678,6 +1829,13 @@ class TestReplacedGuardsCannotDecide:
             "chmod",
             "truncate",
             "write_text",
+            "copy2-onto",
+            "start-open-w",
+            "start-touch",
+            "start-replace-onto",
+            "start-link",
+            "start-symlink",
+            "start-copy2",
         ],
     )
     def test_pth_operations_are_refused(self, operation, capfd, scratch_pth, monkeypatch):
@@ -1695,6 +1853,7 @@ class TestReplacedGuardsCannotDecide:
         assert "TAMPER DETECTED" in capfd.readouterr().err
         assert scratch_pth.read_text() == PTH_LINE
         assert other.read_text() == "other"
+        assert not os.path.lexists(scratch_pth.with_name("tethered.start"))
 
     def test_intact_policy_leaves_the_decision_to_the_python_guard(self, capfd, scratch_pth):
         _activate_locked()

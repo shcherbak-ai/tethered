@@ -480,19 +480,36 @@ _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 # for it (and for ``os.ftruncate``, which passes a file descriptor that
 # cannot be matched against a path).
 #
-# ``os.link`` and ``os.symlink`` are intentionally absent: both syscalls
-# fail with ``EEXIST`` when the destination already exists, and the
-# ``.pth`` is created during ``pip install`` and present at the moment
-# this hook starts watching.  To use either against the live ``.pth`` an
-# attacker must first delete or rename it — both of which ARE in this set
-# and get refused.  Adding ``os.link`` / ``os.symlink`` would catch nothing
-# extra in the locked-mode threat model.
+# ``_winapi.CopyFile2`` is how ``shutil.copy2`` (and ``copytree`` / ``move``
+# built on it) writes its destination on Windows from Python 3.12: the file
+# is replaced without an ``open`` event.
+#
+# ``os.link`` and ``os.symlink`` cannot be used against the ``.pth`` itself:
+# both syscalls fail with ``EEXIST`` when the destination already exists, and
+# the ``.pth`` is created during ``pip install`` and present at the moment
+# this hook starts watching.  They are here for a name that does not exist.
+# From Python 3.15 (PEP 829) ``site.py`` ignores the ``import`` line of
+# ``tethered.pth`` when a ``tethered.start`` file sits beside it, whatever
+# that file contains.  tethered ships no such file, so creating one disables
+# auto-activation as surely as deleting the ``.pth`` — see
+# :func:`_created_path` for the ways of creating it that are refused.
 #
 # The C guardian verifies the integrity snapshot on these same events before
 # this hook runs (``classify_event`` in ``_guardian.c``), so a replaced
 # ``_handle_pth_fs_op`` cannot wave an operation through.  An event added
 # here must be added there too; ``tests/test_guardian.py`` checks that.
-_PTH_FS_EVENTS = frozenset(("os.remove", "os.rename", "open", "os.chmod", "os.truncate"))
+_PTH_FS_EVENTS = frozenset(
+    (
+        "os.remove",
+        "os.rename",
+        "open",
+        "os.chmod",
+        "os.truncate",
+        "os.link",
+        "os.symlink",
+        "_winapi.CopyFile2",
+    )
+)
 
 
 def _is_ip(host: str) -> bool:
@@ -1474,7 +1491,7 @@ _SITE_BYPASS_FLAG_CHARS = "S"
 _USER_SITE_BYPASS_FLAG_CHARS = "sI"
 
 # CPython's interpreter options (``SHORT_OPTS`` and ``longopts`` in
-# ``Python/getopt.c``; the same for 3.10-3.14 except that ``-P`` and the
+# ``Python/getopt.c``; the same for 3.10-3.15 except that ``-P`` and the
 # ``--help-*`` forms are new in 3.11).  A flag stands alone or in a cluster
 # (``-IS``).  A value option takes the rest of its token (``-Wdefault``) or,
 # when it ends the token, the whole next token — which is therefore never an
@@ -2135,7 +2152,7 @@ def _resolve_winapi_launch(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], dict
     is unknown and the launch is treated as inheriting the process
     environment.
 
-    The command line cannot be relied on either.  CPython 3.10 to 3.14 format
+    The command line cannot be relied on either.  CPython 3.10 to 3.15 format
     the event's ``command_line`` argument, a Python object, as a C wide
     string, so what arrives is a character or two of garbage and not the
     command line.  Interpreter options such as ``-S`` are therefore not
@@ -2411,8 +2428,27 @@ def _is_open_for_write(args: tuple[Any, ...]) -> bool:
     return False
 
 
+def _created_path(event: str, args: tuple[Any, ...]) -> Any:
+    """Return the path at which ``event`` brings a file into being, or ``None``.
+
+    That is the target of a write-capable ``open`` and the destination of a
+    rename, a hard link, a symlink or a ``_winapi.CopyFile2`` — the ways of
+    creating a file from Python that raise an audit event.  ``os.mknod`` and
+    ``os.mkfifo`` raise none.
+    """
+    if event == "open":
+        return args[0] if args and _is_open_for_write(args) else None
+    if event in ("os.rename", "os.link", "os.symlink", "_winapi.CopyFile2"):
+        return args[1] if len(args) >= 2 else None
+    return None
+
+
 def _path_matches_pth(target: Any, cached: str) -> bool:
-    """Return True if ``target`` (str/bytes/PathLike) refers to the cached ``tethered.pth`` path."""
+    """Return True if ``target`` (str/bytes/PathLike) refers to ``cached``, a guarded path.
+
+    ``cached`` is the ``tethered.pth`` path stored at ``activate()`` time, or
+    the ``tethered.start`` path beside it, in :func:`_normalize_path` form.
+    """
     if not cached:
         return False
     if not isinstance(target, (str, bytes, os.PathLike)):
@@ -2438,7 +2474,14 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
       the file unreadable, so site.py silently skips it on POSIX → next
       interpreter has no auto-activation);
     - ``os.truncate`` given a path (emptying the file disables
-      auto-activation just as deleting it does).
+      auto-activation just as deleting it does);
+    - ``_winapi.CopyFile2`` onto the path (``shutil.copy2`` on Windows, which
+      replaces the file without an ``open`` event).
+
+    Also refuses creating ``tethered.start`` beside it, which from Python
+    3.15 makes ``site.py`` ignore the ``.pth``'s ``import`` line (PEP 829):
+    any event for which :func:`_created_path` names that file.  Removing
+    such a file is not refused — that can only restore the bootstrap.
 
     The cached path is computed at ``activate()`` time; if it's empty (no
     ``tethered.pth`` in a directory ``site.py`` processes — see
@@ -2447,14 +2490,25 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     No effect outside locked mode.  Not caught: ``os.ftruncate`` (and
     ``os.truncate`` given a file descriptor) — the event carries the
     descriptor, not a path, though obtaining a writable descriptor through
-    ``open`` / ``os.open`` is refused above; ``ctypes`` calling libc
-    ``unlink`` / ``rename`` / ``open`` / ``chmod`` / ``truncate`` directly,
-    which raises no audit event; and external tools spawned via
-    ``subprocess`` (mitigated by ``external_subprocess_policy="block"``).
-    See ``SECURITY.md``.
+    ``open`` / ``os.open`` is refused above; ``os.mknod`` creating
+    ``tethered.start`` (POSIX), which raises no audit event; ``ctypes``
+    calling libc ``unlink`` / ``rename`` / ``open`` / ``chmod`` /
+    ``truncate`` directly, which raises none either; and external tools
+    spawned via ``subprocess`` (mitigated by
+    ``external_subprocess_policy="block"``).  See ``SECURITY.md``.
     """
     if not cfg.locked or not cfg._pth_path:
         return
+    created = _created_path(event, args)
+    if created is not None:
+        start_path = os.path.join(os.path.dirname(cfg._pth_path), "tethered.start")
+        if _path_matches_pth(created, start_path):
+            logger.warning("tethered: blocked creation of %s", start_path)
+            raise SubprocessBlocked(
+                event,
+                f"refused creation of {start_path} in locked mode "
+                "(beside tethered.pth it disables auto-activation on Python 3.15+)",
+            )
     if event == "os.remove":
         target = args[0] if args else None
         if _path_matches_pth(target, cfg._pth_path):
@@ -2485,6 +2539,12 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
         if _path_matches_pth(target, cfg._pth_path):
             logger.warning("tethered: blocked truncation of %s", cfg._pth_path)
             raise SubprocessBlocked(event, f"refused truncation of {cfg._pth_path} in locked mode")
+    elif event == "_winapi.CopyFile2":
+        # args: (existing_file_name, new_file_name, flags)
+        dst = args[1] if len(args) >= 2 else None
+        if _path_matches_pth(dst, cfg._pth_path):
+            logger.warning("tethered: blocked overwrite of %s", cfg._pth_path)
+            raise SubprocessBlocked(event, f"refused overwrite of {cfg._pth_path} in locked mode")
 
 
 def _install_hook() -> None:

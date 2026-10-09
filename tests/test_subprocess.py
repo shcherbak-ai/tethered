@@ -1345,8 +1345,9 @@ class TestPthFsHook:
 
     Refuses Python-level deletion (``os.remove`` audit event, fired by
     ``os.remove`` / ``os.unlink`` / ``pathlib.Path.unlink`` / ``shutil.rmtree``),
-    rename touching the path, write-mode open of the path, and chmod of
-    the path.  ``ctypes`` calling libc directly bypasses the audit event
+    rename touching the path, write-mode open of the path, chmod of the
+    path, a ``_winapi.CopyFile2`` onto it, and creating ``tethered.start``
+    beside it.  ``ctypes`` calling libc directly bypasses the audit event
     entirely (documented limit).
     """
 
@@ -1477,6 +1478,101 @@ class TestPthFsHook:
     def test_chmod_unrelated_path_allowed(self):
         cfg = self._locked_cfg()
         _handle_pth_fs_op(cfg, "os.chmod", ("/tmp/other.txt", 0))  # no raise
+
+    def test_copyfile2_onto_pth_blocked(self, caplog):
+        """``shutil.copy2`` on Windows replaces its destination without an ``open`` event."""
+        cfg = self._locked_cfg()
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.SubprocessBlocked, match=r"refused overwrite"),
+        ):
+            _handle_pth_fs_op(
+                cfg, "_winapi.CopyFile2", ("/tmp/empty.txt", "/site-packages/tethered.pth", 0)
+            )
+        assert any("blocked overwrite of" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("/site-packages/tethered.pth", "/tmp/backup.pth", 0),  # reading the hook
+            ("/tmp/a.txt", "/tmp/b.txt", 0),
+            ("/tmp/a.txt",),
+            (),
+        ],
+        ids=repr,
+    )
+    def test_copyfile2_elsewhere_allowed(self, args):
+        _handle_pth_fs_op(self._locked_cfg(), "_winapi.CopyFile2", args)  # no raise
+
+    # PEP 829 (Python 3.15+): site.py ignores the import line of tethered.pth
+    # when a tethered.start file sits beside it, whatever that file contains.
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            ("open", ("/site-packages/tethered.start", "w", 0)),
+            ("open", ("/site-packages/tethered.start", "x", 0)),
+            ("open", ("/site-packages/tethered.start", "ab", 0)),
+            ("open", ("/site-packages/tethered.start", "", os.O_CREAT)),
+            ("open", (b"/site-packages/tethered.start", "w", 0)),
+            ("open", (Path("/site-packages/tethered.start"), "w", 0)),
+            ("open", ("/site-packages/./x/../tethered.start", "w", 0)),
+            ("os.rename", ("/tmp/empty.txt", "/site-packages/tethered.start", -1, -1)),
+            ("os.rename", ("/site-packages/tethered.pth", "/site-packages/tethered.start")),
+            ("os.link", ("/tmp/empty.txt", "/site-packages/tethered.start", -1, -1)),
+            ("os.symlink", ("/tmp/empty.txt", "/site-packages/tethered.start", -1)),
+            ("_winapi.CopyFile2", ("/tmp/empty.txt", "/site-packages/tethered.start", 0)),
+        ],
+        ids=repr,
+    )
+    def test_creating_the_start_file_blocked(self, event, args, caplog):
+        cfg = self._locked_cfg()
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.SubprocessBlocked, match=r"refused creation") as exc_info,
+        ):
+            _handle_pth_fs_op(cfg, event, args)
+        assert exc_info.value.event == event
+        assert "tethered.start" in exc_info.value.description
+        assert any("blocked creation of" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            ("open", ("/site-packages/tethered.start", "rb", 0)),  # reading
+            ("open", ()),
+            # Taking such a file away can only bring the bootstrap back.
+            ("os.remove", ("/site-packages/tethered.start", -1)),
+            ("os.rename", ("/site-packages/tethered.start", "/tmp/gone.start", -1, -1)),
+            ("os.truncate", ("/site-packages/tethered.start", 0)),
+            ("os.chmod", ("/site-packages/tethered.start", 0, -1)),
+            # The source of a link or copy is only read.
+            ("os.link", ("/site-packages/tethered.start", "/tmp/alias", -1, -1)),
+            ("os.symlink", ("/site-packages/tethered.start", "/tmp/alias", -1)),
+            ("_winapi.CopyFile2", ("/site-packages/tethered.start", "/tmp/copy", 0)),
+            # Other names, other directories.
+            ("open", ("/site-packages/other.start", "w", 0)),
+            ("open", ("/elsewhere/tethered.start", "w", 0)),
+            ("os.link", ("/tmp/a.txt", "/site-packages/other.start", -1, -1)),
+            ("os.symlink", ("/tmp/a.txt", "/elsewhere/tethered.start", -1)),
+            # Too few arguments, or a destination that is not a path.
+            ("os.link", ("/tmp/a.txt",)),
+            ("os.symlink", ()),
+            ("os.rename", ("/tmp/a.txt",)),
+            ("os.link", ("/tmp/a.txt", 7, -1, -1)),
+        ],
+        ids=repr,
+    )
+    def test_other_operations_on_start_files_allowed(self, event, args):
+        _handle_pth_fs_op(self._locked_cfg(), event, args)  # no raise
+
+    def test_start_file_not_guarded_without_a_bootstrap_or_a_lock(self):
+        args = ("/site-packages/tethered.start", "w", 0)
+        policy = AllowPolicy([], allow_localhost=True)
+        no_pth = _Config(policy=policy, locked=True, _serialized_payload="{}", _pth_path="")
+        _handle_pth_fs_op(no_pth, "open", args)  # no raise
+        unlocked = _Config(policy=policy, locked=False, _pth_path=self._PTH)
+        _handle_pth_fs_op(unlocked, "open", args)  # no raise
 
     def test_unknown_event_is_noop(self):
         """Events not in the dispatch table are silently ignored."""
@@ -4115,7 +4211,7 @@ class TestLaunchesThatBypassPopen:
         [
             pytest.param((None, '"C:\\tools\\curl.exe" evil.test', None), "C:\\tools\\curl.exe"),
             pytest.param((None, "curl evil.test", None), "curl"),
-            # What CPython 3.10-3.14 actually deliver for the command line: a
+            # What CPython 3.10-3.15 actually deliver for the command line: a
             # character or two of garbage.  It must not reach the log.
             pytest.param((None, "\x03", None), "<unknown>", id="garbage-command-line"),
             pytest.param((None, None, None), "<unknown>", id="nothing"),
