@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 
+from tethered import _policy
 from tethered._core import _serialize_allow_list
 from tethered._policy import (
     AllowPolicy,
@@ -658,6 +660,104 @@ class TestAllowPolicyWildcardWarnings:
     def test_question_mark_prefix_accepted(self):
         """?.stripe.com matches single-char subdomains — must be accepted."""
         AllowPolicy(["?.stripe.com"])
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "*[!/]",
+            "*[a-z0-9]",
+            "[!/]*",
+            "*[!/]:443",
+            "*.[a-z]*",
+            "[a-z]*[0-9]",
+            "*[]a]",
+            "*[!]a]",
+            "[ab].*",
+        ],
+    )
+    def test_character_set_is_not_a_literal(self, rule):
+        """A ``[...]`` set matches like a wildcard, so it cannot anchor a ``*`` pattern."""
+        with pytest.raises(ValueError, match="matches ALL destinations"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize(
+        "rule",
+        ["x[ab].example.com", "[ab]*.example.com", "*[ab]c", "*.example.com", "*[ab", "*]"],
+    )
+    def test_character_set_next_to_a_literal_accepted(self, rule):
+        AllowPolicy([rule])
+
+    @pytest.mark.parametrize("rule", ["[!/]", "[a-z][a-z]", "[a-z]?.[0-9]", "[*]"])
+    def test_character_sets_without_star_are_bounded(self, rule):
+        """Like ``?``, a set matches exactly one character — bounded, so accepted."""
+        AllowPolicy([rule])
+
+
+@pytest.fixture
+def address_wildcard_warnings(monkeypatch, caplog):
+    """Start with no rule warned about yet; return the address-shaped warnings logged."""
+    monkeypatch.setattr(_policy, "_ADDRESS_WILDCARD_WARNED", set())
+    caplog.set_level(logging.WARNING, logger="tethered")
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "CIDR notation" in r.getMessage()]
+
+    return warnings
+
+
+class TestAddressShapedWildcard:
+    """``10.*`` is an fnmatch pattern over text, not an address range."""
+
+    def test_matching_is_unchanged(self):
+        policy = AllowPolicy(["10.*"], allow_localhost=False)
+        assert policy.is_allowed("10.1.2.3") is True
+        assert policy.is_allowed("11.1.2.3") is False
+        # The documented fnmatch semantics: a hostname that fits the text matches too.
+        assert policy.is_allowed("10.attacker.example") is True
+
+    @pytest.mark.parametrize(
+        "rule",
+        ["10.*", "192.0.2.*", "192.0.2.*:443", "10.?.0.1", "1*", "*.1", "10.[0-9].*", "10.[!0].1"],
+    )
+    def test_warns_and_points_to_cidr(self, rule, address_wildcard_warnings):
+        AllowPolicy([rule])
+        (message,) = address_wildcard_warnings()
+        assert repr(rule) in message
+        assert "also allows every hostname" in message
+        assert "CIDR notation" in message
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "*.example.com",
+            "api1.example.com",
+            "10.example.*",
+            "1example.*",
+            "???.??",
+            "10.0.0.0/8",
+            "192.0.2.1",
+            "10.0.0.256",
+            "10.*[",
+        ],
+    )
+    def test_no_warning_for_other_rules(self, rule, address_wildcard_warnings):
+        AllowPolicy([rule])
+        assert address_wildcard_warnings() == []
+
+    def test_warns_once_per_rule_string(self, address_wildcard_warnings):
+        """``scope()`` builds a policy on every use; the log must not repeat per call."""
+        for _ in range(3):
+            AllowPolicy(["10.*", "api.example.com"])
+        assert len(address_wildcard_warnings()) == 1
+
+        AllowPolicy(["10.*", "172.16.*"])
+        assert len(address_wildcard_warnings()) == 2
+
+    def test_warned_set_is_bounded(self, monkeypatch, address_wildcard_warnings):
+        monkeypatch.setattr(_policy, "_ADDRESS_WILDCARD_WARNED_MAX", 2)
+        AllowPolicy(["10.*", "11.*", "12.*", "13.*"])
+        assert len(address_wildcard_warnings()) == 2
+        assert {"10.*", "11.*"} == _policy._ADDRESS_WILDCARD_WARNED
 
 
 class TestAllowPolicyEmptyRuleRaises:

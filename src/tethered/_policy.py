@@ -145,12 +145,18 @@ class AllowPolicy:
                 )
                 raise ValueError(msg)
 
+            # An fnmatch character set ("[seq]", "[!seq]") matches like a
+            # wildcard, so stand "?" in for each one when judging what the
+            # pattern is made of.
+            shape = _CHAR_SET_RE.sub("?", rule) if "[" in rule else rule
+
             # Reject overly broad wildcards — the host portion (without port)
             # must contain at least one literal character that isn't a wildcard
-            # or dot. Patterns like *, *.*, *?*, ?* match all destinations.
-            # Patterns with only ? (like ???.??) are allowed because ? matches
-            # exactly one character — they are bounded, not open-ended.
-            if "*" in rule and all(c in "*?." for c in rule):
+            # or dot. Patterns like *, *.*, *?*, ?*, *[!/] match all destinations.
+            # Patterns with only ? or character sets (like ???.??) are allowed
+            # because each matches exactly one character — they are bounded,
+            # not open-ended.
+            if "*" in shape and all(c in "*?." for c in shape):
                 msg = (
                     f"allow rule {raw!r} matches ALL destinations, "
                     f"which disables egress control entirely. "
@@ -158,6 +164,11 @@ class AllowPolicy:
                     f"(e.g. '*.stripe.com:443')."
                 )
                 raise ValueError(msg)
+
+            # An address-shaped wildcard ("10.*", "192.0.2.*") is still an
+            # fnmatch pattern over text: it also allows "10.attacker.example".
+            if ("*" in shape or "?" in shape) and _ADDRESS_SHAPED_RE.fullmatch(shape):
+                _warn_address_shaped_wildcard(raw)
 
             # It's a hostname pattern
             host_rules.append(_HostRule(pattern=rule, port=port))
@@ -410,6 +421,39 @@ def _is_ip_like(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# An fnmatch character set: "[seq]" or "[!seq]", where a "]" directly after
+# the opening bracket (or after "!") is a member rather than the end.  For
+# malformed input ("[]", "[!]") this errs toward calling literal text a set,
+# which only makes the checks built on it stricter.
+_CHAR_SET_RE = re.compile(r"\[!?\]?[^\]]*\]")
+
+# A wildcard pattern (character sets already replaced by "?") made only of
+# digits, dots and wildcards — it reads like an IP address range.
+_ADDRESS_SHAPED_RE = re.compile(r"[.*?]*[0-9][0-9.*?]*")
+
+# Address-shaped wildcard rules already warned about.  ``scope()`` builds an
+# ``AllowPolicy`` on every use, so each distinct rule is reported once per
+# process; the cap bounds the set when rule strings are generated dynamically.
+_ADDRESS_WILDCARD_WARNED: set[str] = set()
+_ADDRESS_WILDCARD_WARNED_MAX = 256
+
+
+def _warn_address_shaped_wildcard(raw: str) -> None:
+    """Warn, once per rule string, that an address-shaped wildcard is not a range."""
+    if raw in _ADDRESS_WILDCARD_WARNED:
+        return
+    if len(_ADDRESS_WILDCARD_WARNED) >= _ADDRESS_WILDCARD_WARNED_MAX:
+        return
+    _ADDRESS_WILDCARD_WARNED.add(raw)
+    logger.warning(
+        "tethered: allow rule %r looks like an IP address range but is a wildcard "
+        "pattern matched as text — it also allows every hostname that fits the "
+        "pattern (the way '10.*' allows '10.attacker.example'). Use CIDR notation "
+        "(e.g. '10.0.0.0/8') to allow an address range.",
+        raw,
+    )
 
 
 def _parse_bracketed_ip(
