@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import socket
 import sys
@@ -1325,13 +1326,13 @@ class TestAuditHookDirect:
     def test_connect_uses_ip_map(self):
         tethered.activate(allow=["*.stripe.com"])
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "api.stripe.com"
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
         _audit_hook("socket.connect", (None, ("198.51.100.1", 443)))
 
     def test_connect_ip_map_hostname_blocked(self):
         tethered.activate(allow=["*.stripe.com"])
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "evil.test"
+            _ip_to_hostname["198.51.100.1"] = ("evil.test",)
         with pytest.raises(tethered.EgressBlocked):
             _audit_hook("socket.connect", (None, ("198.51.100.1", 443)))
 
@@ -1401,15 +1402,15 @@ class TestAuditHookDirect:
         tethered.activate(allow=["dns.google"])
         _audit_hook("socket.getaddrinfo", ("dns.google", 443, 0, 0, 0))
         with _ip_map_lock:
-            assert any(v == "dns.google" for v in _ip_to_hostname.values())
+            assert any("dns.google" in v for v in _ip_to_hostname.values())
 
     def test_getaddrinfo_allowed_refreshes_existing_ip_map_entry(self, monkeypatch):
         tethered.activate(allow=["dns.google"])
 
         with _ip_map_lock:
             _ip_to_hostname.clear()
-            _ip_to_hostname["203.0.113.10"] = "old.example.com"
-            _ip_to_hostname["198.51.100.20"] = "stale.example.com"
+            _ip_to_hostname["203.0.113.10"] = ("old.example.com",)
+            _ip_to_hostname["198.51.100.20"] = ("stale.example.com",)
 
         monkeypatch.setattr(
             _csocket,
@@ -1419,14 +1420,19 @@ class TestAuditHookDirect:
             ],
         )
 
-        _audit_hook("socket.getaddrinfo", ("dns.google", 443, 0, 0, 0, 0))
+        _audit_hook("socket.getaddrinfo", ("dns.google", 443, 0, 0, 0))
 
         with _ip_map_lock:
-            assert _ip_to_hostname["203.0.113.10"] == "dns.google"
+            # The new name goes first; the name already known for the address stays.
+            assert _ip_to_hostname["203.0.113.10"] == ("dns.google", "old.example.com")
             assert list(_ip_to_hostname.keys())[-1] == "203.0.113.10"
 
     def test_getaddrinfo_forwards_caller_args(self, monkeypatch):
-        """getaddrinfo forwards family/socktype/proto/flags to C-level resolver."""
+        """getaddrinfo forwards the event's family/socktype/proto to the C-level resolver.
+
+        The audit event is ``(host, port, family, type, protocol)``; the
+        caller's flags are not part of it, so tethered's lookup passes none.
+        """
         tethered.activate(allow=["dns.google"])
         captured = {}
 
@@ -1437,7 +1443,7 @@ class TestAuditHookDirect:
         monkeypatch.setattr(_csocket, "getaddrinfo", _capture)
         _audit_hook(
             "socket.getaddrinfo",
-            ("dns.google", 443, socket.AF_INET6, socket.SOCK_STREAM, 6, socket.AI_CANONNAME),
+            ("dns.google", 443, socket.AF_INET6, socket.SOCK_STREAM, 6),
         )
         host, port, family, socktype, proto, flags = captured["args"]
         assert host == "dns.google"
@@ -1445,7 +1451,7 @@ class TestAuditHookDirect:
         assert family == socket.AF_INET6
         assert socktype == socket.SOCK_STREAM
         assert proto == 6
-        assert flags == socket.AI_CANONNAME
+        assert flags == 0
 
     def test_getaddrinfo_allowed_handles_dns_failure(self):
         tethered.activate(allow=["nonexistent.invalid"])
@@ -1463,7 +1469,7 @@ class TestAuditHookDirect:
         _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
         # No IP mapping stored (resolution failed), but DNS-level check passed
         with _ip_map_lock:
-            assert not any(v == "api.example.com" for v in _ip_to_hostname.values())
+            assert not any("api.example.com" in v for v in _ip_to_hostname.values())
 
     def test_getaddrinfo_bypasses_monkey_patched_socket(self, monkeypatch):
         """IP map resolution uses C-level _socket, not monkey-patchable socket.
@@ -1489,7 +1495,7 @@ class TestAuditHookDirect:
         assert patched_calls == []
         # IP map was populated via C-level _socket.getaddrinfo
         with _ip_map_lock:
-            assert any(v == "localhost" for v in _ip_to_hostname.values())
+            assert any("localhost" in v for v in _ip_to_hostname.values())
 
     def test_connect_ex_fires_connect_event(self):
         """connect_ex raises audit event socket.connect in CPython, not socket.connect_ex."""
@@ -1538,13 +1544,13 @@ class TestAuditHookDirect:
         tethered.activate(allow=["dns.google"])
         with _ip_map_lock:
             for i in range(_IP_MAP_MAX_SIZE):
-                _ip_to_hostname[f"198.51.{i // 256}.{i % 256}"] = f"host{i}.example.com"
+                _ip_to_hostname[f"198.51.{i // 256}.{i % 256}"] = (f"host{i}.example.com",)
         _audit_hook("socket.getaddrinfo", ("dns.google", 443, 0, 0, 0))
         with _ip_map_lock:
             # After eviction + adding dns.google IPs, should be at or below capacity
             assert len(_ip_to_hostname) <= _IP_MAP_MAX_SIZE
             # dns.google entries should be present
-            assert any(v == "dns.google" for v in _ip_to_hostname.values())
+            assert any("dns.google" in v for v in _ip_to_hostname.values())
 
     def test_getaddrinfo_policy_none_guard(self):
         """Direct call with a dummy config to verify early exits."""
@@ -1786,7 +1792,7 @@ class TestIPMapEviction:
             _ip_to_hostname.clear()
             # Fill the map with 10 entries
             for i in range(10):
-                _ip_to_hostname[f"10.0.0.{i}"] = "old.example.com"
+                _ip_to_hostname[f"10.0.0.{i}"] = ("old.example.com",)
 
         # Access the first entry to make it "recently used"
         with _ip_map_lock:
@@ -1810,8 +1816,8 @@ class TestIPMapEviction:
 
         with _ip_map_lock:
             _ip_to_hostname.clear()
-            _ip_to_hostname["198.51.100.1"] = "api.stripe.com"
-            _ip_to_hostname["198.51.100.2"] = "other.stripe.com"
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
+            _ip_to_hostname["198.51.100.2"] = ("other.stripe.com",)
 
         # Connect to first IP -- should move it to end of LRU
         _audit_hook("socket.connect", (None, ("198.51.100.1", 443)))
@@ -1820,6 +1826,211 @@ class TestIPMapEviction:
             keys = list(_ip_to_hostname.keys())
             # 198.51.100.1 should now be after 198.51.100.2 (moved to end)
             assert keys.index("198.51.100.1") > keys.index("198.51.100.2")
+
+
+class TestSharedAddresses:
+    """Several hostnames can share one address, and each keeps its identity.
+
+    The IP map remembers a bounded list of names per address.  A connect is
+    allowed if any of those names, or the raw IP, is allowed — so resolving a
+    second name that lives on the same address (a CDN, a cloud front end, a
+    load balancer) must not take the first name's permission away.
+    """
+
+    def test_two_names_one_address_distinct_ports(self, fake_dns):
+        fake_dns.table["a.example.com"] = ["203.0.113.7"]
+        fake_dns.table["b.example.com"] = ["203.0.113.7"]
+        tethered.activate(allow=["a.example.com:8001", "b.example.com:8002"], allow_localhost=False)
+
+        _audit_hook("socket.getaddrinfo", ("a.example.com", 8001, 0, 0, 0))
+        _audit_hook("socket.connect", (None, ("203.0.113.7", 8001)))
+
+        _audit_hook("socket.getaddrinfo", ("b.example.com", 8002, 0, 0, 0))
+        _audit_hook("socket.connect", (None, ("203.0.113.7", 8001)))  # still a.example.com's
+        _audit_hook("socket.connect", (None, ("203.0.113.7", 8002)))
+
+        with pytest.raises(tethered.EgressBlocked) as exc_info:
+            _audit_hook("socket.connect", (None, ("203.0.113.7", 8003)))
+        assert exc_info.value.host == "203.0.113.7"
+        assert exc_info.value.resolved_from == "b.example.com"  # the most recent name
+
+    def test_two_names_one_address_real_sockets(self, fake_dns, tcp_listener):
+        """Both names resolve to loopback; each rule names a different listener."""
+        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        second.bind(("127.0.0.1", 0))
+        second.listen(4)
+        try:
+            port_a, port_b = tcp_listener, second.getsockname()[1]
+            fake_dns.table["a.invalid"] = ["127.0.0.1"]
+            fake_dns.table["b.invalid"] = ["127.0.0.1"]
+            tethered.activate(
+                allow=[f"a.invalid:{port_a}", f"b.invalid:{port_b}"], allow_localhost=False
+            )
+            _audit_hook("socket.getaddrinfo", ("a.invalid", port_a, 0, 0, 0))
+            _audit_hook("socket.getaddrinfo", ("b.invalid", port_b, 0, 0, 0))
+            for port in (port_a, port_b, port_a):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                    client.settimeout(5)
+                    client.connect(("127.0.0.1", port))
+        finally:
+            second.close()
+
+    def test_raw_ip_rule_allows_whatever_names_are_mapped(self, fake_dns):
+        fake_dns.table["a.example.com"] = ["203.0.113.7"]
+        tethered.activate(allow=["a.example.com:8001", "203.0.113.7:443"], allow_localhost=False)
+        _audit_hook("socket.getaddrinfo", ("a.example.com", 8001, 0, 0, 0))
+        _audit_hook("socket.connect", (None, ("203.0.113.7", 443)))
+
+    def test_cross_scope_interleaving(self, fake_dns):
+        """A lookup made under another scope does not hijack this scope's address."""
+        fake_dns.table["a.example.com"] = ["203.0.113.7"]
+        fake_dns.table["b.example.com"] = ["203.0.113.7"]
+        ctx_a, ctx_b = contextvars.copy_context(), contextvars.copy_context()
+        scope_a = tethered.scope(allow=["a.example.com"], allow_localhost=False, label="A")
+        scope_b = tethered.scope(allow=["b.example.com"], allow_localhost=False, label="B")
+        ctx_a.run(scope_a.__enter__)
+        ctx_b.run(scope_b.__enter__)
+        try:
+            ctx_a.run(_audit_hook, "socket.getaddrinfo", ("a.example.com", 443, 0, 0, 0))
+            ctx_b.run(_audit_hook, "socket.getaddrinfo", ("b.example.com", 443, 0, 0, 0))
+            # Each context reaches the shared address through its own name.
+            ctx_a.run(_audit_hook, "socket.connect", (None, ("203.0.113.7", 443)))
+            ctx_b.run(_audit_hook, "socket.connect", (None, ("203.0.113.7", 443)))
+        finally:
+            ctx_b.run(scope_b.__exit__, None, None, None)
+            ctx_a.run(scope_a.__exit__, None, None, None)
+
+    def test_a_scope_allowing_none_of_the_names_still_blocks(self, fake_dns):
+        fake_dns.table["a.example.com"] = ["203.0.113.7"]
+        fake_dns.table["b.example.com"] = ["203.0.113.7"]
+        _learn("a.example.com")
+        _learn("b.example.com")
+        with (
+            tethered.scope(allow=["c.example.com"], allow_localhost=False, label="C"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, ("203.0.113.7", 443)))
+        assert exc_info.value.scope_label == "C"
+        assert exc_info.value.resolved_from == "b.example.com"
+
+    # ── One address, several spellings ──
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("192.0.2.1", "192.0.2.1"),
+            ("::ffff:192.0.2.1", "192.0.2.1"),
+            ("::FFFF:C000:0201", "192.0.2.1"),
+            ("2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("fe80::1%eth0", "fe80::1"),
+            ("::1", "::1"),
+            ("example.com", None),
+            ("1example.com", None),
+            ("cafe::bad::", None),
+            ("", None),
+            # _canonical_ip returns IPv4 text unchanged, which is only right
+            # while ipaddress accepts exactly one spelling of an IPv4 address.
+            ("010.0.0.1", None),
+            ("10.0.0.01", None),
+            ("10.1", None),
+            ("0x0a.0.0.1", None),
+            (" 10.0.0.1", None),
+        ],
+    )
+    def test_canonical_ip(self, text, expected):
+        assert _core._canonical_ip(text) == expected
+
+    @pytest.mark.parametrize(
+        ("resolved", "connect_to"),
+        [
+            pytest.param("203.0.113.7", ("::ffff:203.0.113.7", 443, 0, 0), id="mapped-connect"),
+            pytest.param("203.0.113.7", ("::FFFF:CB00:7107", 443, 0, 0), id="mapped-hex-connect"),
+            pytest.param("::ffff:203.0.113.7", ("203.0.113.7", 443), id="mapped-resolve"),
+            pytest.param(
+                "2001:db8::1",
+                ("2001:0DB8:0000:0000:0000:0000:0000:0001", 443, 0, 0),
+                id="expanded-ipv6",
+            ),
+            pytest.param("fe80::1", ("fe80::1%eth0", 443, 0, 3), id="scoped-connect"),
+            pytest.param("fe80::1%eth0", ("fe80::1", 443, 0, 3), id="scoped-resolve"),
+        ],
+    )
+    def test_any_spelling_of_the_address_finds_the_name(self, fake_dns, resolved, connect_to):
+        fake_dns.table["api.example.com"] = [resolved]
+        tethered.activate(allow=["api.example.com"], allow_localhost=False)
+        _audit_hook("socket.getaddrinfo", ("api.example.com", 443, 0, 0, 0))
+        _audit_hook("socket.connect", (None, connect_to))
+
+    def test_dual_stack_socket_reaches_a_name_mapped_to_ipv4(self, tcp_listener):
+        """A real AF_INET6 socket connecting to the IPv4-mapped form of the address."""
+        try:
+            client = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        except OSError:
+            pytest.skip("IPv6 not supported on this system")
+        with client:
+            try:
+                client.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pytest.skip("dual-stack sockets not supported on this system")
+            client.settimeout(5)
+            tethered.activate(allow=[f"localhost:{tcp_listener}"], allow_localhost=False)
+            socket.getaddrinfo("localhost", tcp_listener, socket.AF_INET)  # maps 127.0.0.1
+            try:
+                client.connect(("::ffff:127.0.0.1", tcp_listener, 0, 0))
+            except OSError as exc:  # EgressBlocked is not an OSError and would fail the test
+                pytest.skip(f"IPv4-mapped connect not possible here: {exc}")
+
+    def test_fallback_resolve_matches_in_canonical_form(self, fake_dns):
+        fake_dns.table["api.example.com"] = ["203.0.113.7"]
+        tethered.activate(allow=["api.example.com"], allow_localhost=False)
+        _core._remember_allowed_hostname("api.example.com")
+        assert _core._fallback_resolve("::ffff:203.0.113.7", 443) == "api.example.com"
+
+    # ── Bounds ──
+
+    def test_names_per_address_are_bounded_most_recent_first(self, fake_dns):
+        limit = _core._IP_MAP_MAX_NAMES
+        tethered.activate(allow=["*.example.com"], allow_localhost=False)
+        for i in range(limit + 3):
+            fake_dns.table[f"h{i}.example.com"] = ["203.0.113.7"]
+            _audit_hook("socket.getaddrinfo", (f"h{i}.example.com", 443, 0, 0, 0))
+        with _ip_map_lock:
+            names = _ip_to_hostname["203.0.113.7"]
+        assert names == tuple(f"h{i}.example.com" for i in range(limit + 2, 2, -1))
+        assert len(names) == limit
+
+    def test_resolving_a_known_name_again_moves_it_to_the_front(self, fake_dns):
+        tethered.activate(allow=["*.example.com"], allow_localhost=False)
+        for name in ("a.example.com", "b.example.com", "c.example.com", "a.example.com"):
+            fake_dns.table[name] = ["203.0.113.7"]
+            _audit_hook("socket.getaddrinfo", (name, 443, 0, 0, 0))
+        with _ip_map_lock:
+            assert _ip_to_hostname["203.0.113.7"] == (
+                "a.example.com",
+                "c.example.com",
+                "b.example.com",
+            )
+        # Resolving the front name again changes nothing.
+        _audit_hook("socket.getaddrinfo", ("a.example.com", 443, 0, 0, 0))
+        with _ip_map_lock:
+            assert _ip_to_hostname["203.0.113.7"][0] == "a.example.com"
+            assert len(_ip_to_hostname["203.0.113.7"]) == 3
+
+    def test_lru_eviction_drops_whole_addresses(self, fake_dns):
+        tethered.activate(allow=["*.example.com"], allow_localhost=False)
+        with _ip_map_lock:
+            _ip_to_hostname["10.0.0.0"] = ("old-a.example.com", "old-b.example.com")
+            for i in range(1, _IP_MAP_MAX_SIZE):
+                _ip_to_hostname[f"10.{i // 65536}.{i // 256 % 256}.{i % 256}"] = (
+                    "filler.example.com",
+                )
+        fake_dns.table["new.example.com"] = ["203.0.113.7"]
+        _audit_hook("socket.getaddrinfo", ("new.example.com", 443, 0, 0, 0))
+        with _ip_map_lock:
+            assert len(_ip_to_hostname) == _IP_MAP_MAX_SIZE
+            assert "10.0.0.0" not in _ip_to_hostname
+            assert _ip_to_hostname["203.0.113.7"] == ("new.example.com",)
 
 
 class TestAllowedHostnamesRecording:
@@ -1980,7 +2191,7 @@ class TestFallbackResolve:
         assert _core._fallback_resolve("203.0.113.99", 443) == "api.example.com"
         # IP map enriched for the fast path on the next connect.
         with _ip_map_lock:
-            assert _ip_to_hostname.get("203.0.113.99") == "api.example.com"
+            assert _ip_to_hostname.get("203.0.113.99") == ("api.example.com",)
 
     def test_returns_none_when_no_candidate_matches(self, monkeypatch):
         """All candidates resolve, none match the target IP → ``None``."""
@@ -2045,7 +2256,7 @@ class TestFallbackResolve:
             _ip_to_hostname.clear()
             # Fill IP map to capacity with sentinel entries.
             for i in range(_IP_MAP_MAX_SIZE):
-                _ip_to_hostname[f"10.0.0.{i}"] = "old.example.com"
+                _ip_to_hostname[f"10.0.0.{i}"] = ("old.example.com",)
 
         monkeypatch.setattr(
             _core._csocket,
@@ -2065,7 +2276,7 @@ class TestFallbackResolve:
         tethered.activate(allow=["*.example.com"])
         with _ip_map_lock:
             _core._allowed_hostnames["new.example.com"] = None
-            _ip_to_hostname["203.0.113.5"] = "stale.example.com"
+            _ip_to_hostname["203.0.113.5"] = ("stale.example.com",)
 
         monkeypatch.setattr(
             _core._csocket,
@@ -2074,7 +2285,8 @@ class TestFallbackResolve:
         )
         assert _core._fallback_resolve("203.0.113.5", 443) == "new.example.com"
         with _ip_map_lock:
-            assert _ip_to_hostname["203.0.113.5"] == "new.example.com"
+            # Most recent name first; the earlier name for the address is kept.
+            assert _ip_to_hostname["203.0.113.5"] == ("new.example.com", "stale.example.com")
 
     def test_locked_mode_routes_through_c_guardian(self, monkeypatch):
         """When the C guardian is active, ``_fallback_resolve`` calls its trusted resolve."""
@@ -2128,7 +2340,7 @@ class TestFallbackResolve:
         _audit_hook("socket.connect", (None, ("203.0.113.42", 443)))
         # The fallback enriched the map; future connects take the fast path.
         with _ip_map_lock:
-            assert _ip_to_hostname.get("203.0.113.42") == "api.example.com"
+            assert _ip_to_hostname.get("203.0.113.42") == ("api.example.com",)
 
     def test_handle_connect_blocks_when_fallback_finds_no_match(self, monkeypatch):
         """A genuinely-disallowed IP is still blocked after the fallback.
@@ -2415,7 +2627,7 @@ class TestConcurrency:
             try:
                 for i in range(200):
                     with _ip_map_lock:
-                        _ip_to_hostname[f"10.0.0.{i % 256}"] = f"host{i}.stripe.com"
+                        _ip_to_hostname[f"10.0.0.{i % 256}"] = (f"host{i}.stripe.com",)
             except Exception as e:
                 errors.append(e)
 
@@ -2491,7 +2703,7 @@ class TestDeactivateReactivate:
         """deactivate() should clear the IP map."""
         tethered.activate(allow=["*.stripe.com"])
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "api.stripe.com"
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
 
         tethered.deactivate()
 
@@ -2502,7 +2714,7 @@ class TestDeactivateReactivate:
         """IP map from old policy should not affect new policy."""
         tethered.activate(allow=["*.stripe.com"])
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "api.stripe.com"
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
 
         tethered.deactivate()
         tethered.activate(allow=["*.example.com"])
@@ -2515,7 +2727,7 @@ class TestDeactivateReactivate:
         """activate() -> activate() (no deactivate) must clear the IP map."""
         tethered.activate(allow=["*.stripe.com"])
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "api.stripe.com"
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
 
         # Re-activate with a different policy — no deactivate() in between
         tethered.activate(allow=["*.example.com"])
@@ -3951,7 +4163,7 @@ class TestScopeDirect:
         )
         # Prime IP map with a hostname mapping
         with _ip_map_lock:
-            _ip_to_hostname["198.51.100.1"] = "evil.example.com"
+            _ip_to_hostname["198.51.100.1"] = ("evil.example.com",)
         _handle_connect(None, (sc,), "socket.connect", (None, ("198.51.100.1", 443)))
         # Callback should receive the resolved hostname, not the raw IP
         assert blocked == [("evil.example.com", 443)]
@@ -3964,7 +4176,7 @@ class TestScopeDirect:
 
         # Prime IP map: 10.0.0.1 -> "db.internal"
         with _ip_map_lock:
-            _ip_to_hostname["10.0.0.1"] = "db.internal"
+            _ip_to_hostname["10.0.0.1"] = ("db.internal",)
 
         # "db.internal" is not in the scope, but 10.0.0.1 matches 10.0.0.0/8
         # Should be allowed (IP fallback), not blocked

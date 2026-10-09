@@ -503,7 +503,7 @@ class TestContextVarTamperDetection:
         # the policy check passes, then resolution flows through the C guardian.
         _audit_hook("socket.getaddrinfo", ("dns.google", 53, 0, 0, 0))
         with _ip_map_lock:
-            assert any(v == "dns.google" for v in _ip_to_hostname.values())
+            assert any("dns.google" in v for v in _ip_to_hostname.values())
 
     def test_unauthorized_resolve_call_blocked(self):
         """Calling _guardian.resolve() from non-trusted code is blocked."""
@@ -541,7 +541,7 @@ class TestContextVarTamperDetection:
         result = _core._fallback_resolve("203.0.113.99", 443)
         assert result == "api.example.com"
         with _ip_map_lock:
-            assert _ip_to_hostname.get("203.0.113.99") == "api.example.com"
+            assert _ip_to_hostname.get("203.0.113.99") == ("api.example.com",)
 
     def test_fallback_resolve_repairs_divergence_end_to_end_locked(self, monkeypatch):
         """End-to-end: locked-mode connect to an unmapped IP succeeds via fallback.

@@ -33,6 +33,11 @@ logger = logging.getLogger("tethered")
 # Maximum number of IP -> hostname entries to retain.
 _IP_MAP_MAX_SIZE = 4096
 
+# Maximum number of hostnames remembered per IP address.  Several names can
+# share one address (CDNs, cloud API front ends, load balancers), so one name
+# per address is not enough; bounded so per-connect work stays a small constant.
+_IP_MAP_MAX_NAMES = 8
+
 
 def _rebuild_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseException:
     """Recreate a pickled or copied policy exception without calling ``__init__``.
@@ -207,9 +212,13 @@ _state_lock = threading.Lock()
 _config: _Config | None = None
 _guardian_token_id: int = 0  # stored for test fixture cleanup
 
-# IP -> hostname mapping from intercepted getaddrinfo calls.
+# IP -> hostnames mapping from intercepted getaddrinfo calls.  The key is the
+# canonical text of the address (see ``_canonical_ip``); the value is the
+# hostnames that resolved to it, most recent first, at most
+# ``_IP_MAP_MAX_NAMES`` (see ``_record_ip_name``).  A connect to the address
+# is allowed if any of those names, or the raw IP, is allowed.
 # OrderedDict for LRU eviction: move_to_end() on access, popitem(last=False) to evict.
-_ip_to_hostname: collections.OrderedDict[str, str] = collections.OrderedDict()
+_ip_to_hostname: collections.OrderedDict[str, tuple[str, ...]] = collections.OrderedDict()
 _ip_map_lock = threading.Lock()
 
 # Recently-allowed hostnames (lookups that the global policy and every
@@ -344,6 +353,53 @@ def _is_ip(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _canonical_ip(host: str) -> str | None:
+    """Return the canonical text of an IP address, or ``None`` if ``host`` is not one.
+
+    The IP map is keyed by this form when storing and when looking up, so that
+    different spellings of one address meet: IPv6 compressed and lower-case,
+    no scope ID (``fe80::1%eth0`` -> ``fe80::1``), and IPv4-mapped IPv6 as the
+    IPv4 address (``::ffff:192.0.2.1`` -> ``192.0.2.1``).
+    """
+    if not _could_be_ip(host):
+        return None
+    if "%" in host:
+        host = host.partition("%")[0]
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if ip.version == 4:
+        # ipaddress accepts a single spelling of an IPv4 address (four decimal
+        # octets, no leading zeros), so the text that parsed is the canonical
+        # one already; skipping str() keeps the connect hot path short.
+        return host
+    mapped = ip.ipv4_mapped
+    return str(ip if mapped is None else mapped)
+
+
+def _record_ip_name(ip: str, hostname: str) -> str:
+    """Record that ``hostname`` resolved to ``ip``; return the map key used.
+
+    Caller must hold ``_ip_map_lock``.  Keeps up to ``_IP_MAP_MAX_NAMES``
+    hostnames per address, most recent first, and marks the address as the
+    most recently used one (LRU across addresses).
+    """
+    key = _canonical_ip(ip) or ip
+    names = _ip_to_hostname.get(key)
+    if names is None:
+        # LRU eviction: remove oldest entry when at capacity
+        if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
+            _ip_to_hostname.popitem(last=False)
+        _ip_to_hostname[key] = (hostname,)
+        return key
+    if names[0] != hostname:
+        others = tuple(name for name in names if name != hostname)
+        _ip_to_hostname[key] = (hostname, *others)[:_IP_MAP_MAX_NAMES]
+    _ip_to_hostname.move_to_end(key)
+    return key
 
 
 def _host_text(host: Any) -> str | None:
@@ -488,7 +544,7 @@ def _check_scopes(
     """Check one destination against all active scopes.
 
     ``hosts`` holds the alternative, already-normalized names of a single
-    destination: for a connect, the hostname its address resolved from and
+    destination: for a connect, the hostnames its address resolved from and
     the raw IP.  The alternatives are combined inside each scope — a scope
     allows the destination if it allows any one of them — and then every
     scope must allow.  A hostname-only scope and an IP-only scope can
@@ -859,22 +915,16 @@ def _handle_getaddrinfo(
         family = args[2] if len(args) >= 3 and isinstance(args[2], int) else 0
         socktype = args[3] if len(args) >= 4 and isinstance(args[3], int) else 0
         proto = args[4] if len(args) >= 5 and isinstance(args[4], int) else 0
-        flags = args[5] if len(args) >= 6 and isinstance(args[5], int) else 0
+        # The audit event ends there: the caller's flags are not part of it,
+        # so this lookup is made without any.
         if _c_guardian is not None and _c_guardian.is_active():
-            results = _c_guardian.resolve(host, port, family, socktype, proto, flags)
+            results = _c_guardian.resolve(host, port, family, socktype, proto, 0)
         else:
-            results = _csocket.getaddrinfo(host, port, family, socktype, proto, flags)
+            results = _csocket.getaddrinfo(host, port, family, socktype, proto, 0)
         with _ip_map_lock:
             for _family, _socktype, _proto, _canonname, sockaddr in results:
-                ip = str(sockaddr[0])  # always str; cast for the type checker
-                if ip in _ip_to_hostname:
-                    _ip_to_hostname[ip] = host_lower
-                    _ip_to_hostname.move_to_end(ip)
-                    continue
-                # LRU eviction: remove oldest entry when at capacity
-                if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
-                    _ip_to_hostname.popitem(last=False)
-                _ip_to_hostname[ip] = host_lower
+                # sockaddr[0] is always str; cast for the type checker
+                _record_ip_name(str(sockaddr[0]), host_lower)
     except Exception:
         # Best-effort: gevent/eventlet monkey-patched resolvers can raise
         # RuntimeError or other non-OSError exceptions (e.g. thread pool
@@ -913,7 +963,8 @@ def _fallback_resolve(target_ip: str, port: int | None) -> str | None:
 
     Returns the matching hostname (and enriches :data:`_ip_to_hostname`
     so future connects to the same IP take the fast path) on hit; returns
-    ``None`` on miss.  Per-hostname resolve failures are swallowed and
+    ``None`` on miss.  Addresses are compared in canonical form (see
+    :func:`_canonical_ip`).  Per-hostname resolve failures are swallowed and
     the search continues — sustained DNS failure for every candidate
     yields ``None``, leaving the calling :func:`_handle_connect` to block
     on the original miss.
@@ -930,6 +981,8 @@ def _fallback_resolve(target_ip: str, port: int | None) -> str | None:
 
     if not candidates:
         return None
+
+    target_key = _canonical_ip(target_ip) or target_ip
 
     _token = _in_hook.set(True)
     try:
@@ -952,15 +1005,7 @@ def _fallback_resolve(target_ip: str, port: int | None) -> str | None:
             matched = False
             with _ip_map_lock:
                 for _fam, _stype, _proto, _canon, sockaddr in results:
-                    ip = str(sockaddr[0])
-                    if ip in _ip_to_hostname:
-                        _ip_to_hostname[ip] = hostname
-                        _ip_to_hostname.move_to_end(ip)
-                    else:
-                        if len(_ip_to_hostname) >= _IP_MAP_MAX_SIZE:
-                            _ip_to_hostname.popitem(last=False)
-                        _ip_to_hostname[ip] = hostname
-                    if ip == target_ip:
+                    if _record_ip_name(str(sockaddr[0]), hostname) == target_key:
                         matched = True
             if matched:
                 logger.debug(
@@ -1000,35 +1045,43 @@ def _handle_connect(
 
     host, port = parsed
 
-    # Look up original hostname if this is an IP
+    # Look up the original hostname(s) if this is an IP
     resolved_from: str | None = None
     check_host = _normalize_host(host)
+    # Every name a policy may allow this destination by: the hostnames its
+    # address is known to have resolved from (most recent first), then the
+    # host as given.  A policy allows the destination if it allows ANY of them.
+    hosts: tuple[str, ...] = (check_host,)
 
-    if _is_ip(host):
+    ip_key = _canonical_ip(check_host)
+    if ip_key is not None:
         with _ip_map_lock:
-            resolved_from = _ip_to_hostname.get(host)
+            names = _ip_to_hostname.get(ip_key, ())
             # LRU: move to end on access so recently-used entries survive eviction
-            if resolved_from is not None:
-                _ip_to_hostname.move_to_end(host)
-        if resolved_from is None:
+            if names:
+                _ip_to_hostname.move_to_end(ip_key)
+        if not names:
             # IP map miss — could be DNS divergence (load-balanced service,
             # short TTL, gevent threadpool latency) where the IP CPython
             # returned to the application differs from what tethered's
             # audit-time getaddrinfo saw.  Re-resolve recently-allowed
             # hostnames to find one that maps to this IP.  Hot path
             # (mapped IP) is unaffected; cost only on the miss.
-            resolved_from = _fallback_resolve(host, port)
-        if resolved_from is not None:
-            check_host = resolved_from
+            fallback = _fallback_resolve(ip_key, port)
+            if fallback is not None:
+                names = (fallback,)
+        if names:
+            hosts = (*names, check_host)
+            # Reported (exception, logs, callbacks) under the name most
+            # recently seen for the address.
+            resolved_from = check_host = names[0]
 
     # ── Global policy check ──
     global_allowed = True
     if cfg is not None:
         try:
-            allowed = cfg.policy.is_allowed(check_host, port, _normalized=True)
-            # If hostname didn't match but we have the raw IP, try that too
-            if not allowed and resolved_from is not None:
-                allowed = cfg.policy.is_allowed(host, port, _normalized=True)
+            # Allowed if any mapped hostname, or the raw IP, is allowed.
+            allowed = _allows_any(cfg.policy, hosts, port)
         except Exception:
             if cfg.fail_closed:
                 logger.error(
@@ -1083,13 +1136,12 @@ def _handle_connect(
                 )
 
     # ── Scope checks ──
-    # Each scope is asked about the resolved hostname and the raw IP together:
-    # a scope allows the connection if it allows EITHER (the same either/or
+    # Each scope is asked about the mapped hostnames and the raw IP together:
+    # a scope allows the connection if it allows ANY of them (the same rule
     # the global policy applies above), and every scope must allow.
     #
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
-    hosts = (check_host,) if resolved_from is None else (check_host, host)
     for blocking_scope in _check_scopes(scope_stack, hosts, port):
         _enforce_scope_block(
             blocking_scope,
