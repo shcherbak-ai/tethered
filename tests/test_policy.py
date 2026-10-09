@@ -283,6 +283,75 @@ class TestAllowPolicyTrailingDot:
         policy = AllowPolicy(["api.stripe.com."])
         assert policy.is_allowed("api.stripe.com") is True
 
+    def test_trailing_dot_in_wildcard_rule(self):
+        policy = AllowPolicy(["*.example.com."], allow_localhost=False)
+        assert policy.is_allowed("api.example.com") is True
+        assert policy.is_allowed("api.example.com.") is True
+        assert policy.is_allowed("example.org") is False
+
+    def test_trailing_dot_before_port_in_exact_rule(self):
+        """The FQDN dot belongs to the host part: ``host.:port``, not ``host:port.``."""
+        policy = AllowPolicy(["api.example.com.:443"], allow_localhost=False)
+        assert policy.is_allowed("api.example.com", 443) is True
+        assert policy.is_allowed("api.example.com.", 443) is True
+        assert policy.is_allowed("api.example.com", 80) is False
+
+    def test_trailing_dot_before_port_in_wildcard_rule(self):
+        policy = AllowPolicy(["*.example.com.:443"], allow_localhost=False)
+        assert policy.is_allowed("api.example.com", 443) is True
+        assert policy.is_allowed("api.example.com.", 443) is True
+        assert policy.is_allowed("api.example.com", 80) is False
+        assert policy.is_allowed("api.example.org", 443) is False
+
+    def test_trailing_dot_before_port_in_ip_rule(self):
+        policy = AllowPolicy(["192.0.2.1.:443"], allow_localhost=False)
+        assert policy.is_allowed("192.0.2.1", 443) is True
+        assert policy.is_allowed("192.0.2.1", 80) is False
+
+    def test_trailing_dot_rules_equal_their_dotless_form(self):
+        dotted = AllowPolicy(
+            ["api.example.com.", "api.example.com.:443", "*.example.com.", "*.example.com.:443"]
+        )
+        plain = AllowPolicy(
+            ["api.example.com", "api.example.com:443", "*.example.com", "*.example.com:443"]
+        )
+        assert dotted._exact_hosts_any_port == plain._exact_hosts_any_port
+        assert dotted._exact_hosts == plain._exact_hosts
+        assert dotted._host_rules == plain._host_rules
+
+    def test_trailing_dot_rules_serialize_without_the_dot(self):
+        """A child process rebuilds the same policy from the serialized allow list."""
+        policy = AllowPolicy(["api.example.com.:443", "*.example.com.:443", "db.example.com."])
+        serialized = _serialize_allow_list(policy)
+        assert serialized == ["*.example.com:443", "api.example.com:443", "db.example.com"]
+        assert _serialize_allow_list(AllowPolicy(serialized)) == serialized
+
+    def test_double_trailing_dot_before_port_round_trips_through_serialization(self):
+        """One dot is stripped; the one that stays survives the trip to a child process."""
+        policy = AllowPolicy(["api.example.com..:443"], allow_localhost=False)
+        assert policy.is_allowed("api.example.com..", 443) is True
+        assert policy.is_allowed("api.example.com", 443) is False
+
+        serialized = _serialize_allow_list(policy)
+        assert serialized == ["api.example.com..:443"]
+        assert AllowPolicy(serialized, allow_localhost=False)._exact_hosts == policy._exact_hosts
+
+    @pytest.mark.parametrize("rule", ["api.example.com:443.", "*.example.com:443."])
+    def test_dot_after_port_raises(self, rule):
+        """``443.`` is not a port; only the host part may carry the FQDN dot."""
+        with pytest.raises(ValueError, match="not a valid HOST:PORT rule"):
+            AllowPolicy([rule])
+
+    def test_dot_after_bracketed_ip_raises(self):
+        with pytest.raises(ValueError, match=r"unexpected text '\.' after '\]'"):
+            AllowPolicy(["[2001:db8::1]."])
+        with pytest.raises(ValueError, match=r"invalid port '443\.'"):
+            AllowPolicy(["[2001:db8::1]:443."])
+
+    def test_host_of_only_a_dot_before_port_raises(self):
+        with pytest.raises(ValueError, match="has no host"):
+            AllowPolicy([".:443"])
+
 
 class TestAllowPolicyScopeId:
     def test_ipv6_scope_id_stripped(self):

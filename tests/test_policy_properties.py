@@ -147,8 +147,9 @@ def _bracketed(addr, prefix, port):
 
 
 def _decorate(core, port, dots, upper, pad):
-    text = core if port is None else f"{core}:{port}"
-    text += "." * dots
+    text = core + "." * dots
+    if port is not None:
+        text = f"{text}:{port}"
     if upper:
         text = text.upper()
     return f"{pad}{text}{pad}"

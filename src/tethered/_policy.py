@@ -91,12 +91,6 @@ class AllowPolicy:
                 )
                 raise ValueError(msg)
 
-            # Strip exactly one trailing dot from FQDNs (not IPs, not CIDRs).
-            # The rstrip keeps the result free of outer whitespace, like the
-            # initial strip() does, so a serialized rule re-parses unchanged.
-            if rule.endswith(".") and not rule.endswith("/"):
-                rule = rule[:-1].rstrip()
-
             port: int | None = None
 
             # Bracketed IP: [::1], [2001:db8::1]:443, [2001:db8::]/32[:443].
@@ -113,6 +107,14 @@ class AllowPolicy:
                 rule_part, port_str = rule.rsplit(":", 1)
                 port = _validate_port(int(port_str))
                 rule = rule_part
+
+            # Strip exactly one trailing dot (FQDN form) from the host part.
+            # This runs after the port split so that "api.example.com.:443"
+            # normalizes the same way "api.example.com." does.  The rstrip
+            # keeps the result free of outer whitespace, like the initial
+            # strip() does, so a serialized rule re-parses unchanged.
+            if rule.endswith("."):
+                rule = rule[:-1].rstrip()
 
             if not rule:
                 msg = f"allow rule {raw!r} has no host. Use 'HOST' or 'HOST:PORT'."

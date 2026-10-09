@@ -2043,16 +2043,16 @@ def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
     combined list.  Sorting is round-trip stable — every entry is a
     normalized string, so parse → re-serialize yields the identical list.
 
-    ``AllowPolicy`` strips exactly one trailing dot from a port-less rule,
-    so a stored pattern that still ends in a dot (from ``"host.."``) gets
-    that dot back here; otherwise the child would strip the remaining one
-    and hold a different rule than the parent.
+    ``AllowPolicy`` strips exactly one trailing dot from a rule's host
+    part, so a stored pattern that still ends in a dot (from ``"host.."``)
+    gets that dot back here; otherwise the child would strip the remaining
+    one and hold a different rule than the parent.
     """
 
     def host_rule(pattern: str, port: int | None) -> str:
-        if port is not None:
-            return f"{pattern}:{port}"
-        return pattern + "." if pattern.endswith(".") else pattern
+        if pattern.endswith("."):
+            pattern += "."
+        return pattern if port is None else f"{pattern}:{port}"
 
     return sorted(
         [host_rule(h, None) for h in policy._exact_hosts_any_port]
