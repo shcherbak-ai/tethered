@@ -114,7 +114,7 @@ Also usable as a context manager (`with tethered.scope(allow=[...]):`). No `deac
 
 ### Subprocess control
 
-Python child processes (`multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn workers, plain `subprocess.run([sys.executable, ...])`) **automatically inherit** the parent's tethered policy — including any active scope. Non-Python launches (curl, ffmpeg, different Python interpreters, or `sys.executable` with `-S` which disables `site.py`) are governed by `external_subprocess_policy` (`"warn"` default, or `"block"`).
+Python child processes (`multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn workers, plain `subprocess.run([sys.executable, ...])`) **automatically inherit** the parent's tethered policy. An active `scope()` travels too for children launched through `subprocess` (and for forked children); spawn-mode `multiprocessing` / `ProcessPoolExecutor` workers receive the global policy only. Non-Python launches (curl, ffmpeg, different Python interpreters, or `sys.executable` with `-S` which disables `site.py`) are governed by `external_subprocess_policy` (`"warn"` default, or `"block"`).
 
 ```python
 import tethered, subprocess, sys
