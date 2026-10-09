@@ -116,8 +116,11 @@ static PyObject        *subprocess_blocked_cls = NULL;
 /* Cached ContextVar object (strong ref) */
 static PyObject        *in_hook_var = NULL;        /* _in_hook ContextVar */
 
-/* Cached _socket module for resolve() */
-static PyObject        *csocket_module = NULL;
+/* The resolver resolve() calls (strong ref): _socket.getaddrinfo as it was
+ * when the guardian went from inactive to active.  Holding the callable —
+ * not the module — means a later `_socket.getaddrinfo = ...` cannot put
+ * other code inside the trusted resolution window. */
+static PyObject        *guardian_resolver = NULL;
 
 /* Cached __code__ objects for caller verification of resolve() (strong refs).
  * Slot 0: _handle_getaddrinfo (the audit-hook DNS path).
@@ -132,8 +135,10 @@ static const char      *expected_caller_names[EXPECTED_CALLER_COUNT] = {
     "_fallback_resolve",
 };
 
-/* Thread-local trusted reentrancy counter for DNS resolution.
- * Invisible to Python — only C functions can modify it. */
+/* Thread-local trusted reentrancy counter for DNS resolution: non-zero
+ * while this thread is inside resolve()'s call to the resolver (the
+ * "resolution window").  Invisible to Python — only C functions can
+ * modify it. */
 static THREAD_LOCAL int resolving_depth = 0;
 
 /*
@@ -577,6 +582,15 @@ env_key_is_policy_var(PyObject *args)
 
 /* ── The C audit hook ────────────────────────────────────────────── */
 
+/* The events that open a connection or send a datagram: (socket, address). */
+static int
+is_connect_event(const char *event)
+{
+    return (strcmp(event, "socket.connect") == 0 ||
+            strcmp(event, "socket.sendto") == 0 ||
+            strcmp(event, "socket.sendmsg") == 0);
+}
+
 /* A socket event failed a check: refuse it, naming the host if we can. */
 static int
 refuse_socket_event(const char *event, PyObject *args, const char *fallback)
@@ -585,9 +599,7 @@ refuse_socket_event(const char *event, PyObject *args, const char *fallback)
 
     if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
         subject = PyTuple_GET_ITEM(args, 0);
-        if (strcmp(event, "socket.connect") == 0 ||
-            strcmp(event, "socket.sendto") == 0 ||
-            strcmp(event, "socket.sendmsg") == 0) {
+        if (is_connect_event(event)) {
             /* args: (socket, address) — name the address's host */
             subject = NULL;
             if (PyTuple_GET_SIZE(args) >= 2) {
@@ -613,9 +625,25 @@ guardian_hook(const char *event, PyObject *args, void *userData)
         return 0;
 
     if (kind == EVENT_SOCKET) {
-        /* Fast path: legitimate recursion from our own resolve() */
-        if (resolving_depth > 0)
-            return 0;
+        /*
+         * Inside the resolution window (this thread is in resolve()'s call
+         * to the resolver), the resolver's own lookup is trusted and
+         * nothing else is:
+         *
+         * - socket.getaddrinfo is the event the resolver itself raises —
+         *   let it through without re-entering the checks below;
+         * - a connection or datagram has no business happening here.  The
+         *   Python hook would wave it through (its reentrancy flag is
+         *   set), so refuse it outright, whatever the policy says;
+         * - every other socket event takes the normal path.
+         */
+        if (resolving_depth > 0) {
+            if (strcmp(event, "socket.getaddrinfo") == 0)
+                return 0;
+            if (is_connect_event(event))
+                return refuse_socket_event(
+                    event, args, "unknown (inside DNS resolution)");
+        }
 
         /* Check ContextVar consistency BEFORE integrity check.  Detects
          * _in_hook.set(True) without corresponding C-owned trusted state. */
@@ -910,8 +938,12 @@ typedef struct {
     PyObject *egress_cls;
     PyObject *subprocess_cls;
     PyObject *in_hook;
+    PyObject *resolver;
     PyObject *caller_codes[EXPECTED_CALLER_COUNT];
 } Holdings;
+
+#define EMPTY_HOLDINGS \
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, { NULL, NULL } }
 
 static void
 release_holdings(Holdings *h)
@@ -922,6 +954,7 @@ release_holdings(Holdings *h)
     Py_CLEAR(h->egress_cls);
     Py_CLEAR(h->subprocess_cls);
     Py_CLEAR(h->in_hook);
+    Py_CLEAR(h->resolver);
     for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
         Py_CLEAR(h->caller_codes[i]);
 }
@@ -939,6 +972,7 @@ swap_holdings(Holdings *h)
     SWAP(egress_blocked_cls, h->egress_cls);
     SWAP(subprocess_blocked_cls, h->subprocess_cls);
     SWAP(in_hook_var, h->in_hook);
+    SWAP(guardian_resolver, h->resolver);
     for (int i = 0; i < EXPECTED_CALLER_COUNT; i++)
         SWAP(expected_caller_codes[i], h->caller_codes[i]);
 #undef SWAP
@@ -972,14 +1006,9 @@ py_activate(PyObject *self, PyObject *args)
      * inactive.
      */
 
-    /* The _socket module cache and the audit hook are process-lifetime:
-     * setting them up for an activation that then fails is harmless (the
-     * hook is a no-op while the guardian is inactive). */
-    if (csocket_module == NULL) {
-        csocket_module = PyImport_ImportModule("_socket");
-        if (csocket_module == NULL)
-            return NULL;
-    }
+    /* The audit hook is process-lifetime: installing it for an activation
+     * that then fails is harmless (it is a no-op while the guardian is
+     * inactive). */
     static int hook_installed = 0;
     if (!hook_installed) {
         if (PySys_AddAuditHook(guardian_hook, NULL) < 0)
@@ -987,7 +1016,7 @@ py_activate(PyObject *self, PyObject *args)
         hook_installed = 1;
     }
 
-    Holdings next = { NULL, NULL, NULL, NULL, NULL, NULL, { NULL, NULL } };
+    Holdings next = EMPTY_HOLDINGS;
     SnapshotEntry *staging = NULL;
     SnapshotEntry *retired = NULL;
     Py_ssize_t staging_count = 0;
@@ -1014,6 +1043,23 @@ py_activate(PyObject *self, PyObject *args)
     for (int i = 0; i < EXPECTED_CALLER_COUNT; i++) {
         next.caller_codes[i] = namespace_get_code(ns, expected_caller_names[i]);
         if (next.caller_codes[i] == NULL)
+            goto fail;
+    }
+
+    /* The resolver is captured when the guardian goes from inactive to
+     * active and kept across authorized re-activations: a replacement of
+     * _socket.getaddrinfo made while a policy is locked is never adopted. */
+    if (ATOMIC_LOAD(guardian_active) && guardian_resolver != NULL) {
+        next.resolver = guardian_resolver;
+        Py_INCREF(next.resolver);
+    }
+    else {
+        PyObject *socket_module = PyImport_ImportModule("_socket");
+        if (socket_module == NULL)
+            goto fail;
+        next.resolver = PyObject_GetAttrString(socket_module, "getaddrinfo");
+        Py_DECREF(socket_module);
+        if (next.resolver == NULL)
             goto fail;
     }
 
@@ -1076,10 +1122,9 @@ py_deactivate(PyObject *self, PyObject *args)
         return NULL;
 
     /* Commit: pointer moves only (see py_activate). */
-    Holdings previous = { NULL, NULL, NULL, NULL, NULL, NULL, { NULL, NULL } };
+    Holdings previous = EMPTY_HOLDINGS;
     ATOMIC_STORE(guardian_active, 0);
     swap_holdings(&previous);
-    /* csocket_module kept alive — harmless, avoids re-import */
     ATOMIC_STORE(tamper_alerted, 0);
 
     /* Release (may run finalizers; the guardian is already inactive). */
@@ -1113,9 +1158,11 @@ py_check_token(PyObject *self, PyObject *args)
 /*
  * resolve(host, port, family, type, proto, flags) → list
  *
- * Wraps _socket.getaddrinfo with a C-internal resolving_depth counter
- * that the guardian hook trusts.  When the guardian is active, also
- * verifies that the caller is _handle_getaddrinfo (frame __code__ check).
+ * Calls the resolver captured at activation (the original
+ * _socket.getaddrinfo) inside the "resolution window": while the call is
+ * running, the guardian hook lets this thread's socket.getaddrinfo events
+ * through and refuses any connection or datagram.  Only the two Python
+ * functions that tethered resolves from may call it (frame __code__ check).
  */
 static PyObject *
 py_resolve(PyObject *self, PyObject *args)
@@ -1152,17 +1199,25 @@ py_resolve(PyObject *self, PyObject *args)
             return raise_blocked_py("unauthorized _guardian.resolve() call");
     }
 
-    if (csocket_module == NULL) {
+    PyObject *resolver = guardian_resolver;
+    if (resolver == NULL) {
         PyErr_SetString(PyExc_RuntimeError,
-            "tethered: _guardian not activated (no _socket module)");
+            "tethered: _guardian.resolve() needs an active guardian");
         return NULL;
     }
+    /* Own reference: the resolver releases the GIL, and a deactivation on
+     * another thread would drop the global meanwhile. */
+    Py_INCREF(resolver);
 
-    resolving_depth++;
-    PyObject *result = PyObject_CallMethod(
-        csocket_module, "getaddrinfo", "OOiiii",
-        host, port, family, socktype, proto, flags);
-    resolving_depth--;
+    /* Open the resolution window for this thread and close it again on
+     * every path out, whether the resolver returns or raises. */
+    int outer_depth = resolving_depth;
+    resolving_depth = outer_depth + 1;
+    PyObject *result = PyObject_CallFunction(
+        resolver, "OOiiii", host, port, family, socktype, proto, flags);
+    resolving_depth = outer_depth;
+
+    Py_DECREF(resolver);
 
     return result;
 }

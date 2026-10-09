@@ -1727,17 +1727,16 @@ class TestContextVarTamperDetection:
         Without slot 1, the call would raise EgressBlocked("unauthorized").
         With it, the call succeeds and returns the resolution result.
         """
+        # Keep the test offline with a stand-in resolver.  The guardian
+        # captures _socket.getaddrinfo when it is activated and calls that
+        # object from then on, so the stand-in has to be in place first.
+        fake_results = [(0, 0, 0, "", ("203.0.113.99", 0))]
+        monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **kw: fake_results)
+
         secret = object()
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
         with _ip_map_lock:
             _core._allowed_hostnames["api.example.com"] = None
-
-        # Patch the underlying _socket.getaddrinfo (the C-level function the
-        # guardian's resolve() ultimately calls) so the test stays offline.
-        # _c_guardian.resolve looks up "getaddrinfo" on the cached _socket
-        # module each call, so attribute patching takes effect.
-        fake_results = [(0, 0, 0, "", ("203.0.113.99", 0))]
-        monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **kw: fake_results)
 
         # _fallback_resolve calls _c_guardian.resolve (because guardian is
         # active); the guardian accepts the call (slot 1) and returns the
@@ -1756,6 +1755,13 @@ class TestContextVarTamperDetection:
         was not in tethered's IP map at audit time.  The fallback re-resolves
         and finds the match, allowing the connect.
         """
+        # Stand-in resolver, installed before activation (see the test above).
+        monkeypatch.setattr(
+            _socket,
+            "getaddrinfo",
+            lambda *a, **kw: [(0, 0, 0, "", ("203.0.113.42", 0))],
+        )
+
         secret = object()
         tethered.activate(allow=["api.example.com"], locked=True, lock_token=secret)
         # Pretend a prior getaddrinfo populated _allowed_hostnames but not
@@ -1763,14 +1769,322 @@ class TestContextVarTamperDetection:
         with _ip_map_lock:
             _core._allowed_hostnames["api.example.com"] = None
 
-        monkeypatch.setattr(
-            _socket,
-            "getaddrinfo",
-            lambda *a, **kw: [(0, 0, 0, "", ("203.0.113.42", 0))],
-        )
-
         # The connect path should NOT raise — the fallback finds the match.
         _audit_hook("socket.connect", (None, ("203.0.113.42", 443)))
+
+
+# ── The trusted resolver window (R7) ───────────────────────────────
+
+
+class _StandInResolver:
+    """Stand-in for ``_socket.getaddrinfo`` that can run code inside the window.
+
+    The guardian captures ``_socket.getaddrinfo`` when it is activated, so a
+    test installs this *before* activating; ``inside`` then runs while the
+    guardian's resolution window is open on the calling thread.
+    """
+
+    RESOLVED_IP = "203.0.113.7"
+
+    def __init__(self) -> None:
+        self.inside = None
+        self.hosts: list[object] = []
+
+    def __call__(self, host, port, *rest):
+        self.hosts.append(host)
+        if self.inside is not None:
+            self.inside(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (self.RESOLVED_IP, port or 0))]
+
+
+class _Abort(BaseException):
+    """Not an ``Exception``: escapes the handlers' best-effort ``except``."""
+
+
+@pytest.fixture
+def stand_in_resolver(monkeypatch):
+    resolver = _StandInResolver()
+    monkeypatch.setattr(_socket, "getaddrinfo", resolver)
+    return resolver
+
+
+@pytest.fixture
+def loopback_ports():
+    """Two listening TCP ports on 127.0.0.1: one the tests allow, one they do not."""
+    servers = []
+    for _ in range(2):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(16)
+        servers.append(server)
+    yield tuple(server.getsockname()[1] for server in servers)
+    for server in servers:
+        server.close()
+
+
+def _try_connect(port: int) -> str:
+    with socket.socket() as client:
+        client.settimeout(5)
+        try:
+            client.connect(("127.0.0.1", port))
+        except tethered.EgressBlocked:
+            return "blocked"
+        return "connected"
+
+
+def _try_sendto(port: int) -> str:
+    with socket.socket(type=socket.SOCK_DGRAM) as client:
+        try:
+            client.sendto(b"x", ("127.0.0.1", port))
+        except tethered.EgressBlocked:
+            return "blocked"
+        return "sent"
+
+
+def _resolve_through(path: str, hostname: str = "allowed.test") -> str | None:
+    """Drive one of the two code paths that call ``_c_guardian.resolve``."""
+    if path == "getaddrinfo-hook":
+        _audit_hook("socket.getaddrinfo", (hostname, 443, 0, 0, 0))
+        return hostname
+    with _ip_map_lock:
+        _core._allowed_hostnames[hostname] = None
+        _core._allowed_hostnames.move_to_end(hostname)
+    return _core._fallback_resolve(_StandInResolver.RESOLVED_IP, 443)
+
+
+RESOLVER_PATHS = ["getaddrinfo-hook", "fallback-resolve"]
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestResolverWindow:
+    """What the guardian trusts while it is inside its own DNS resolution."""
+
+    @staticmethod
+    def _lock(open_port: int) -> None:
+        tethered.activate(
+            allow=["allowed.test", "other.test", f"127.0.0.1:{open_port}"],
+            allow_localhost=False,
+            locked=True,
+            lock_token=object(),
+        )
+
+    @pytest.mark.parametrize("path", RESOLVER_PATHS)
+    def test_resolver_replaced_after_activation_is_never_called(self, path, monkeypatch, capfd):
+        """The review's R7 reproduction: the replacement never gets inside the window."""
+        tethered.activate(allow=["localhost"], locked=True, lock_token=object())
+        calls = []
+
+        def replacement(*args):
+            calls.append(args)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.66", 0))]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_socket, "getaddrinfo", replacement)
+            if path == "getaddrinfo-hook":
+                _audit_hook("socket.getaddrinfo", ("localhost", 80, 0, 0, 0))
+            else:
+                with _ip_map_lock:
+                    _core._allowed_hostnames["localhost"] = None
+                assert _core._fallback_resolve("127.0.0.1", 80) == "localhost"
+        assert calls == []
+        with _ip_map_lock:
+            # The genuine resolver answered, from the hosts file.
+            assert _ip_to_hostname.get("127.0.0.1") == "localhost"
+            assert "203.0.113.66" not in _ip_to_hostname
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    @pytest.mark.parametrize("path", RESOLVER_PATHS)
+    def test_connection_attempts_inside_the_window_are_refused(
+        self, path, stand_in_resolver, loopback_ports, capfd
+    ):
+        open_port, closed_port = loopback_ports
+        self._lock(open_port)
+        assert _try_connect(open_port) == "connected"
+        assert _try_connect(closed_port) == "blocked"
+
+        seen = {}
+
+        def inside(host):
+            # Refused whatever the policy says: the Python hook's reentrancy
+            # flag is set here, so it would not check anything.
+            seen["forbidden"] = _try_connect(closed_port)
+            seen["allowed"] = _try_connect(open_port)
+            seen["datagram"] = _try_sendto(closed_port)
+
+        stand_in_resolver.inside = inside
+        assert _resolve_through(path) == "allowed.test"
+        assert seen == {"forbidden": "blocked", "allowed": "blocked", "datagram": "blocked"}
+
+        # Outside the window the policy decides again.
+        assert _try_connect(open_port) == "connected"
+        assert _try_connect(closed_port) == "blocked"
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_refusal_inside_the_window_names_the_destination(
+        self, stand_in_resolver, loopback_ports
+    ):
+        open_port, _ = loopback_ports
+        self._lock(open_port)
+        caught = []
+
+        def inside(host):
+            for event, args in (
+                ("socket.connect", (None, ("127.0.0.1", open_port))),
+                ("socket.sendto", (None, ("127.0.0.1", open_port))),
+                ("socket.sendmsg", (None, ("127.0.0.1", open_port))),
+                ("socket.connect", (None, b"/run/app.sock")),
+            ):
+                try:
+                    sys.audit(event, *args)
+                except tethered.EgressBlocked as exc:
+                    caught.append(exc.host)
+
+        stand_in_resolver.inside = inside
+        _resolve_through("getaddrinfo-hook")
+        assert caught == ["127.0.0.1", "127.0.0.1", "127.0.0.1", "unknown (inside DNS resolution)"]
+
+    def test_other_socket_events_inside_the_window_are_still_verified(
+        self, stand_in_resolver, loopback_ports, monkeypatch, capfd
+    ):
+        """Only the resolver's own lookup is exempt; the snapshot still guards the rest."""
+        open_port, _ = loopback_ports
+        self._lock(open_port)
+        seen = {}
+
+        def inside(host):
+            sys.audit("socket.tethered_test_probe")  # intact: passes
+            sys.audit("socket.getaddrinfo", "anything.test", 80, 0, 0, 0)  # the exempt event
+            with monkeypatch.context() as patch:
+                patch.setattr(_core, "_FALLBACK_RESOLVE_MAX_CANDIDATES", 1)
+                try:
+                    sys.audit("socket.tethered_test_probe")
+                except tethered.EgressBlocked:
+                    seen["tampered"] = "refused"
+
+        stand_in_resolver.inside = inside
+        _resolve_through("getaddrinfo-hook")
+        assert seen == {"tampered": "refused"}
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    @pytest.mark.parametrize("path", RESOLVER_PATHS)
+    @pytest.mark.parametrize(
+        "error", [OSError("resolver down"), _Abort()], ids=["OSError", "BaseException"]
+    )
+    def test_window_closes_when_the_resolver_raises(
+        self, path, error, stand_in_resolver, loopback_ports, capfd
+    ):
+        open_port, _ = loopback_ports
+        self._lock(open_port)
+
+        def inside(host):
+            raise error
+
+        stand_in_resolver.inside = inside
+        if isinstance(error, Exception):
+            # Both callers treat a failed lookup as best-effort.
+            expected = "allowed.test" if path == "getaddrinfo-hook" else None
+            assert _resolve_through(path) == expected
+        else:
+            with pytest.raises(_Abort):
+                _resolve_through(path)
+        stand_in_resolver.inside = None
+        self._assert_window_closed(open_port, capfd)
+
+    def test_window_closes_when_the_genuine_resolver_raises(self, loopback_ports, capfd):
+        open_port, _ = loopback_ports
+        tethered.activate(
+            allow=["localhost", f"127.0.0.1:{open_port}"],
+            allow_localhost=False,
+            locked=True,
+            lock_token=object(),
+        )
+        # A port the real getaddrinfo() rejects; the hook swallows the error.
+        _audit_hook("socket.getaddrinfo", ("localhost", object(), 0, 0, 0))
+        self._assert_window_closed(open_port, capfd)
+
+    @staticmethod
+    def _assert_window_closed(open_port: int, capfd: pytest.CaptureFixture[str]) -> None:
+        """Depth is back to zero: connects follow the policy, and the flag check is live."""
+        # With the window stuck open this would be refused ...
+        assert _try_connect(open_port) == "connected"
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+        # ... and this lookup would be waved through.
+        flag = _core._in_hook.set(True)
+        try:
+            with pytest.raises(tethered.EgressBlocked):
+                sys.audit("socket.getaddrinfo", "allowed.test", 443, 0, 0, 0)
+        finally:
+            _core._in_hook.reset(flag)
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    def test_window_is_per_thread(self, stand_in_resolver, loopback_ports, capfd):
+        """Overlapping resolutions on two threads, one through each resolver path."""
+        open_port, closed_port = loopback_ports
+        self._lock(open_port)
+        entered = threading.Event()
+        release = threading.Event()
+        seen = {}
+
+        def inside(host):
+            # Pause only the slow thread's own lookup, once.  (A connect to
+            # an unmapped IP re-resolves recent hostnames on whichever
+            # thread makes it, which lands here as well.)
+            if threading.current_thread() is thread and not entered.is_set():
+                entered.set()
+                assert release.wait(30)
+                seen["slow thread, inside"] = _try_connect(open_port)
+
+        stand_in_resolver.inside = inside
+
+        def slow():
+            _resolve_through("getaddrinfo-hook", "allowed.test")
+            seen["slow thread, after"] = _try_connect(open_port)
+
+        thread = threading.Thread(target=slow)
+        thread.start()
+        try:
+            assert entered.wait(30)
+            # The other thread sits inside its window.  This one does not.
+            assert _try_connect(open_port) == "connected"
+            assert _try_connect(closed_port) == "blocked"
+            # This thread resolves too, through the other path, and its own
+            # window opens and closes while the first is still open.
+            assert _resolve_through("fallback-resolve", "other.test") == "other.test"
+            assert _try_connect(open_port) == "connected"
+        finally:
+            release.set()
+            thread.join(30)
+        assert not thread.is_alive()
+        assert seen == {"slow thread, inside": "blocked", "slow thread, after": "connected"}
+        assert {"allowed.test", "other.test"} <= set(stand_in_resolver.hosts)
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_authorized_reactivation_keeps_the_original_resolver(self, monkeypatch):
+        """Only locking an unlocked process captures a resolver."""
+        secret = object()
+        tethered.activate(allow=["localhost"], locked=True, lock_token=secret)
+        calls = []
+
+        def replacement(*args):
+            calls.append(args)
+            return []
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_socket, "getaddrinfo", replacement)
+            tethered.activate(allow=["localhost", "other.test"], locked=True, lock_token=secret)
+            _audit_hook("socket.getaddrinfo", ("localhost", 80, 0, 0, 0))
+            assert calls == []
+
+            tethered.deactivate(lock_token=secret)
+            tethered.activate(allow=["localhost"], locked=True, lock_token=secret)
+            _audit_hook("socket.getaddrinfo", ("localhost", 80, 0, 0, 0))
+            assert len(calls) == 1
+            tethered.deactivate(lock_token=secret)
+
+    def test_resolve_needs_an_active_guardian(self):
+        assert _core._c_guardian.is_active() is False
+        with pytest.raises(RuntimeError, match="active guardian"):
+            _core._c_guardian.resolve("localhost", 80, 0, 0, 0, 0)
 
 
 class TestTetheredLockedException:
