@@ -1786,6 +1786,22 @@ def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
     return True
 
 
+def _is_policy_env_key(key: Any) -> bool:
+    """Return True if ``key`` names ``_TETHERED_CHILD_POLICY`` in a child environment.
+
+    Environment names are case-insensitive on Windows, so every case variant
+    is the same variable there (the child's ``os.environ`` upper-cases them).
+    POSIX launch APIs accept ``bytes`` and ``os.PathLike`` names next to
+    ``str``; every spelling that decodes to the name counts.
+    """
+    name = _env_text(key)
+    if name is None:
+        return False
+    if _ENV_NAMES_IGNORE_CASE:
+        return name.upper() == _CHILD_POLICY_ENV
+    return name == _CHILD_POLICY_ENV
+
+
 def _env_text(value: Any) -> str | None:
     """Decode an environment name or value the way the child sees it (``None`` if it cannot be)."""
     if isinstance(value, str):
@@ -1846,13 +1862,17 @@ def _classify_payload(text: str | None, expected: str, payload: str) -> str:
 def _launch_env_state(pairs: list[tuple[Any, Any]], expected: str, payload: str) -> str:
     """Classify the policy payload an explicit launch environment carries.
 
-    Returns ``"missing"`` when the policy key is absent, otherwise the
-    :func:`_classify_payload` result for its value.
+    Returns ``"missing"`` when no spelling of the policy key is present,
+    ``"duplicate"`` when more than one is (which one the child reads is
+    platform-dependent), otherwise the :func:`_classify_payload` result for
+    the single value.
     """
-    values = [value for key, value in pairs if key == _CHILD_POLICY_ENV]
+    values = [value for key, value in pairs if _is_policy_env_key(key)]
     if not values:
         return "missing"
-    return _classify_payload(_env_text(values[-1]), expected, payload)
+    if len(values) > 1:
+        return "duplicate"
+    return _classify_payload(_env_text(values[0]), expected, payload)
 
 
 def _process_env_state(payload: str) -> str:
@@ -1885,7 +1905,7 @@ def _handle_env_change(event: str, args: tuple[Any, ...]) -> None:
     runs inside ``os.environ`` assignments, including tethered's own.
     """
     global _env_dirty
-    if not args or _env_text(args[0]) != _CHILD_POLICY_ENV or _in_env_sync.get():
+    if not args or not _is_policy_env_key(args[0]) or _in_env_sync.get():
         return
     cfg = _config
     if cfg is None:
@@ -1912,6 +1932,11 @@ def _refuse_launch(event: str, desc: str, source: str, state: str) -> None:
             f"{source} carries a {_CHILD_POLICY_ENV} value whose "
             "'global' field differs from the parent's canonical payload "
             "(substitution attempt)",
+        ),
+        "duplicate": (
+            "duplicate policy env entries",
+            f"{source} carries more than one spelling of {_CHILD_POLICY_ENV} "
+            "(duplicate-key tamper attempt)",
         ),
         "diverged": (
             "unverifiable policy env",
@@ -1943,19 +1968,20 @@ def _build_per_launch_env(
     """Build the per-launch env dict to inject into ``_execute_child``.
 
     Copies the effective launch environment — the explicit ``env=`` mapping
-    whatever its type, or ``os.environ`` when the child would inherit — and
-    overwrites ``_TETHERED_CHILD_POLICY`` with a nested-format payload that
-    carries the canonical global plus the active scope chain.  All other env
-    vars are preserved verbatim — never fabricate a child env from scratch —
-    and the caller's mapping is never mutated.  Returns ``None`` when the
-    caller's mapping cannot be read: an environment tethered cannot copy is
-    never replaced by the parent's.
+    whatever its type, or ``os.environ`` when the child would inherit — drops
+    every spelling of ``_TETHERED_CHILD_POLICY`` and sets the one canonical
+    entry: a nested-format payload that carries the canonical global plus
+    the active scope chain.  All other env vars are preserved verbatim —
+    never fabricate a child env from scratch — and the caller's mapping is
+    never mutated.  Returns ``None`` when the caller's mapping cannot be
+    read: an environment tethered cannot copy is never replaced by the
+    parent's.
     """
     _has_env, env_value = _extract_subprocess_env(event, args)
     pairs = _snapshot_env(os.environ if env_value is None else env_value)
     if pairs is None:
         return None
-    new_env = dict(pairs)
+    new_env = {key: value for key, value in pairs if not _is_policy_env_key(key)}
     new_env[_CHILD_POLICY_ENV] = _launch_payload(cfg, scope_stack)
     return new_env
 
@@ -2846,6 +2872,10 @@ def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
 # the same policy.  Fork-mode children inherit tethered state directly via
 # the OS fork() copy and don't need this env var.
 _CHILD_POLICY_ENV = "_TETHERED_CHILD_POLICY"
+
+# Windows environment names are case-insensitive: every case variant of the
+# policy key is the same variable to the child.
+_ENV_NAMES_IGNORE_CASE = sys.platform == "win32"
 
 # True while a native change to the policy variable that did not come from
 # tethered may have left the process environment different from what

@@ -3387,3 +3387,193 @@ class TestNativeEnvChangeTracking:
         assert state["active"] is True
         assert state["allow"] == ["*.example.com"]
         assert _core._env_dirty is False
+
+
+# A payload an attacker would like the child to read instead of the parent's.
+_PERMISSIVE_PAYLOAD = json.dumps(
+    {
+        "global": {
+            "allow": ["0.0.0.0/0", "::/0"],
+            "allow_localhost": True,
+            "log_only": False,
+            "fail_closed": False,
+            "external_subprocess_policy": "allow",
+            "locked": False,
+        },
+        "scopes": [],
+    }
+)
+
+
+class TestOnePolicyKey:
+    """Every spelling of the policy key is the key.
+
+    Windows environment names are case-insensitive, so a second entry
+    spelled ``_tethered_child_policy`` reaches the child as the same
+    variable; on POSIX a mapping may hold both the ``str`` and the ``bytes``
+    name.  The exact-case lookup missed them: the locked-mode check passed
+    and — even when tethered injected its own payload — the duplicate
+    survived in the constructed environment and won in the child.
+    """
+
+    _SCOPE = _ScopeConfig(policy=AllowPolicy(["api.allowed.com"]), label="one-key")
+    _LOWER = _CHILD_POLICY_ENV.lower()
+    _BYTES = _CHILD_POLICY_ENV.encode()
+
+    @pytest.fixture
+    def windows_names(self, monkeypatch):
+        monkeypatch.setattr(_core, "_ENV_NAMES_IGNORE_CASE", True)
+
+    @pytest.fixture
+    def posix_names(self, monkeypatch):
+        monkeypatch.setattr(_core, "_ENV_NAMES_IGNORE_CASE", False)
+
+    def _payload(self) -> str:
+        return _core._canonical_payload(_launch_cfg(locked=True))
+
+    def test_platform_default(self):
+        assert _core._ENV_NAMES_IGNORE_CASE is (sys.platform == "win32")
+
+    # ── which names are the key ────────────────────────────────────────
+
+    def test_windows_every_case_variant_is_the_key(self, windows_names):
+        for name in (_CHILD_POLICY_ENV, self._LOWER, "_Tethered_Child_Policy"):
+            assert _core._is_policy_env_key(name) is True
+        for name in ("_TETHERED_CHILD_POLICY_", "TETHERED_CHILD_POLICY", "PATH", "", 5, None):
+            assert _core._is_policy_env_key(name) is False
+
+    def test_posix_str_bytes_and_pathlike_spellings_are_the_key(self, posix_names):
+        class Name:
+            def __init__(self, value):
+                self.value = value
+
+            def __fspath__(self):
+                if self.value is None:
+                    raise TypeError("not a name")
+                return self.value
+
+        for name in (_CHILD_POLICY_ENV, self._BYTES, Name(_CHILD_POLICY_ENV), Name(self._BYTES)):
+            assert _core._is_policy_env_key(name) is True
+        for name in (self._LOWER, self._LOWER.encode(), b"PATH", Name("PATH"), Name(None), 5):
+            assert _core._is_policy_env_key(name) is False
+
+    # ── validating an environment ──────────────────────────────────────
+
+    def test_windows_case_variant_duplicate_is_detected(self, windows_names):
+        pairs = [(_CHILD_POLICY_ENV, self._payload()), (self._LOWER, _PERMISSIVE_PAYLOAD)]
+        assert _core._launch_env_state(pairs, self._payload(), self._payload()) == "duplicate"
+
+    def test_windows_single_variant_is_read_as_the_key(self, windows_names):
+        payload = self._payload()
+        assert _core._launch_env_state([(self._LOWER, payload)], payload, payload) == "exact"
+        assert (
+            _core._launch_env_state([(self._LOWER, _PERMISSIVE_PAYLOAD)], payload, payload)
+            == "substituted"
+        )
+
+    def test_posix_bytes_duplicate_is_detected(self, posix_names):
+        pairs = [(_CHILD_POLICY_ENV, self._payload()), (self._BYTES, _PERMISSIVE_PAYLOAD.encode())]
+        assert _core._launch_env_state(pairs, self._payload(), self._payload()) == "duplicate"
+
+    def test_posix_bytes_spelling_is_read_as_the_key(self, posix_names):
+        payload = self._payload()
+        assert _core._launch_env_state([(self._BYTES, payload.encode())], payload, payload) == (
+            "exact"
+        )
+        # A different case is a different variable on POSIX.
+        assert _core._launch_env_state([(self._LOWER, payload)], payload, payload) == "missing"
+
+    def test_locked_refuses_a_case_variant_duplicate(self, windows_names):
+        env = {_CHILD_POLICY_ENV: self._payload(), self._LOWER: _PERMISSIVE_PAYLOAD}
+        with pytest.raises(tethered.SubprocessBlocked, match=r"more than one spelling"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    def test_locked_refuses_identical_duplicates_too(self, windows_names):
+        env = {_CHILD_POLICY_ENV: self._payload(), self._LOWER: self._payload()}
+        with pytest.raises(tethered.SubprocessBlocked, match=r"more than one spelling"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    def test_locked_refuses_a_variant_whose_payload_differs(self, windows_names):
+        env = {self._LOWER: _PERMISSIVE_PAYLOAD}
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    def test_locked_accepts_a_single_variant_with_the_canonical_payload(self, windows_names):
+        env = {self._LOWER: self._payload()}
+        _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    def test_locked_refuses_a_bytes_duplicate(self, posix_names):
+        env = {_CHILD_POLICY_ENV: self._payload(), self._BYTES: _PERMISSIVE_PAYLOAD.encode()}
+        with pytest.raises(tethered.SubprocessBlocked, match=r"more than one spelling"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    # ── constructing an environment ────────────────────────────────────
+
+    def test_windows_constructed_env_has_exactly_one_canonical_key(self, windows_names):
+        env_arg = {
+            "PATH": "C:\\Windows",
+            _CHILD_POLICY_ENV: "stale",
+            self._LOWER: _PERMISSIVE_PAYLOAD,
+            "_Tethered_Child_Policy": _PERMISSIVE_PAYLOAD,
+        }
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", _popen_args(env_arg), (self._SCOPE,), _launch_cfg()
+        )
+        assert [k for k in new_env if k.upper() == _CHILD_POLICY_ENV] == [_CHILD_POLICY_ENV]
+        assert json.loads(new_env[_CHILD_POLICY_ENV])["scopes"][0]["label"] == "one-key"
+        assert new_env["PATH"] == "C:\\Windows"
+        assert len(env_arg) == 4  # the caller's mapping is untouched
+
+    def test_posix_constructed_env_has_exactly_one_canonical_key(self, posix_names):
+        env_arg = {"PATH": "/usr/bin", self._BYTES: _PERMISSIVE_PAYLOAD.encode(), self._LOWER: "x"}
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", _popen_args(env_arg), (self._SCOPE,), _launch_cfg()
+        )
+        assert self._BYTES not in new_env
+        assert json.loads(new_env[_CHILD_POLICY_ENV])["scopes"][0]["label"] == "one-key"
+        # A different case is a different variable on POSIX and is preserved.
+        assert new_env[self._LOWER] == "x"
+        assert self._BYTES in env_arg
+
+    def test_windows_putenv_through_a_case_variant_sets_the_dirty_flag(self, windows_names):
+        tethered.activate(allow=["*.example.com"])
+        _core._handle_env_change("os.putenv", (self._LOWER, _PERMISSIVE_PAYLOAD))
+        assert _core._env_dirty is True
+
+    # ── real children ──────────────────────────────────────────────────
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="case-insensitive names are Windows-only")
+    def test_windows_case_variant_does_not_win_in_the_child(self):
+        """The report's observation: tethered injected its payload, the duplicate still won."""
+        tethered.activate(allow=["*.allowed.com"])
+        env = dict(os.environ)
+        env[self._LOWER] = _PERMISSIVE_PAYLOAD
+        with tethered.scope(allow=["api.allowed.com"]):
+            state = _launch_probe(env=env)
+        assert state["allow"] == ["*.allowed.com"]
+        assert state["scopes"] == 1
+        assert env[self._LOWER] == _PERMISSIVE_PAYLOAD
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="bytes environment names are POSIX-only")
+    def test_posix_bytes_spelling_does_not_win_in_the_child(self):
+        tethered.activate(allow=["*.allowed.com"])
+        env = {**_minimal_child_env(), self._BYTES: _PERMISSIVE_PAYLOAD.encode()}
+        with tethered.scope(allow=["api.allowed.com"]):
+            state = _launch_probe(env=env)
+        assert state["allow"] == ["*.allowed.com"]
+        assert state["scopes"] == 1
+        assert self._BYTES in env
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_locked_parent_refuses_a_duplicate_spelling(self):
+        """End to end, with whichever second spelling this platform has."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        env: dict = dict(os.environ)
+        if sys.platform == "win32":
+            env[self._LOWER] = _PERMISSIVE_PAYLOAD
+        else:
+            env[self._BYTES] = _PERMISSIVE_PAYLOAD.encode()
+        with pytest.raises(tethered.SubprocessBlocked, match=r"more than one spelling"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"], env=env, capture_output=True, timeout=30
+            )
