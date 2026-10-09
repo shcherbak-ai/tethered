@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from tethered._core import (
     _build_child_policy_payload,
     _clear_policy_from_env,
     _Config,
+    _serialize_allow_list,
 )
 from tethered._policy import AllowPolicy
 
@@ -882,3 +884,275 @@ class TestChildStartupFailsClosed:
         assert r.returncode == 0, r.stderr
         assert "USER CODE RAN active=False" in r.stdout
         assert "malformed _TETHERED_CHILD_POLICY" in r.stderr
+
+
+class _FakeInterpreters:
+    """Stands in for ``_interpreters`` / ``_xxsubinterpreters``."""
+
+    def __init__(self, current: object, main: object) -> None:
+        self._current = current
+        self._main = main
+
+    def get_current(self) -> object:
+        if isinstance(self._current, Exception):
+            raise self._current
+        return self._current
+
+    def get_main(self) -> object:
+        return self._main
+
+
+class _InterpreterID:
+    """Like the ``InterpreterID`` objects of Python 3.10 - 3.12: read through ``int()``."""
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def __int__(self) -> int:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"InterpreterID({self._value})"
+
+
+class TestInSubinterpreter:
+    """``_in_subinterpreter()``, the question a locked payload makes the bootstrap ask.
+
+    The answer inside a real subinterpreter is tested in
+    ``test_subinterpreters.py``; here the stdlib modules are stood in for, so
+    that every form of their answer is covered on every Python version.
+    """
+
+    def test_the_main_interpreter_is_not_one(self):
+        assert _autoactivate._in_subinterpreter() is False
+
+    @pytest.mark.parametrize(
+        ("current", "main", "expected"),
+        [
+            ((0, 1), (0, 1), False),  # Python 3.13+: (id, whence)
+            ((3, 5), (0, 1), True),
+            ((3, 1), (0, 1), True),
+            ((0, 5), (0, 1), False),  # the ID decides, not the whence
+            (0, 0, False),
+            (7, 0, True),
+            (_InterpreterID(0), _InterpreterID(0), False),  # Python 3.10 - 3.12
+            (_InterpreterID(7), _InterpreterID(0), True),
+        ],
+        ids=repr,
+    )
+    def test_compares_the_two_ids(self, monkeypatch, current, main, expected):
+        monkeypatch.setitem(sys.modules, "_interpreters", _FakeInterpreters(current, main))
+        assert _autoactivate._in_subinterpreter() is expected
+
+    def test_falls_back_to_the_module_of_older_pythons(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "_interpreters", None)  # import raises ImportError
+        fake = _FakeInterpreters(_InterpreterID(4), _InterpreterID(0))
+        monkeypatch.setitem(sys.modules, "_xxsubinterpreters", fake)
+        assert _autoactivate._in_subinterpreter() is True
+
+    def test_without_either_module_it_counts_as_the_main_interpreter(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "_interpreters", None)
+        monkeypatch.setitem(sys.modules, "_xxsubinterpreters", None)
+        assert _autoactivate._in_subinterpreter() is False
+
+    @pytest.mark.parametrize(
+        "current", [RuntimeError("no interpreter state"), "not an id", None, ()], ids=repr
+    )
+    def test_an_answer_that_cannot_be_read_counts_as_the_main_interpreter(
+        self, monkeypatch, current
+    ):
+        monkeypatch.setitem(sys.modules, "_interpreters", _FakeInterpreters(current, 0))
+        assert _autoactivate._in_subinterpreter() is False
+
+
+class TestLockedPayloadInASubinterpreter:
+    """A lock exists once per process, so a subinterpreter enforces the policy unlocked.
+
+    Run in the main interpreter with only the question "is this a
+    subinterpreter?" answered differently: coverage does not see code that
+    runs inside another interpreter.  ``test_subinterpreters.py`` runs the
+    same paths for real.
+    """
+
+    @pytest.fixture
+    def as_subinterpreter(self, monkeypatch):
+        monkeypatch.setattr(_autoactivate, "_in_subinterpreter", lambda: True)
+
+    def _run(self, monkeypatch, scopes: list | None = None, **overrides: object) -> str:
+        raw = _payload(scopes=scopes, **{"locked": True, **overrides})
+        monkeypatch.setenv(_CHILD_POLICY_ENV, raw)
+        _autoactivate._autoactivate_from_env()
+        return raw
+
+    def test_the_policy_is_established_unlocked(self, as_subinterpreter, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO, logger="tethered"):
+            raw = self._run(
+                monkeypatch,
+                allow=["*.example.com", "10.0.0.0/8:5432"],
+                allow_localhost=False,
+                fail_closed=True,
+                external_subprocess_policy="block",
+            )
+        cfg = _core._config
+        assert cfg is not None
+        assert cfg.locked is False
+        assert cfg.fail_closed is True
+        assert cfg.log_only is False
+        assert cfg.external_subprocess_policy == "block"
+        assert cfg.policy._allow_localhost is False
+        assert cfg.policy.is_allowed("api.example.com", 443)
+        assert cfg.policy.is_allowed("10.1.2.3", 5432)
+        assert not cfg.policy.is_allowed("evil.test", 443)
+        assert json.loads(cfg._serialized_payload)["global"] == {
+            **json.loads(raw)["global"],
+            "locked": False,
+        }
+        if _core._c_guardian is not None:
+            assert _core._c_guardian.is_active() is False
+        # Not published: the process-wide variable still carries the locked payload.
+        assert os.environ[_CHILD_POLICY_ENV] == raw
+        # Reported once, at INFO — a pool creates many interpreters.
+        assert [r.levelno for r in caplog.records if "subinterpreter" in r.message] == [
+            logging.INFO
+        ]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_allow_list_is_enforced(self, as_subinterpreter, monkeypatch):
+        self._run(monkeypatch, allow=["*.example.com"])
+        with pytest.raises(tethered.EgressBlocked, match="is not in the allow list"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        sys.audit("socket.connect", None, ("127.0.0.1", 443))
+        tethered.deactivate()  # unlocked: no token involved
+        assert _core._config is None
+
+    def test_the_config_is_the_one_activate_would_build(self, as_subinterpreter, monkeypatch):
+        """Guards against drift: apart from ``locked``, what ``activate()`` builds."""
+        fields = {
+            "allow": ["*.example.com", "10.0.0.0/8:5432", "db.internal"],
+            "allow_localhost": False,
+            "log_only": True,
+            "fail_closed": True,
+            "external_subprocess_policy": "block",
+        }
+        tethered.activate(**fields)
+        expected = _core._config
+        tethered.deactivate()
+
+        self._run(monkeypatch, **fields)
+        actual = _core._config
+        assert actual is not None
+        assert actual is not expected
+        for field in dataclasses.fields(_Config):
+            if field.name != "policy":
+                assert getattr(actual, field.name) == getattr(expected, field.name), field.name
+        assert _serialize_allow_list(actual.policy) == _serialize_allow_list(expected.policy)
+        assert actual.policy._allow_localhost == expected.policy._allow_localhost
+
+    def test_optional_fields_default_as_in_activate(self, as_subinterpreter, monkeypatch):
+        payload = {"global": {"allow": ["*.example.com"], "locked": True}, "scopes": []}
+        monkeypatch.setenv(_CHILD_POLICY_ENV, json.dumps(payload))
+        _autoactivate._autoactivate_from_env()
+        cfg = _core._config
+        assert cfg is not None
+        assert (cfg.locked, cfg.log_only, cfg.fail_closed) == (False, False, False)
+        assert cfg.external_subprocess_policy == "warn"
+        assert cfg.policy._allow_localhost is True
+
+    def test_the_c_extension_is_not_needed(self, as_subinterpreter, monkeypatch):
+        """An interpreter with its own GIL cannot load it; that used to stop its startup."""
+        monkeypatch.setattr(_core, "_c_guardian", None)
+        self._run(monkeypatch, allow=["*.example.com"])
+        assert _core._config is not None
+        assert _core._config.locked is False
+
+    def test_inherited_scopes_are_applied_too(self, as_subinterpreter, monkeypatch):
+        self._run(
+            monkeypatch,
+            scopes=[{"allow": ["api.example.com"], "label": "inherited"}],
+            allow=["*.example.com"],
+        )
+        assert _core._config is not None
+        assert [s.label for s in _core._scopes.get()] == ["inherited"]
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"log_only": 0}, r"global\.log_only must be bool"),
+            ({"locked": 1}, r"global\.locked must be bool"),
+            ({"from_a_newer_version": True}, r"unknown field 'from_a_newer_version'"),
+            ({"allow": ["://not-a-rule"]}, r"auto-activation failed: ValueError"),
+            ({"allow": "*.example.com"}, r"global\.allow must be list"),
+            (
+                {"external_subprocess_policy": "sometimes"},
+                r"external_subprocess_policy: unknown value 'sometimes'",
+            ),
+        ],
+        ids=["wrong-type", "mistyped-flag", "unknown-field", "bad-rule", "allow-type", "bad-value"],
+    )
+    def test_every_other_strict_failure_still_stops_startup(
+        self, as_subinterpreter, monkeypatch, overrides, expected
+    ):
+        with pytest.raises(SystemExit, match=expected):
+            self._run(monkeypatch, **overrides)
+        assert _core._config is None
+
+    def test_a_malformed_scope_still_stops_startup(self, as_subinterpreter, monkeypatch):
+        with pytest.raises(SystemExit, match=r"scopes\[0\]\.allow\[0\] must be str"):
+            self._run(monkeypatch, scopes=[{"allow": [5]}])
+
+    def test_a_fail_closed_policy_that_cannot_be_established_still_stops_startup(
+        self, as_subinterpreter, monkeypatch
+    ):
+        with pytest.raises(SystemExit, match=r"auto-activation failed: ValueError"):
+            self._run(monkeypatch, locked=False, fail_closed=True, allow=["://not-a-rule"])
+        assert _core._config is None
+
+    def test_a_hook_that_cannot_be_installed_stops_startup(self, as_subinterpreter, monkeypatch):
+        def refuse() -> None:
+            raise RuntimeError("no audit hook")
+
+        monkeypatch.setattr(_core, "_install_hook", refuse)
+        with pytest.raises(SystemExit, match=r"auto-activation failed: RuntimeError: no audit"):
+            self._run(monkeypatch, allow=["*.example.com"])
+        assert _core._config is None
+
+    def test_only_a_locked_payload_asks_which_interpreter_this_is(self, monkeypatch):
+        """The question costs a module import; no other startup pays for it."""
+        asked: list[bool] = []
+
+        def in_subinterpreter() -> bool:
+            asked.append(True)
+            return False
+
+        monkeypatch.setattr(_autoactivate, "_in_subinterpreter", in_subinterpreter)
+        for raw in (
+            _payload(allow=["*.example.com"]),
+            _payload(allow=["*.example.com"], fail_closed=True),
+            _payload(allow=["*.example.com"], log_only=0),  # invalid, not strict
+            json.dumps({"global": None, "scopes": [{"allow": ["api.example.com"]}]}),
+        ):
+            monkeypatch.setenv(_CHILD_POLICY_ENV, raw)
+            _autoactivate._autoactivate_from_env()
+            _core._config = None
+        assert asked == []
+
+        # A locked payload that fails validation is refused without asking.
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(locked=True, log_only=0))
+        with pytest.raises(SystemExit):
+            _autoactivate._autoactivate_from_env()
+        assert asked == []
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_a_valid_locked_payload_asks_once_and_locks_in_the_main_interpreter(self, monkeypatch):
+        asked: list[bool] = []
+
+        def in_subinterpreter() -> bool:
+            asked.append(True)
+            return False
+
+        monkeypatch.setattr(_autoactivate, "_in_subinterpreter", in_subinterpreter)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"], locked=True))
+        _autoactivate._autoactivate_from_env()
+        assert asked == [True]
+        assert _core._config.locked is True
+        assert _core._c_guardian.is_active() is True

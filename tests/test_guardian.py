@@ -1736,26 +1736,42 @@ class TestGuardianEventCoverage:
     @pytest.mark.skipif(
         sys.version_info < (3, 14), reason="concurrent.interpreters arrived in Python 3.14"
     )
-    def test_events_from_other_interpreters_are_left_alone(self, bare_guardian, capfd):
+    def test_events_from_other_interpreters_are_refused_without_verifying(
+        self, bare_guardian, capfd
+    ):
         """A C audit hook is process-wide, but the guardian's objects belong to one interpreter.
 
-        Another interpreter has its own GIL and its own tethered instance
-        (via ``tethered.pth``).  The guardian must not verify — let alone
-        raise this interpreter's exception classes — on its behalf.
+        Another interpreter has its own GIL.  The guardian must not verify on
+        its behalf, let alone raise this interpreter's exception classes
+        there.  While a policy is locked it refuses that interpreter the
+        guarded operations outright — tampered with or not, with an
+        exception made there and without a tamper alert — and leaves its
+        other events alone.  ``test_subinterpreters.py`` covers this in full.
         """
         interpreters = pytest.importorskip("concurrent.interpreters")
         other = interpreters.create()
+        probe = (
+            "import sys\n"
+            "def refused(event, *args):\n"
+            "    try:\n"
+            "        sys.audit(event, *args)\n"
+            "    except RuntimeError as exc:\n"
+            "        return type(exc) is RuntimeError and 'another interpreter' in str(exc)\n"
+            "    return False\n"
+            "assert refused('socket.connect', None, ('127.0.0.1', 9))\n"
+            "assert refused('subprocess.Popen', 'prog', ['prog'], None, None)\n"
+            "assert refused('open', 'site-packages/tethered.pth', 'w', 0)\n"
+            "assert refused('os.putenv', '_TETHERED_CHILD_POLICY', 'x')\n"
+            "sys.audit('socket.tethered_test_probe')\n"
+            "sys.audit('open', 'site-packages/tethered.pth', 'r', 0)\n"
+        )
         try:
+            other.exec(probe)
+            assert "TAMPER DETECTED" not in capfd.readouterr().err
             bare_guardian.tamper()
             with pytest.raises(tethered.EgressBlocked):
                 sys.audit("socket.tethered_test_probe")
-            other.exec(
-                "import sys\n"
-                "sys.audit('socket.tethered_test_probe')\n"
-                "sys.audit('subprocess.Popen', 'prog', ['prog'], None, None)\n"
-                "sys.audit('open', 'site-packages/tethered.pth', 'w', 0)\n"
-                "sys.audit('os.putenv', '_TETHERED_CHILD_POLICY', 'x')\n"
-            )
+            other.exec(probe)  # no different: nothing is verified for it
         finally:
             other.close()
         # ... while this interpreter's events are still refused.

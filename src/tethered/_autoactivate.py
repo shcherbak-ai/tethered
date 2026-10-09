@@ -18,6 +18,13 @@ fail open: if it cannot be established here, interpreter startup is
 terminated with ``SystemExit`` (``site.py`` swallows ordinary exceptions
 raised by a ``.pth`` line, so anything else would let the workload run
 unprotected).
+
+A subinterpreter runs this module too, with the environment of the process
+it lives in.  A lock exists once per process — the C guardian holds it for
+the interpreter that took it and refuses every other interpreter the
+guarded operations — so a subinterpreter that inherits a ``locked`` policy
+enforces the same policy unlocked instead of refusing to start (see
+:func:`_establish_unlocked`).
 """
 
 from __future__ import annotations
@@ -109,6 +116,10 @@ def _autoactivate_from_env() -> None:
     Otherwise the problem is logged and the child continues without that
     part.  A value that is not a JSON object at all cannot ask for anything
     and is logged and ignored.
+
+    In a subinterpreter a ``locked`` global is established unlocked, since
+    the lock exists once per process (:func:`_establish_unlocked`); every
+    other strict failure terminates its startup as well.
     """
     raw = os.environ.get("_TETHERED_CHILD_POLICY")
     if raw is None:
@@ -159,13 +170,19 @@ def _apply_inherited_policy(payload: dict, strict: bool) -> None:
         problem = _schema_problem(global_payload, _GLOBAL_FIELDS, "global", strict)
         if problem is None and "allow" not in global_payload:
             problem = "global is missing 'allow'"
-        if problem is None and global_payload.get("locked") and _core._c_guardian is None:
+        # Which interpreter this is matters for a locked policy only, so
+        # nothing else pays for the question.
+        locked = problem is None and bool(global_payload.get("locked"))
+        unlocked_here = locked and _in_subinterpreter()
+        if locked and not unlocked_here and _core._c_guardian is None:
             problem = (
                 "the parent requested locked mode but the C guardian extension "
                 "is not available in this child"
             )
         if problem is not None:
             _fail("auto-activation failed", problem, strict)
+        elif unlocked_here:
+            _establish_unlocked(global_payload)
         else:
             activate_kwargs = {k: global_payload[k] for k in _GLOBAL_FIELDS if k in global_payload}
             if activate_kwargs.get("locked"):
@@ -191,6 +208,93 @@ def _apply_inherited_policy(payload: dict, strict: bool) -> None:
         )
     elif scopes_payload:
         _inherit_scopes(scopes_payload, strict=strict)
+
+
+def _in_subinterpreter() -> bool:
+    """Return True if this is not the main interpreter of the process.
+
+    Python offers no public way to ask before 3.14, so the private stdlib
+    modules are used: ``_interpreters`` (3.13+) or ``_xxsubinterpreters``
+    (3.10 to 3.12).  Their ``get_current()`` and ``get_main()`` return an
+    interpreter ID, from 3.13 as an ``(id, whence)`` pair.  A build without
+    either module, or any failure, counts as the main interpreter: a locked
+    policy is then established or startup refused, as in any child process.
+    """
+    try:
+        # (Imported by name: these modules have no type stubs for every
+        # supported version.)
+        try:
+            interpreters = __import__("_interpreters")
+        except ImportError:
+            interpreters = __import__("_xxsubinterpreters")
+        current, main = (
+            int(found[0] if isinstance(found, tuple) else found)
+            for found in (interpreters.get_current(), interpreters.get_main())
+        )
+    except Exception:
+        return False
+    return current != main
+
+
+def _establish_unlocked(global_payload: dict) -> None:
+    """Enforce an inherited ``locked`` policy in this subinterpreter, unlocked.
+
+    A lock exists once per process.  While another interpreter holds it, the
+    C guardian refuses this one every connection, lookup and process launch,
+    whatever the allow list says, so the policy installed here decides
+    nothing; it is what still enforces the allow list from Python if the
+    lock is released, or was never taken, while this interpreter lives.
+    Every field but ``locked`` is the inherited one.
+
+    The config is bound directly, not through :func:`tethered.activate`.
+    That call publishes the policy to ``_TETHERED_CHILD_POLICY``, which is
+    one variable for the whole process: an unlocked payload written here
+    would be what every later child process inherits (the guardian refuses
+    that write from this interpreter).  And where the C extension can be
+    loaded, ``activate()`` refuses to act at all while a policy is locked.
+
+    ``global_payload`` has passed the strict schema check.  What
+    ``activate()`` validates beyond types is validated here; an exception
+    terminates startup like any other strict failure.
+    """
+    import tethered._core as _core
+    from tethered._policy import AllowPolicy
+
+    external = global_payload.get("external_subprocess_policy", "warn")
+    if external not in _core._EXTERNAL_SUBPROCESS_POLICIES:
+        msg = f"external_subprocess_policy: unknown value {external!r}"
+        raise ValueError(msg)
+    log_only = global_payload.get("log_only", False)
+    fail_closed = global_payload.get("fail_closed", False)
+    policy = AllowPolicy(
+        global_payload["allow"], allow_localhost=global_payload.get("allow_localhost", True)
+    )
+    global_dict = _core._build_global_payload_dict(
+        policy,
+        log_only=log_only,
+        fail_closed=fail_closed,
+        external_subprocess_policy=external,
+        locked=False,
+    )
+    cfg = _core._Config(
+        policy=policy,
+        log_only=log_only,
+        fail_closed=fail_closed,
+        locked=False,
+        external_subprocess_policy=external,
+        _serialized_payload=_core._build_env_payload(global_dict, ()),
+        _global_payload_dict=global_dict,
+        _pth_path=_core._compute_pth_path(),
+        _local_hostname=_core._capture_local_hostname(),
+    )
+    with _core._lifecycle_lock:
+        _core._install_hook()
+        _core._config = cfg
+    logger.info(
+        "tethered: this subinterpreter inherited a locked policy and enforces it "
+        "unlocked — a lock exists once per process; while another interpreter "
+        "holds it, this one gets no network access and no process launches"
+    )
 
 
 def _inherit_scopes(scopes_payload: list, *, strict: bool = False) -> None:

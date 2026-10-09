@@ -28,6 +28,15 @@
  * changed by plain pointer swaps with no such call in between, and
  * references are released only after the swap is complete.
  *
+ * Other interpreters: the audit hook is process-wide, the state above is
+ * not — it consists of objects of the interpreter that locked the policy.
+ * An interpreter with its own GIL (3.12+) runs the hook concurrently with
+ * that one, so for an event raised anywhere else the hook reads two atomics
+ * (guardian_active, guardian_interp) and nothing more of the state.  While
+ * a policy is locked, such an interpreter is refused every operation
+ * tethered guards: it cannot be verified and holds no policy the guardian
+ * can vouch for (see guardian_interp and other_interpreter_event).
+ *
  * Also owns trusted reentrancy state for DNS resolution.  The Python-side
  * _in_hook ContextVar is a convenience flag; in locked mode, the C guardian
  * verifies its value against its own thread-local counter.  A mismatch
@@ -40,13 +49,16 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <fcntl.h>
 #include <string.h>
 
 #ifdef _WIN32
 #  include <io.h>
 #  define write _write
+#  define OPEN_WRITE_BITS (_O_WRONLY | _O_RDWR | _O_TRUNC | _O_CREAT)
 #else
 #  include <unistd.h>
+#  define OPEN_WRITE_BITS (O_WRONLY | O_RDWR | O_TRUNC | O_CREAT)
 #endif
 
 /* ── Thread-local storage ───────────────────────────────────────── */
@@ -84,22 +96,39 @@ typedef struct {
 
 /* ── Atomics compat ──────────────────────────────────────────────── */
 
+/*
+ * ATOMIC_PTR is for a pointer that threads of other interpreters read
+ * without holding this interpreter's GIL (see guardian_interp).  It is
+ * always stored before an ATOMIC_STORE and loaded after an ATOMIC_LOAD of
+ * guardian_active, which is what orders the two; the pointer access itself
+ * only has to be free of tearing.  MSVC without C11 atomics gets that from
+ * an aligned volatile pointer.
+ */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
     && !defined(__STDC_NO_ATOMICS__)
 #  include <stdatomic.h>
 #  define ATOMIC_INT     _Atomic int
 #  define ATOMIC_STORE(v, x) atomic_store(&(v), (x))
 #  define ATOMIC_LOAD(v)     atomic_load(&(v))
+#  define ATOMIC_PTR(T)  _Atomic(T)
+#  define ATOMIC_PTR_STORE(v, x) atomic_store(&(v), (x))
+#  define ATOMIC_PTR_LOAD(v)     atomic_load(&(v))
 #elif defined(_MSC_VER)
 #  include <intrin.h>
 #  define ATOMIC_INT     volatile int
 #  define ATOMIC_STORE(v, x) _InterlockedExchange((volatile long *)&(v), (x))
 #  define ATOMIC_LOAD(v)     _InterlockedOr((volatile long *)&(v), 0)
+#  define ATOMIC_PTR(T)  T volatile
+#  define ATOMIC_PTR_STORE(v, x) ((v) = (x))
+#  define ATOMIC_PTR_LOAD(v)     (v)
 #else
    /* GCC/Clang built-ins */
 #  define ATOMIC_INT     volatile int
 #  define ATOMIC_STORE(v, x) __atomic_store_n(&(v), (x), __ATOMIC_SEQ_CST)
 #  define ATOMIC_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_SEQ_CST)
+#  define ATOMIC_PTR(T)  T volatile
+#  define ATOMIC_PTR_STORE(v, x) __atomic_store_n(&(v), (x), __ATOMIC_SEQ_CST)
+#  define ATOMIC_PTR_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_SEQ_CST)
 #endif
 
 /* ── C-level state ───────────────────────────────────────────────── */
@@ -152,19 +181,41 @@ static const char      *expected_caller_names[EXPECTED_CALLER_COUNT] = {
 static THREAD_LOCAL int resolving_depth = 0;
 
 /*
- * The interpreter that activated the guardian.
+ * The interpreter that locked the policy (the "owning" interpreter).
  *
  * A C audit hook is process-wide: it also runs for events raised in other
- * interpreters.  Those have their own modules, since 3.12 possibly their
- * own GIL, and — through tethered.pth — their own tethered instance.  All
- * of the guardian's state consists of objects of one interpreter, which
- * must not be read, called or raised from another, so the hook leaves
- * other interpreters' events alone.
+ * interpreters.  Those have their own modules and, since 3.12, possibly
+ * their own GIL, so their threads can be in the hook while the owner's are.
+ * All of the guardian's other state — snapshot, config, token, exception
+ * classes — consists of objects of the owning interpreter, which must not
+ * be read, called, raised or reference-counted from anywhere else.
  *
- * Written before guardian_active is set, and read by the hook only after
- * it has seen guardian_active set.
+ * The lock is process-wide all the same.  The guardian cannot verify
+ * another interpreter (the snapshot says nothing about its modules, and
+ * whatever Python hook it has is its own to remove), and it cannot hand it
+ * the policy.  So while a policy is locked, every other interpreter is
+ * refused the operations tethered guards — see other_interpreter_event(),
+ * which works from guardian_active, this pointer, the event's own arguments
+ * and objects of the interpreter the event was raised in, and nothing else.
+ *
+ * "Other" is relative to whoever took the lock.  This module can only be
+ * loaded by interpreters that share the main GIL; if such a subinterpreter
+ * locks a policy, the main interpreter is the one that is refused.
+ *
+ * Written before guardian_active is set, read by the hook only after it
+ * has seen guardian_active set, and never changed while it is set: the
+ * module's functions refuse a caller from another interpreter (see
+ * locked_elsewhere).  Compared, never dereferenced.
  */
-static PyInterpreterState *guardian_interp = NULL;
+static ATOMIC_PTR(PyInterpreterState *) guardian_interp = NULL;
+
+/* Is a policy locked by an interpreter other than the calling one? */
+static int
+locked_elsewhere(void)
+{
+    return ATOMIC_LOAD(guardian_active) &&
+           PyInterpreterState_Get() != ATOMIC_PTR_LOAD(guardian_interp);
+}
 
 /*
  * The live snapshot.  A static array that is never freed: a verification
@@ -539,11 +590,16 @@ unicode_readable(PyObject *str)
  * what is tested here, not merely the final component.
  *
  * A file descriptor (int) cannot be matched and is skipped.  Any other
- * object — a path-like passed to io.FileIO, say — cannot be inspected
- * without running its __fspath__, so it is treated as a match.
+ * object — os.remove(pathlib.Path(...)) passes the Path itself — cannot be
+ * inspected without running its __fspath__.  With `ask` unset it is
+ * treated as a match, which costs the owning interpreter one verification
+ * and runs no code before it.  With `ask` set the object is asked, as the
+ * Python guard asks it (os.fsdecode): that is for another interpreter's
+ * events, where a match is a refusal and presuming one would refuse every
+ * pathlib operation.  An object that does not answer is a match.
  */
 static int
-path_mentions_pth(PyObject *path)
+path_mentions_pth(PyObject *path, int ask)
 {
     if (PyUnicode_Check(path)) {
         if (!unicode_readable(path))
@@ -562,20 +618,77 @@ path_mentions_pth(PyObject *path)
     }
     if (PyLong_Check(path) || path == Py_None)
         return 0;
+    if (ask) {
+        PyObject *fspath = PyOS_FSPath(path); /* str or bytes, or an error */
+        if (fspath == NULL) {
+            PyErr_Clear();
+            return 1;
+        }
+        int mentions = path_mentions_pth(fspath, 0);
+        Py_DECREF(fspath);
+        return mentions;
+    }
     return 1;
 }
 
 static int
-fs_event_concerns_pth(int kind, PyObject *args)
+fs_event_concerns_pth(int kind, PyObject *args, int ask)
 {
     if (!PyTuple_Check(args))
         return 1; /* unexpected shape — verify */
     Py_ssize_t paths = (kind == EVENT_FS_PAIR) ? 2 : 1;
     for (Py_ssize_t i = 0; i < paths && i < PyTuple_GET_SIZE(args); i++) {
-        if (path_mentions_pth(PyTuple_GET_ITEM(args, i)))
+        if (path_mentions_pth(PyTuple_GET_ITEM(args, i), ask))
             return 1;
     }
     return 0;
+}
+
+/*
+ * Can this `open` event — args (path, mode, flags) — write to, truncate or
+ * create the file?  The counterpart of _core._is_open_for_write(), needed
+ * where the guardian decides alone (another interpreter's events): every
+ * interpreter reads tethered.pth when it starts, and that must not be
+ * refused.  A mode or flags value CPython would not report is not guessed
+ * at: it counts as writing.
+ */
+static int
+open_event_may_write(PyObject *args)
+{
+    if (!PyTuple_Check(args))
+        return 1;
+    Py_ssize_t n = PyTuple_GET_SIZE(args);
+    PyObject *mode = (n >= 2) ? PyTuple_GET_ITEM(args, 1) : Py_None;
+    PyObject *flags = (n >= 3) ? PyTuple_GET_ITEM(args, 2) : Py_None;
+
+    if (PyUnicode_Check(mode)) {
+        if (!unicode_readable(mode))
+            return 1;
+        int kind = PyUnicode_KIND(mode);
+        const void *text = PyUnicode_DATA(mode);
+        Py_ssize_t len = PyUnicode_GET_LENGTH(mode);
+        for (Py_ssize_t i = 0; i < len; i++) {
+            Py_UCS4 ch = PyUnicode_READ(kind, text, i);
+            if (ch == 'w' || ch == 'a' || ch == 'x' || ch == '+')
+                return 1;
+        }
+    }
+    else if (mode != Py_None) {
+        return 1;
+    }
+
+    if (PyLong_Check(flags)) {
+        int overflow = 0;
+        long bits = PyLong_AsLongAndOverflow(flags, &overflow);
+        if (overflow != 0)
+            return 1;
+        if (bits == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return 1;
+        }
+        return (bits & OPEN_WRITE_BITS) != 0;
+    }
+    return flags != Py_None;
 }
 
 /*
@@ -630,25 +743,213 @@ is_connect_event(const char *event)
             strcmp(event, "socket.sendmsg") == 0);
 }
 
+/* The lookups the Python hook enforces a policy on (socket.getaddrinfo and
+ * _core._DNS_EVENTS). */
+static int
+is_lookup_event(const char *event)
+{
+    return (strcmp(event, "socket.getaddrinfo") == 0 ||
+            strcmp(event, "socket.gethostbyname") == 0 ||
+            strcmp(event, "socket.gethostbyaddr") == 0);
+}
+
+/* The object that names a socket event's destination — the host of a
+ * connect-type event's address, the first argument of any other event — or
+ * NULL.  Borrowed. */
+static PyObject *
+socket_event_subject(const char *event, PyObject *args)
+{
+    if (!PyTuple_Check(args) || PyTuple_GET_SIZE(args) < 1)
+        return NULL;
+    if (!is_connect_event(event))
+        return PyTuple_GET_ITEM(args, 0);
+    /* args: (socket, address) — name the address's host */
+    if (PyTuple_GET_SIZE(args) >= 2) {
+        PyObject *addr = PyTuple_GET_ITEM(args, 1);
+        if (PyTuple_Check(addr) && PyTuple_GET_SIZE(addr) >= 1)
+            return PyTuple_GET_ITEM(addr, 0);
+    }
+    return NULL;
+}
+
 /* A socket event failed a check: refuse it, naming the host if we can. */
 static int
 refuse_socket_event(const char *event, PyObject *args, const char *fallback)
 {
-    PyObject *subject = NULL;
+    return raise_blocked(utf8_or(socket_event_subject(event, args), fallback));
+}
 
-    if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) >= 1) {
-        subject = PyTuple_GET_ITEM(args, 0);
-        if (is_connect_event(event)) {
-            /* args: (socket, address) — name the address's host */
-            subject = NULL;
-            if (PyTuple_GET_SIZE(args) >= 2) {
-                PyObject *addr = PyTuple_GET_ITEM(args, 1);
-                if (PyTuple_Check(addr) && PyTuple_GET_SIZE(addr) >= 1)
-                    subject = PyTuple_GET_ITEM(addr, 0);
-            }
+/* ── Events raised in other interpreters ─────────────────────────── */
+
+/*
+ * Everything in this section runs in an interpreter that does not own the
+ * lock, possibly under another GIL and at the same time as the owner.  It
+ * touches none of the guardian's objects: only the event, its arguments and
+ * objects of the interpreter it is running in.  No tamper alert is written
+ * — nothing has been tampered with.
+ */
+
+#define ELSEWHERE \
+    "a locked tethered policy is active in another interpreter of this process"
+
+/* Return a new reference to attribute `name` of tethered._core if that
+ * module is already imported in this interpreter, else NULL.  Never imports
+ * it and never leaves an exception set. */
+static PyObject *
+loaded_core_attr(const char *name)
+{
+    PyObject *module_name = PyUnicode_FromString("tethered._core");
+    if (module_name == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *module = PyImport_GetModule(module_name);
+    Py_DECREF(module_name);
+    if (module == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *attr = PyObject_GetAttrString(module, name);
+    Py_DECREF(module);
+    if (attr == NULL)
+        PyErr_Clear();
+    return attr;
+}
+
+/*
+ * Raise the refusal in the interpreter the event was raised in and return
+ * -1 — always with an exception set.
+ *
+ * The exception is this interpreter's tethered._core.<cls_name>, built as
+ * cls(*ctor_args) like the guardian's other refusals and given `message`,
+ * if that module is already imported here.  Otherwise, or when anything on
+ * that route fails, it is a RuntimeError with the same message: both
+ * tethered classes derive from RuntimeError, so one `except` clause covers
+ * either.  Consumes the references to ctor_args and message; either may be
+ * NULL (a failed allocation).
+ */
+static int
+raise_in_this_interpreter(const char *cls_name, PyObject *ctor_args,
+                          PyObject *message)
+{
+    PyObject *exc = NULL;
+
+    if (ctor_args != NULL && message != NULL) {
+        PyObject *cls = loaded_core_attr(cls_name);
+        if (cls != NULL) {
+            exc = PyObject_CallObject(cls, ctor_args);
+            Py_DECREF(cls);
+        }
+        if (exc != NULL) {
+            /* The class words its own message; replace it with ours. */
+            PyObject *exc_args = PyTuple_Pack(1, message);
+            if (exc_args == NULL || !PyExceptionInstance_Check(exc) ||
+                PyObject_SetAttrString(exc, "args", exc_args) < 0)
+                Py_CLEAR(exc);
+            Py_XDECREF(exc_args);
         }
     }
-    return raise_blocked(utf8_or(subject, fallback));
+
+    PyErr_Clear(); /* whatever went wrong above: the fallback covers it */
+    if (exc != NULL)
+        PyErr_SetObject((PyObject *)Py_TYPE(exc), exc);
+    else if (message != NULL)
+        PyErr_SetObject(PyExc_RuntimeError, message);
+    else
+        PyErr_SetString(PyExc_RuntimeError,
+                        "Blocked by tethered: " ELSEWHERE);
+    Py_XDECREF(exc);
+    Py_XDECREF(ctor_args);
+    Py_XDECREF(message);
+    return -1;
+}
+
+/* Refuse a guarded event raised in an interpreter that does not own the
+ * lock: EgressBlocked(host, None) for a socket event, SubprocessBlocked(
+ * event, description) for the others — or RuntimeError, see above. */
+static int
+refuse_other_interpreter(const char *event, int kind, PyObject *args)
+{
+    const char *subject = event;
+    const char *consequence;
+
+    switch (kind) {
+    case EVENT_SOCKET:
+        subject = utf8_or(socket_event_subject(event, args), "unknown");
+        consequence = "gets no network access";
+        break;
+    case EVENT_LAUNCH:
+        consequence = "cannot launch processes";
+        break;
+    case EVENT_ENV:
+        consequence = "cannot change the _TETHERED_CHILD_POLICY variable";
+        break;
+    default:
+        consequence = "cannot change tethered.pth or tethered.start";
+        break;
+    }
+
+    /* (PyUnicode_FromFormat needs an ASCII format string.) */
+    PyObject *message = PyUnicode_FromFormat(
+        "Blocked by tethered: %s (" ELSEWHERE ", so this interpreter %s)",
+        subject, consequence);
+    PyObject *ctor_args = NULL;
+
+    if (message == NULL)
+        PyErr_Clear();
+    else if (kind == EVENT_SOCKET)
+        ctor_args = Py_BuildValue("(sO)", subject, Py_None);
+    else
+        ctor_args = Py_BuildValue(
+            "(sN)", event,
+            PyUnicode_FromFormat(
+                "%s refused: " ELSEWHERE ", so this interpreter %s",
+                event, consequence));
+
+    return raise_in_this_interpreter(
+        kind == EVENT_SOCKET ? "EgressBlocked" : "SubprocessBlocked",
+        ctor_args, message);
+}
+
+/*
+ * A policy is locked and this event comes from an interpreter that does not
+ * own the lock.  Refuse what tethered guards — connections and datagrams,
+ * lookups, process launches, changes to tethered.pth / tethered.start and
+ * to the policy variable — and leave everything else alone, so that such an
+ * interpreter keeps working for computation.  The guardian matches no
+ * policy, so "refuse" is all it can say: not even loopback is reachable.
+ */
+static int
+other_interpreter_event(const char *event, PyObject *args)
+{
+    int kind = classify_event(event);
+
+    switch (kind) {
+    case EVENT_SOCKET:
+        /* Not socket.__new__, socket.bind, socket.getnameinfo, ...: the
+         * Python hook enforces nothing on those either. */
+        if (!is_connect_event(event) && !is_lookup_event(event))
+            return 0;
+        break;
+    case EVENT_LAUNCH:
+        break;
+    case EVENT_FS:
+    case EVENT_FS_PAIR:
+        /* Reading the file is not refused: site.py does it in every new
+         * interpreter. */
+        if (strcmp(event, "open") == 0 && !open_event_may_write(args))
+            return 0;
+        if (!fs_event_concerns_pth(kind, args, 1))
+            return 0;
+        break;
+    case EVENT_ENV:
+        if (!env_key_is_policy_var(args))
+            return 0;
+        break;
+    default:
+        return 0;
+    }
+    return refuse_other_interpreter(event, kind, args);
 }
 
 static int
@@ -659,10 +960,10 @@ guardian_hook(const char *event, PyObject *args, void *userData)
     if (!ATOMIC_LOAD(guardian_active))
         return 0;
 
-    /* Not this guardian's interpreter: none of its objects may be touched
-     * from here (see guardian_interp). */
-    if (PyInterpreterState_Get() != guardian_interp)
-        return 0;
+    /* Not the interpreter that holds the lock: none of the guardian's
+     * objects may be touched from here (see guardian_interp). */
+    if (PyInterpreterState_Get() != ATOMIC_PTR_LOAD(guardian_interp))
+        return other_interpreter_event(event, args);
 
     int kind = classify_event(event);
     if (kind == EVENT_IGNORED)
@@ -707,7 +1008,7 @@ guardian_hook(const char *event, PyObject *args, void *userData)
 
     /* Launch, filesystem and environment events. */
     if ((kind == EVENT_FS || kind == EVENT_FS_PAIR) &&
-        !fs_event_concerns_pth(kind, args))
+        !fs_event_concerns_pth(kind, args, 0))
         return 0;
     if (kind == EVENT_ENV && !env_key_is_policy_var(args))
         return 0;
@@ -1082,6 +1383,14 @@ py_activate(PyObject *self, PyObject *args)
                           &PyDict_Type, &ns, &config, &token, &snapshot_items))
         return NULL;
 
+    /* A lock is replaced only from the interpreter that holds it: the state
+     * swapped out below is made of that interpreter's objects. */
+    if (locked_elsewhere()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "tethered: " ELSEWHERE " and can only be replaced from there");
+        return NULL;
+    }
+
     /* If guardian is already active, verify the token before replacing */
     if (ATOMIC_LOAD(guardian_active) && token != guardian_token) {
         PyErr_SetString(PyExc_RuntimeError,
@@ -1181,7 +1490,8 @@ py_activate(PyObject *self, PyObject *args)
     install_snapshot(staging, staging_count);
     staging = NULL; /* owned by the live snapshot now */
     swap_holdings(&next);
-    guardian_interp = PyInterpreterState_Get();
+    /* (On a re-activation this stores the value it already has.) */
+    ATOMIC_PTR_STORE(guardian_interp, PyInterpreterState_Get());
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
 
@@ -1214,6 +1524,14 @@ py_deactivate(PyObject *self, PyObject *args)
      * rebind.  The return value tells the two cases apart. */
     if (!ATOMIC_LOAD(guardian_active))
         Py_RETURN_FALSE;
+
+    /* As in py_activate: only the interpreter that holds the lock gives it
+     * up. */
+    if (locked_elsewhere()) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "tethered: " ELSEWHERE " and can only be deactivated from there");
+        return NULL;
+    }
 
     if (token != guardian_token) {
         PyErr_SetString(PyExc_RuntimeError,
@@ -1283,19 +1601,26 @@ py_check_token(PyObject *self, PyObject *args)
         return NULL;
     if (!ATOMIC_LOAD(guardian_active))
         Py_RETURN_TRUE;
+    /* No object of this interpreter is the token of another one's lock. */
+    if (locked_elsewhere())
+        Py_RETURN_FALSE;
     return PyBool_FromLong(token == guardian_token);
 }
 
 /* verify() → bool: run the integrity check now.  True when the guardian
  * is inactive (nothing to verify) or every pinned fact still holds.  Lets
  * activate()/deactivate() refuse to act on a policy that has been tampered
- * with, without waiting for the next guarded event. */
+ * with, without waiting for the next guarded event.  False, without
+ * looking, when the lock is held by another interpreter: its objects cannot
+ * be examined from here. */
 static PyObject *
 py_verify(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     (void)self;
     if (!ATOMIC_LOAD(guardian_active))
         Py_RETURN_TRUE;
+    if (locked_elsewhere())
+        Py_RETURN_FALSE;
     return PyBool_FromLong(verify_integrity());
 }
 
@@ -1320,6 +1645,13 @@ py_resolve(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "OOiiii",
                           &host, &port, &family, &socktype, &proto, &flags))
         return NULL;
+
+    /* The lock is another interpreter's: this one gets no lookups, and the
+     * resolver and the callers checked below are not its objects. */
+    if (locked_elsewhere()) {
+        (void)refuse_other_interpreter("socket.getaddrinfo", EVENT_SOCKET, args);
+        return NULL;
+    }
 
     /* Caller verification: only the cached authorized callers
      * (_handle_getaddrinfo and _fallback_resolve) may call this.
@@ -1383,11 +1715,14 @@ static PyMethodDef guardian_methods[] = {
      "True.  Returns False, having done nothing, when the guardian is not\n"
      "active."},
     {"is_active",   py_is_active,   METH_NOARGS,
-     "Return True if the guardian is active."},
+     "Return True if the guardian is active: a policy is locked, by this\n"
+     "interpreter or by another one of the process."},
     {"check_token", py_check_token, METH_VARARGS,
-     "Return True if the guardian is inactive or the object is the lock token."},
+     "Return True if the guardian is inactive or the object is the lock token.\n\n"
+     "Always False while the lock is held by another interpreter."},
     {"verify",      py_verify,      METH_NOARGS,
-     "Return True if the guardian is inactive or the integrity check passes."},
+     "Return True if the guardian is inactive or the integrity check passes.\n\n"
+     "False while the lock is held by another interpreter."},
     {"resolve",     py_resolve,     METH_VARARGS,
      "C-guarded DNS resolution with caller verification."},
     {NULL, NULL, 0, NULL}
@@ -1400,7 +1735,9 @@ static struct PyModuleDef guardian_module = {
     "Snapshots identity of all critical Python objects at activation.\n"
     "On tamper detection, blocks ALL network access and refuses the\n"
     "guarded launch, filesystem and environment operations (fail-closed).\n"
-    "Owns trusted reentrancy state for DNS resolution.",
+    "Owns trusted reentrancy state for DNS resolution.\n\n"
+    "The lock is process-wide: while it is held, every interpreter other\n"
+    "than the one that took it is refused those same operations.",
     -1,
     guardian_methods
 };
