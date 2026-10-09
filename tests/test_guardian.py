@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import _socket
+import gc
 import logging
 import socket
 import sys
 import threading
 import unittest.mock
+import weakref
 
 import pytest
 
@@ -24,10 +26,31 @@ class TestLockedMode:
         with pytest.raises(ValueError, match="lock_token is required"):
             tethered.activate(allow=["*.example.com"], locked=True)
 
-    @pytest.mark.parametrize("token", ["secret", 42, 3.14, b"key", True])
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "secret",
+            42,
+            3.14,
+            b"key",
+            True,
+            # Singletons and immutable containers: an independently created
+            # equal value is (or can be) the very same object.
+            (),
+            ("a", "b"),
+            frozenset(),
+            frozenset({"a"}),
+            1j,
+            Ellipsis,
+            NotImplemented,
+        ],
+        ids=repr,
+    )
     def test_lock_token_rejects_internable_types(self, token):
         with pytest.raises(TypeError, match="must not be a str"):
             tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        assert _core._config is None
+        assert _core._c_guardian.is_active() is False
 
     def test_lock_token_internable_type_allowed_when_not_locked(self):
         """Internable lock_token types are accepted when locked=False (token is discarded)."""
@@ -160,6 +183,106 @@ class TestLockedMode:
                 lock_token=object(),
                 log_only=True,
             )
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestLockTokenHeldInC:
+    """The lock token lives only in the C guardian (R29)."""
+
+    def test_token_is_not_stored_on_the_python_side(self):
+        """No config field or module global holds the token or its id()."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        cfg = _core._config
+        assert "lock_token" not in _core._Config.__slots__
+        assert not hasattr(cfg, "lock_token")
+        assert not hasattr(_core, "_guardian_token_id")
+        for slot in _core._Config.__slots__:
+            assert getattr(cfg, slot) is not secret
+        for module in (_core, sys.modules["tethered._policy"], tethered):
+            for name, value in vars(module).items():
+                assert value is not secret, name
+                assert not (type(value) is int and value == id(secret)), name
+
+    def test_reading_the_token_back_from_the_config_does_not_unlock(self):
+        """The report's one-liner: deactivate(lock_token=_config.lock_token)."""
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.deactivate(lock_token=getattr(_core._config, "lock_token", None))
+        assert _core._c_guardian.is_active() is True
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+
+    def test_guardian_rejects_the_token_id(self):
+        """The guardian compares the object, so a recovered id() is useless."""
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        with pytest.raises(RuntimeError, match="lock_token"):
+            _core._c_guardian.deactivate(id(secret))
+        assert _core._c_guardian.check_token(id(secret)) is False
+        assert _core._c_guardian.is_active() is True
+
+    def test_equal_but_distinct_object_does_not_unlock(self):
+        """Comparison is by identity: ``__eq__`` is never consulted."""
+
+        class AlwaysEqual:
+            def __eq__(self, other):
+                return True
+
+            def __hash__(self):
+                return 0
+
+        secret = AlwaysEqual()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.deactivate(lock_token=AlwaysEqual())
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.activate(allow=["evil.test"], lock_token=AlwaysEqual())
+        tethered.deactivate(lock_token=secret)
+        assert _core._c_guardian.is_active() is False
+
+    def test_check_token(self):
+        secret = object()
+        guardian = _core._c_guardian
+        assert guardian.check_token(object()) is True  # nothing is locked
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        assert guardian.check_token(secret) is True
+        assert guardian.check_token(object()) is False
+        assert guardian.check_token(None) is False
+
+    def test_guardian_keeps_the_token_alive(self):
+        """The guardian holds a strong reference, so the address is never reused.
+
+        Uses the unwrapped ``_core.activate`` so conftest's token recorder
+        does not hold a reference of its own.
+        """
+
+        class Token:
+            pass
+
+        secret = Token()
+        watcher = weakref.ref(secret)
+        _core.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        del secret
+        gc.collect()
+        survivor = watcher()
+        assert survivor is not None, "the guardian must keep the token alive"
+        tethered.deactivate(lock_token=survivor)
+        del survivor
+        gc.collect()
+        assert watcher() is None, "deactivation must release the token"
+
+    def test_unlocked_activation_ignores_and_does_not_keep_the_token(self):
+        class Token:
+            pass
+
+        token = Token()
+        watcher = weakref.ref(token)
+        _core.activate(allow=["*.example.com"], lock_token=token)
+        del token
+        gc.collect()
+        assert watcher() is None
+        tethered.deactivate()
 
 
 class TestLockedRequiresCGuardian:

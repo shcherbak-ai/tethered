@@ -74,7 +74,11 @@ typedef struct {
 
 static ATOMIC_INT       guardian_active = 0;
 static PyObject        *guardian_config = NULL;    /* strong ref to _Config */
-static unsigned long long guardian_token_id = 0;
+/* The lock token itself (strong ref).  Held only here: a strong reference
+ * keeps the object alive, so its address can never be reused by another
+ * object, and comparison is by pointer identity.  Nothing on the Python
+ * side stores the token or its id(). */
+static PyObject        *guardian_token = NULL;
 static ATOMIC_INT       tamper_alerted = 0;
 static PyObject        *core_module = NULL;
 static PyObject        *egress_blocked_cls = NULL; /* strong ref */
@@ -438,15 +442,15 @@ py_activate(PyObject *self, PyObject *args)
     (void)self;
     PyObject *config;
     PyObject *exc_class;
-    unsigned long long token_id;
+    PyObject *token;
     PyObject *snapshot_items;
 
-    if (!PyArg_ParseTuple(args, "OOKO",
-                          &config, &exc_class, &token_id, &snapshot_items))
+    if (!PyArg_ParseTuple(args, "OOOO",
+                          &config, &exc_class, &token, &snapshot_items))
         return NULL;
 
     /* If guardian is already active, verify the token before replacing */
-    if (ATOMIC_LOAD(guardian_active) && token_id != guardian_token_id) {
+    if (ATOMIC_LOAD(guardian_active) && token != guardian_token) {
         PyErr_SetString(PyExc_RuntimeError,
             "tethered: replacing locked guardian requires correct lock_token");
         return NULL;
@@ -464,7 +468,8 @@ py_activate(PyObject *self, PyObject *args)
     Py_INCREF(exc_class);
     egress_blocked_cls = exc_class;
 
-    guardian_token_id = token_id;
+    Py_INCREF(token);
+    Py_XSETREF(guardian_token, token);
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
 
@@ -514,15 +519,15 @@ static PyObject *
 py_deactivate(PyObject *self, PyObject *args)
 {
     (void)self;
-    unsigned long long token_id;
+    PyObject *token;
 
-    if (!PyArg_ParseTuple(args, "K", &token_id))
+    if (!PyArg_ParseTuple(args, "O", &token))
         return NULL;
 
     if (!ATOMIC_LOAD(guardian_active))
         Py_RETURN_NONE;
 
-    if (token_id != guardian_token_id) {
+    if (token != guardian_token) {
         PyErr_SetString(PyExc_RuntimeError,
             "tethered: guardian deactivation requires correct lock_token");
         return NULL;
@@ -537,7 +542,7 @@ py_deactivate(PyObject *self, PyObject *args)
         Py_CLEAR(expected_caller_codes[i]);
     }
     /* csocket_module kept alive — harmless, avoids re-import */
-    guardian_token_id = 0;
+    Py_CLEAR(guardian_token);
     ATOMIC_STORE(tamper_alerted, 0);
 
     Py_RETURN_NONE;
@@ -554,12 +559,12 @@ static PyObject *
 py_check_token(PyObject *self, PyObject *args)
 {
     (void)self;
-    unsigned long long token_id;
-    if (!PyArg_ParseTuple(args, "K", &token_id))
+    PyObject *token;
+    if (!PyArg_ParseTuple(args, "O", &token))
         return NULL;
     if (!ATOMIC_LOAD(guardian_active))
         Py_RETURN_TRUE;
-    return PyBool_FromLong(token_id == guardian_token_id);
+    return PyBool_FromLong(token == guardian_token);
 }
 
 /* ── C-guarded DNS resolution ───────────────────────────────────── */
@@ -627,11 +632,11 @@ static PyMethodDef guardian_methods[] = {
     {"activate",    py_activate,    METH_VARARGS,
      "Activate with config, exception class, token, and integrity snapshot."},
     {"deactivate",  py_deactivate,  METH_VARARGS,
-     "Deactivate (requires correct token_id)."},
+     "Deactivate (requires the lock token object, compared by identity)."},
     {"is_active",   py_is_active,   METH_NOARGS,
      "Return True if the guardian is active."},
     {"check_token", py_check_token, METH_VARARGS,
-     "Return True if token_id matches."},
+     "Return True if the guardian is inactive or the object is the lock token."},
     {"resolve",     py_resolve,     METH_VARARGS,
      "C-guarded DNS resolution with caller verification."},
     {NULL, NULL, 0, NULL}

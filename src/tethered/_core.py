@@ -149,7 +149,6 @@ class _Config:
     fail_closed: bool = False
     on_blocked: Callable[[str, int | None], None] | None = field(default=None, repr=False)
     locked: bool = False
-    lock_token: object | None = field(default=None, repr=False)
     external_subprocess_policy: str = "warn"
     # Canonical JSON-serialized at-rest env payload, written to
     # ``os.environ[_TETHERED_CHILD_POLICY]`` at activate() time.  Format:
@@ -210,7 +209,6 @@ class _ScopeConfig:
 
 _state_lock = threading.Lock()
 _config: _Config | None = None
-_guardian_token_id: int = 0  # stored for test fixture cleanup
 
 # IP -> hostnames mapping from intercepted getaddrinfo calls.  The key is the
 # canonical text of the address (see ``_canonical_ip``); the value is the
@@ -321,6 +319,44 @@ def _validate_optional_str(value: object, param_name: str) -> None:
     """Validate that a parameter is either a ``str`` or ``None``."""
     if value is not None and not isinstance(value, str):
         msg = f"{param_name} must be a str or None, got {type(value).__name__}"
+        raise TypeError(msg)
+
+
+# Types whose instances cannot serve as a lock token.  The token is compared
+# by identity, so it must be an object of which nobody can obtain a second
+# reference just by writing down an equal value.  Singletons (``None``,
+# ``Ellipsis``, ``NotImplemented``, ``True``/``False``, the empty tuple, the
+# empty frozenset) and immutable values that CPython interns, caches or
+# constant-folds (``str``, ``bytes``, numbers, tuples, frozensets) fail that
+# test.
+_UNSAFE_LOCK_TOKEN_TYPES = (
+    str,
+    bytes,
+    bool,
+    int,
+    float,
+    complex,
+    tuple,
+    frozenset,
+    type(None),
+    type(Ellipsis),
+    type(NotImplemented),
+)
+
+
+def _validate_lock_token(lock_token: object) -> None:
+    """Validate the ``lock_token`` of a ``locked=True`` activation."""
+    if lock_token is None:
+        msg = "tethered: lock_token is required when locked=True"
+        raise ValueError(msg)
+    if isinstance(lock_token, _UNSAFE_LOCK_TOKEN_TYPES):
+        msg = (
+            "lock_token must not be a str, int, float, complex, bytes, bool, tuple "
+            "or frozenset, nor None, Ellipsis or NotImplemented — these are "
+            "singletons or immutable values that CPython may intern or cache, so a "
+            "separately created equal value can be the very same object and defeat "
+            "the lock. Use object() or a custom instance."
+        )
         raise TypeError(msg)
 
 
@@ -2792,9 +2828,14 @@ def activate(
         lock_token: An opaque object required when ``locked=True`` and used
             to authenticate when replacing an existing locked policy.
             Compared by identity (``is``), not equality.  Must not be a
-            ``str``, ``int``, ``float``, ``bytes``, or ``bool`` — CPython
-            interns these types, so separate literals can share identity
-            and defeat the lock.  Use ``object()`` or a custom instance.
+            ``str``, ``int``, ``float``, ``complex``, ``bytes``, ``bool``,
+            ``tuple`` or ``frozenset``, nor ``None``, ``Ellipsis`` or
+            ``NotImplemented`` — these are singletons or immutable values
+            that CPython may intern or cache, so a separately created equal
+            value can be the very same object and defeat the lock.  Use
+            ``object()`` or a custom instance.  The token is held only by
+            the C guardian; tethered keeps no Python-visible copy of it, so
+            whoever needs to unlock must keep their own reference.
         external_subprocess_policy: Controls parent-side enforcement for
             *external* subprocess launches — non-Python tools, different
             Python interpreters, or ``sys.executable`` launched with the
@@ -2810,7 +2851,8 @@ def activate(
     Raises:
         RuntimeError: If ``locked=True`` but the C guardian extension is
             not available.
-        TypeError: If ``lock_token`` is an internable type.
+        TypeError: If ``lock_token`` is a singleton or an instance of an
+            immutable built-in type.
         ValueError: If ``locked=True`` is used without ``lock_token``,
             or if ``external_subprocess_policy`` is not a recognized value.
         TetheredLocked: If a locked policy is active, the correct
@@ -2821,7 +2863,7 @@ def activate(
             apps that call ``activate(locked=True)`` at import time
             working inside auto-activated child processes.
     """
-    global _config, _guardian_token_id
+    global _config
 
     _validate_allow(allow)
     _validate_bool(log_only, "log_only")
@@ -2845,17 +2887,8 @@ def activate(
         )
         raise RuntimeError(msg)
 
-    if locked and lock_token is None:
-        msg = "tethered: lock_token is required when locked=True"
-        raise ValueError(msg)
-
-    if locked and isinstance(lock_token, (str, int, float, bytes, bool)):
-        msg = (
-            "lock_token must not be a str, int, float, bytes, or bool — "
-            "these types are interned by CPython, so separate literals can "
-            "share identity and defeat the lock. Use object() or a custom instance."
-        )
-        raise TypeError(msg)
+    if locked:
+        _validate_lock_token(lock_token)
 
     policy = AllowPolicy(allow, allow_localhost=allow_localhost)
     global_payload_dict = _build_global_payload_dict(
@@ -2874,15 +2907,12 @@ def activate(
         fail_closed=fail_closed,
         on_blocked=on_blocked,
         locked=locked,
-        lock_token=lock_token if locked else None,
         external_subprocess_policy=external_subprocess_policy,
         _serialized_payload=serialized_payload,
         _global_payload_dict=global_payload_dict,
         _pth_path=pth_path,
         _local_hostname=local_hostname,
     )
-
-    token_id = id(lock_token) if lock_token is not None else 0
 
     activate_locked_msg = (
         "tethered: activate() blocked — a locked policy is active and the "
@@ -2891,22 +2921,18 @@ def activate(
     )
 
     with _state_lock:
-        # Check lock: C guardian is source of truth when available
-        if _c_guardian is not None and _c_guardian.is_active():
-            if not _c_guardian.check_token(token_id):
-                if _is_idempotent_reactivation(global_payload_dict):
-                    return
-                raise TetheredLocked(activate_locked_msg)
-        else:  # pragma: no cover — fallback when C guardian is unavailable
-            old = _config
-            if (
-                old is not None
-                and old.locked
-                and (lock_token is None or lock_token is not old.lock_token)
-            ):
-                if _is_idempotent_reactivation(global_payload_dict):
-                    return
-                raise TetheredLocked(activate_locked_msg)
+        # The C guardian owns the lock: a locked policy exists only while the
+        # guardian is active (locked=True requires the extension), and only
+        # the guardian knows the token.  Without the extension nothing can
+        # be locked, so there is nothing to check.
+        if (
+            _c_guardian is not None
+            and _c_guardian.is_active()
+            and not _c_guardian.check_token(lock_token)
+        ):
+            if _is_idempotent_reactivation(global_payload_dict):
+                return
+            raise TetheredLocked(activate_locked_msg)
         with _ip_map_lock:
             _config = cfg
             _ip_to_hostname.clear()
@@ -2917,16 +2943,14 @@ def activate(
         if locked:
             snapshot = _build_integrity_snapshot(cfg)
             try:
-                _c_guardian.activate(cfg, EgressBlocked, token_id, snapshot)
+                _c_guardian.activate(cfg, EgressBlocked, lock_token, snapshot)
             except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
                 raise TetheredLocked from None
-            _guardian_token_id = token_id
         elif _c_guardian.is_active():
             try:
-                _c_guardian.deactivate(token_id)
+                _c_guardian.deactivate(lock_token)
             except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
                 raise TetheredLocked from None
-            _guardian_token_id = 0
 
     _install_hook()
     # Propagate the policy to spawn-mode child processes via env var.  The
@@ -2967,23 +2991,14 @@ def deactivate(*, lock_token: object | None = None) -> None:
     """
     global _config
 
-    token_id = id(lock_token) if lock_token is not None else 0
-
     with _state_lock:
-        # Check lock: C guardian is source of truth when available
+        # The C guardian owns the lock (see activate()); without the
+        # extension no policy can be locked.
         if _c_guardian is not None and _c_guardian.is_active():
             try:
-                _c_guardian.deactivate(token_id)
+                _c_guardian.deactivate(lock_token)
             except RuntimeError:
                 raise TetheredLocked from None
-        else:  # pragma: no cover — fallback when C guardian is unavailable
-            cfg = _config
-            if (
-                cfg is not None
-                and cfg.locked
-                and (lock_token is None or lock_token is not cfg.lock_token)
-            ):
-                raise TetheredLocked
         with _ip_map_lock:
             _config = None
             _ip_to_hostname.clear()

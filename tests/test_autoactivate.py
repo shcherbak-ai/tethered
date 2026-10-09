@@ -97,11 +97,9 @@ class TestAutoactivateUnit:
         cfg = _core._config
         assert cfg is not None
         assert cfg.locked is True
-        assert cfg.lock_token is not None
-        # Required because cleanup needs the token to deactivate the C guardian
-        _core._c_guardian.deactivate(_core._guardian_token_id)
-        with _core._state_lock:
-            _core._config = None
+        # The child's fresh per-process token lives only in the C guardian.
+        assert _core._c_guardian.is_active() is True
+        assert _core._c_guardian.check_token(None) is False
 
     def test_locked_without_c_extension_refuses_to_start(self, monkeypatch):
         """The parent asked for locked mode; a child that cannot lock must not run unlocked."""

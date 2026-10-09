@@ -1118,7 +1118,6 @@ class TestLockedPayloadIntegrity:
             policy=AllowPolicy([], allow_localhost=True),
             external_subprocess_policy=external_subprocess_policy,
             locked=True,
-            lock_token=object(),
             _serialized_payload=self._CANONICAL,
             _global_payload_dict=self._GLOBAL_DICT,
         )
@@ -1357,7 +1356,6 @@ class TestPthFsHook:
         return _Config(
             policy=AllowPolicy([], allow_localhost=True),
             locked=True,
-            lock_token=object(),
             _serialized_payload="{}",
             _pth_path=self._PTH,
         )
@@ -1367,7 +1365,6 @@ class TestPthFsHook:
         cfg = _Config(
             policy=AllowPolicy([], allow_localhost=True),
             locked=True,
-            lock_token=object(),
             _serialized_payload="{}",
             _pth_path="",
         )

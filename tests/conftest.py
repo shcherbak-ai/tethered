@@ -13,6 +13,7 @@ that exercise subprocess auto-propagation need it there to work end-to-end.
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
 import shutil
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import tethered
 import tethered._core as _core
 from tethered._core import (
     _CHILD_POLICY_ENV,
@@ -97,6 +99,51 @@ def _skip_if_no_network(request):
         pytest.skip("No network access")
 
 
+# ── Lock-token bookkeeping for cleanup ────────────────────────────
+# The lock token is held only inside the C guardian: tethered keeps no
+# Python-visible copy and offers no way to force-deactivate.  To unlock
+# between tests, remember every token a test hands to ``tethered.activate``
+# (which is also how ``_autoactivate`` reaches it).  This lives entirely on
+# the test side — the package knows nothing about it.
+_seen_lock_tokens: list[object] = []
+_real_activate = tethered.activate
+
+
+@functools.wraps(_real_activate)
+def _recording_activate(*args, **kwargs):
+    token = kwargs.get("lock_token")
+    if token is not None:
+        _seen_lock_tokens.append(token)
+    return _real_activate(*args, **kwargs)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _record_lock_tokens():
+    """Route ``tethered.activate`` through the token-recording wrapper."""
+    tethered.activate = _recording_activate
+    yield
+    tethered.activate = _real_activate
+
+
+def _unlock_guardian() -> None:
+    """Deactivate the C guardian with whichever recorded token it holds."""
+    guardian = _core._c_guardian
+    if guardian is None:
+        return
+    try:
+        if guardian.is_active():
+            for token in _seen_lock_tokens:
+                if guardian.check_token(token):
+                    guardian.deactivate(token)
+                    break
+        assert not guardian.is_active(), (
+            "a test left the C guardian locked with a token that was not passed "
+            "through tethered.activate(); conftest cannot unlock it"
+        )
+    finally:
+        _seen_lock_tokens.clear()
+
+
 @pytest.fixture(autouse=True)
 def _cleanup():
     """Reset tethered state after each test.
@@ -107,9 +154,8 @@ def _cleanup():
     dirty flag is cleared.
     """
     yield
-    # Deactivate C guardian first (using stored token_id)
-    if _core._c_guardian is not None and _core._c_guardian.is_active():
-        _core._c_guardian.deactivate(_core._guardian_token_id)
+    # Deactivate the C guardian first (using the token the test supplied)
+    _unlock_guardian()
     with _core._state_lock, _ip_map_lock:
         _core._config = None
         _ip_to_hostname.clear()
