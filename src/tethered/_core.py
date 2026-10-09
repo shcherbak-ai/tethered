@@ -2424,9 +2424,9 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     - ``os.truncate`` given a path (emptying the file disables
       auto-activation just as deleting it does).
 
-    The cached path is computed at ``activate()`` time; if it's empty
-    (``tethered.__file__`` unavailable, e.g. frozen interpreter), the
-    hook is a no-op.
+    The cached path is computed at ``activate()`` time; if it's empty (no
+    ``tethered.pth`` in a directory ``site.py`` processes — see
+    :func:`_compute_pth_path`), the hook is a no-op.
 
     No effect outside locked mode.  Not caught: ``os.ftruncate`` (and
     ``os.truncate`` given a file descriptor) — the event carries the
@@ -3121,16 +3121,19 @@ def activate(
             _ip_to_hostname.clear()
             _allowed_hostnames.clear()
 
-    # Surface a warning if the auto-propagation hook isn't where we expect.
-    # Without it, child processes spawned via subprocess / multiprocessing
-    # silently bypass tethered, and locked-mode FS-tamper protection has no
-    # real target.  Typical cause: editable install (``pip install -e .``).
+    # Surface a warning if no auto-propagation hook is in a directory that
+    # site.py processes (see _compute_pth_path).  Without it, Python children
+    # do not auto-activate, sys.executable launches are classified as
+    # external, and locked-mode FS-tamper protection has no real target.
     if not pth_path or not os.path.isfile(pth_path):
         logger.warning(
-            "tethered: tethered.pth not found at %s — child processes spawned "
-            "via subprocess.run / multiprocessing / ProcessPoolExecutor will "
-            "NOT auto-inherit the policy.%s This is typical for editable "
-            "installs (pip install -e .); reinstall normally for full coverage.",
+            "tethered: tethered.pth not found at %s — no directory this "
+            "interpreter's site.py processes holds it, so Python child processes "
+            "will NOT auto-inherit the policy and sys.executable launches are "
+            "treated as external (external_subprocess_policy applies).%s Typical "
+            "causes: an editable install (pip install -e .), pip install --target "
+            "with PYTHONPATH, or running with -S. Install tethered into "
+            "site-packages for full coverage.",
             pth_path or "<unresolved>",
             (
                 " Locked-mode FS-tamper protection on tethered.pth is also unavailable."
