@@ -155,6 +155,137 @@ class TestSubprocessPolicy:
                 timeout=10,
             )  # nosec B603 B607
 
+    def test_block_blocks_dash_S_with_explicit_executable(self):
+        """``executable=`` doesn't hide ``-S`` (on Windows the event then carries both)."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            subprocess.run(
+                [sys.executable, "-S", "-c", "pass"],
+                executable=sys.executable,
+                capture_output=True,
+                timeout=10,
+            )  # nosec B603 B607
+
+    def test_block_blocks_dash_S_after_an_option_value(self):
+        """``-X -c`` makes ``-c`` the value of ``-X``; the ``-S`` after it is a real option."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            subprocess.run(
+                [sys.executable, "-X", "-c", "-S", "-c", "pass"],
+                capture_output=True,
+                timeout=10,
+            )  # nosec B603 B607
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="command-line strings are a Windows form")
+    @pytest.mark.parametrize("flag", ['"-S"', '-"S"', "-S"])
+    def test_block_blocks_dash_S_in_a_command_line_string(self, flag):
+        """A quoted ``"-S"`` in a command-line string is still ``-S`` to the child."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        for kwargs in ({}, {"executable": sys.executable}):
+            with pytest.raises(tethered.SubprocessBlocked):
+                subprocess.run(
+                    f'"{sys.executable}" {flag} -c "pass"',
+                    capture_output=True,
+                    timeout=10,
+                    **kwargs,
+                )  # nosec B603 B607
+
+    _CHILD_REPORT = (
+        "import sys, tethered._core as c; "
+        "print('PASS', sys.flags.no_site, c._config is not None, sys.argv[1:])"
+    )
+
+    def test_block_allows_script_with_dash_S_argument(self, tmp_path):
+        """``-S`` after the script path is the script's argument, not the interpreter's."""
+        script = tmp_path / "report.py"
+        script.write_text(self._CHILD_REPORT.replace("; ", "\n"))
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        result = subprocess.run(
+            [sys.executable, str(script), "-S"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        # site.py ran, so the child auto-activated; the script got -S as its own argument.
+        assert result.stdout.strip() == "PASS 0 True ['-S']"
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ["-c" + _CHILD_REPORT],  # joined -cCODE with an upper-case S in the code
+            ["-Wignore::SyntaxWarning", "-c", _CHILD_REPORT],
+            ["-W", "-S", "-c", _CHILD_REPORT],  # "-S" is the (invalid, ignored) value of -W
+            ["-I", "-E", "-X", "dev", "-c", _CHILD_REPORT],
+        ],
+    )
+    def test_block_allows_python_launches_that_keep_site(self, options):
+        """Launches the old scanner took for ``-S`` launches run, and are tethered."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        result = subprocess.run(
+            [sys.executable, *options],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "PASS 0 True []"
+
+    def test_block_and_a_child_started_under_another_name(self):
+        """``executable=sys.executable`` with a different ``argv[0]``.
+
+        On POSIX the child decides which installation it is from ``argv[0]``:
+        as ``python`` it may not come up as this venv's interpreter at all, so
+        the launch is external.  On Windows the executable alone decides, and
+        the child is this interpreter, tethered included.
+        """
+        tethered.activate(allow=[], external_subprocess_policy="block")
+
+        def launch():
+            return subprocess.run(
+                ["python", "-c", self._CHILD_REPORT],
+                executable=sys.executable,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )  # nosec B603 B607
+
+        if sys.platform == "win32":
+            result = launch()
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip() == "PASS 0 True []"
+        else:
+            with pytest.raises(tethered.SubprocessBlocked):
+                launch()
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ["-S"],
+            ["-IS"],
+            ["-Sc"],
+            ["-X", "-c", "-S"],
+            ["-W", "-c", "-S"],
+            ["-X", "dev", "-W", "ignore", "-S"],
+            ["--check-hash-based-pycs", "never", "-S"],
+            ["-I"],
+            ["-W", "-S"],
+            ["-X", "-S"],
+            ["-Wignore::SyntaxWarning"],
+            ["--check-hash-based-pycs", "never"],
+        ],
+    )
+    def test_site_bypass_verdict_matches_the_real_interpreter(self, options):
+        """Whatever the flag check concludes, this interpreter does the same with the options."""
+        argv = [sys.executable, *options]
+        if not options[-1].endswith("c"):
+            argv.append("-c")
+        argv.append("import sys; print(sys.flags.no_site)")
+        tethered.activate(allow=[], external_subprocess_policy="allow")
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        assert _has_site_bypass_flag(argv) is (result.stdout.strip() == "1")
+
     def test_run_python_no_longer_exists(self):
         """The old run_python() public API has been removed."""
         assert not hasattr(tethered, "run_python")
@@ -358,17 +489,110 @@ class TestHasSiteBypassFlag:
     def test_argv_with_S_after_dash_m_returns_false(self):
         assert _has_site_bypass_flag(["python", "-m", "Smodule"]) is False
 
-    def test_long_form_flag_returns_false(self):
-        """--isolated isn't a real Python flag, but long-form is skipped anyway."""
-        assert _has_site_bypass_flag(["python", "--something-with-S", "-c", "pass"]) is False
+    def test_unknown_long_option_is_not_trusted(self):
+        """An option the interpreter doesn't know makes the command line unparseable."""
+        assert _has_site_bypass_flag(["python", "--something-with-S", "-c", "pass"]) is True
+        assert _has_site_bypass_flag(["python", "--isolated", "-c", "pass"]) is True
 
-    def test_non_list_returns_false(self):
-        assert _has_site_bypass_flag("not a list") is False
-        assert _has_site_bypass_flag(None) is False
+    @pytest.mark.parametrize(
+        "option", ["--help", "--help-all", "--help-env", "--help-xoptions", "--version"]
+    )
+    def test_known_long_flags_are_not_bypass_flags(self, option):
+        assert _has_site_bypass_flag(["python", option]) is False
+        assert _has_site_bypass_flag(["python", option, "-S"]) is True
 
-    def test_non_string_args_skipped(self):
-        # Non-string entries in argv are skipped, not raised on
+    def test_non_list_is_not_trusted(self):
+        """An argv that can't be read as a sequence of arguments is never a known-safe launch."""
+        assert _has_site_bypass_flag("python -c pass") is True
+        assert _has_site_bypass_flag(b"python -c pass") is True
+        assert _has_site_bypass_flag(None) is True
+        assert _has_site_bypass_flag(123) is True
+
+    def test_non_string_arg_is_not_trusted(self):
+        """A non-string element can't be an argument; the launch is not treated as known-safe."""
         assert _has_site_bypass_flag(["python", 123, "-S", "-c", "pass"]) is True
+        assert _has_site_bypass_flag(["python", 123, "-c", "pass"]) is True
+
+    def test_argv0_is_never_an_option(self):
+        """argv[0] is the program name even when it looks like a flag."""
+        assert _has_site_bypass_flag(["-S", "-c", "pass"]) is False
+        assert _has_site_bypass_flag(["python"]) is False
+        assert _has_site_bypass_flag([]) is False
+
+    def test_accepts_a_lazy_token_stream(self):
+        """The Windows parser hands over an iterator, not a list."""
+        assert _has_site_bypass_flag(iter(["python", "-S", "-c", "pass"])) is True
+        assert _has_site_bypass_flag(iter(["python", "-I", "-c", "pass"])) is False
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            # -S as the interpreter's own option, alone or in a cluster
+            ["-S"],
+            ["-S", "script.py"],
+            ["-IS", "-c", "pass"],
+            ["-SE", "-c", "pass"],
+            ["-Sc", "pass"],
+            ["-ISc", "pass"],
+            ["-Sm", "json.tool"],
+            ["-I", "-E", "-S", "-m", "json.tool"],
+            # the token after -X / -W is that option's value, so parsing goes on past it
+            ["-X", "-c", "-S", "-c", "pass"],
+            ["-X", "dev", "-S", "-c", "pass"],
+            ["-Xdev", "-S", "-c", "pass"],
+            ["-W", "-c", "-S", "-c", "pass"],
+            ["-W", "-S", "-S", "-c", "pass"],
+            ["-Wignore", "-S", "-c", "pass"],
+            ["-IX", "dev", "-S", "-c", "pass"],
+            ["-IXdev", "-S", "-c", "pass"],
+            ["--check-hash-based-pycs", "never", "-S", "-c", "pass"],
+            # options the interpreter rejects: not provably a normal launch
+            ["-Z", "-c", "pass"],
+            ["-J", "-c", "pass"],
+            ["-I-S", "-c", "pass"],
+            ["-S-", "-c", "pass"],
+            ["--check-hash-based-pycs=never", "-c", "pass"],
+        ],
+    )
+    def test_site_bypass_detected(self, options):
+        assert _has_site_bypass_flag(["python", *options]) is True
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            # everything after the script path belongs to the script
+            ["script.py", "-S"],
+            ["-I", "script.py", "-S"],
+            ["-u", "-B", "script.py", "-IS"],
+            # -c / -m end the options, joined to their value or not
+            ["-c", "pass", "-S"],
+            ["-cprint('PASS')"],
+            ["-cimport sys; print('S')", "-S"],
+            ["-Ic", "pass", "-S"],
+            ["-m", "json.tool", "-S"],
+            ["-mSmodule", "-S"],
+            # "--" and "-" end the options too
+            ["--", "-S"],
+            ["-", "-S"],
+            # a value is never an option, whatever it looks like
+            ["-W", "-S", "-c", "pass"],
+            ["-X", "-S", "-c", "pass"],
+            ["-EW", "-S", "-c", "pass"],
+            ["--check-hash-based-pycs", "-S", "-c", "pass"],
+            # joined values that merely contain an upper-case S
+            ["-Wignore::SyntaxWarning", "-c", "pass"],
+            ["-XS", "-c", "pass"],
+            ["-WS", "-c", "pass"],
+            # every flag that exists but leaves site.py alone
+            ["-bBdEhiIOPqRstuvVx?", "-c", "pass"],
+            ["-OO", "-q", "-c", "pass"],
+            # a value option with nothing after it: the interpreter exits with a usage error
+            ["-X"],
+            ["--check-hash-based-pycs"],
+        ],
+    )
+    def test_site_bypass_not_detected(self, options):
+        assert _has_site_bypass_flag(["python", *options]) is False
 
     def test_bytes_dash_S_detected(self):
         """``b"-S"`` is what POSIX subprocess passes through to execve — must be detected."""
@@ -395,15 +619,20 @@ class TestHasSiteBypassFlag:
 
         assert _has_site_bypass_flag(["python", _PL(), "-c", "pass"]) is True
 
-    def test_pathlike_with_failing_fspath_skipped(self):
-        """A ``__fspath__`` raising ``TypeError`` is handled gracefully (skipped, not raised)."""
+    def test_pathlike_with_failing_fspath_is_not_trusted(self):
+        """A ``__fspath__`` raising ``TypeError`` doesn't escape; the argv is just unparseable."""
 
         class _BadPL:
             def __fspath__(self) -> str:
                 raise TypeError("simulated bad PathLike")
 
-        # The bad PathLike is skipped; the real ``-S`` still gets detected.
         assert _has_site_bypass_flag(["python", _BadPL(), "-S", "-c", "pass"]) is True
+        assert _has_site_bypass_flag(["python", _BadPL(), "-c", "pass"]) is True
+
+    def test_pathlike_script_ends_the_options(self):
+        """A ``Path`` script (the usual way to pass one) is decoded like any other argument."""
+        assert _has_site_bypass_flag(["python", Path("script.py"), "-S"]) is False
+        assert _has_site_bypass_flag(["python", b"script.py", b"-S"]) is False
 
     def test_str_and_bytes_mixed_args(self):
         """Mixed str + bytes argv (legitimate on POSIX) is parsed coherently."""
@@ -470,7 +699,7 @@ class TestIsAutoInheritingPythonLaunch:
         assert _is_auto_inheriting_python_launch("os.spawn", (1,)) is False
 
     def test_non_path_executable_returns_false(self):
-        args = (123, ["python", "-c", "pass"], None, None)
+        args = (123, [sys.executable, "-c", "pass"], None, None)
         assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
 
     def test_pathlike_executable_with_failing_fspath_returns_false(self):
@@ -478,7 +707,10 @@ class TestIsAutoInheritingPythonLaunch:
             def __fspath__(self):
                 raise TypeError("not a real path")
 
-        args = (BadPath(), ["python", "-c", "pass"], None, None)
+        args = (BadPath(), [sys.executable, "-c", "pass"], None, None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+        # The same object as argv[0] is no better.
+        args = (sys.executable, [BadPath(), "-c", "pass"], None, None)
         assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
 
     def test_windows_command_line_form_with_sys_executable(self):
@@ -504,6 +736,183 @@ class TestIsAutoInheritingPythonLaunch:
     def test_windows_command_line_empty_returns_false(self):
         args = (None, "", None, None)
         assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    # ── POSIX layout: (executable, argv_list, cwd, env) ──
+
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [
+            (["-X", "-c", "-S", "-c", "pass"], False),  # "-c" is the value of -X
+            (["-IS", "-c", "pass"], False),
+            (["-Sc", "pass"], False),
+            (["script.py", "-S"], True),  # -S belongs to the script
+            (["-cprint('PASS')"], True),  # joined -c; the S is code
+            (["-Wignore::SyntaxWarning", "-c", "print('PASS')"], True),
+            (["-m", "json.tool", "-S"], True),
+            (["--bogus"], False),  # unparseable
+        ],
+    )
+    def test_posix_layout_reads_real_option_boundaries(self, options, expected):
+        args = (sys.executable, [sys.executable, *options], None, None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is expected
+        assert _is_auto_inheriting_python_launch("os.posix_spawn", (*args[:2], {})) is expected
+
+    @pytest.mark.parametrize(
+        "argv0",
+        ["python", "python3", "worker", "-S", "/usr/bin/python3", b"python", 123, None],
+    )
+    def test_posix_layout_argv0_must_name_sys_executable(self, argv0):
+        """A POSIX child takes its identity from argv[0], not from the file that was exec'd.
+
+        Started as ``python`` it looks that name up on ``PATH``; from a venv
+        that is not on ``PATH`` it comes up as the base installation, where
+        no ``tethered.pth`` is processed.
+        """
+        for event, tail in (("subprocess.Popen", (None, None)), ("os.posix_spawn", ({},))):
+            args = (sys.executable, [argv0, "-c", "pass"], *tail)
+            assert _is_auto_inheriting_python_launch(event, args) is False
+
+    def test_posix_layout_argv0_may_be_bytes_or_pathlike(self):
+        for argv0 in (os.fsencode(sys.executable), Path(sys.executable)):
+            args = (sys.executable, [argv0, "-c", "pass"], None, None)
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is True
+            args = (sys.executable, [argv0, "-S", "-c", "pass"], None, None)
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    def test_posix_layout_empty_or_unusable_argv_returns_false(self):
+        for argv in ([], (), None, 123, {"python": 1}):
+            args = (sys.executable, argv, None, None)
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    # ── Windows layout: (executable_or_None, command_line, cwd, env) ──
+
+    @pytest.mark.parametrize(
+        ("tail", "expected"),
+        [
+            ('-S -c "print(0)"', False),
+            ('"-S" -c "print(0)"', False),  # quoting every argument is a normal thing to do
+            ('-"S" -c "print(0)"', False),
+            ('-""S -c "print(0)"', False),
+            ("-IS -c pass", False),
+            ("-Sc pass", False),
+            ("-X -c -S -c pass", False),
+            ('-X dev "-S" -c pass', False),
+            ("\t-S\t-c\tpass", False),
+            ("--check-hash-based-pycs never -S -c pass", False),
+            ("--bogus -c pass", False),
+            ('-c "print(0)"', True),
+            ("script.py -S", True),
+            ('"my script.py" "-S"', True),
+            ("-cprint('PASS')", True),
+            ("\"-cprint('PASS S')\" -S", True),
+            ("-Wignore::SyntaxWarning -c \"print('PASS')\"", True),
+            ("-W -S -c pass", True),
+            ('-c "import sys\nprint(\\"-S\\", \'S\')" -S', True),  # quotes and newlines in the body
+            ("-m json.tool -S", True),
+            ("-I -E -c pass", True),
+            ('\\"-S -c pass', True),  # an escaped quote starts a script name, not an option
+            ("", True),
+        ],
+    )
+    def test_windows_layout_reads_real_option_boundaries(self, tail, expected):
+        quoted = f'"{sys.executable}" {tail}'
+        # Without executable=: the image is the command line's first token.
+        assert (
+            _is_auto_inheriting_python_launch("subprocess.Popen", (None, quoted, None, None))
+            is expected
+        )
+        # With executable=: same options, whatever the first token says.
+        for cmdline in (quoted, f"python {tail}", f'"some other name" {tail}'):
+            args = (sys.executable, cmdline, None, None)
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is expected
+
+    def test_windows_layout_explicit_executable_names_the_image(self):
+        """With ``executable=``, the command line's first token is not the launched program."""
+        cmdline = f'"{sys.executable}" -c "print(0)"'
+        args = ("C:\\Windows\\System32\\cmd.exe", cmdline, None, None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    def test_windows_layout_path_with_spaces(self, monkeypatch):
+        exe = "C:\\Program Files\\Python313\\python.exe"
+        monkeypatch.setattr(sys, "executable", exe)
+
+        def check(executable, cmdline):
+            args = (executable, cmdline, None, None)
+            return _is_auto_inheriting_python_launch("subprocess.Popen", args)
+
+        assert check(None, f'"{exe}" -c pass') is True
+        assert check(None, f'"{exe}" -S -c pass') is False
+        assert check(None, f'"{exe}" "-S" -c pass') is False
+        # Unquoted, the first token is "C:\Program": some other program.
+        assert check(None, f"{exe} -c pass") is False
+        # With executable= the child still splits the line at the space, so
+        # "Files\Python313\python.exe" is its script and -S is a script argument.
+        assert check(exe, f"{exe} -S -c pass") is True
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '"{exe}"-S -c pass',  # nothing between the closing quote and the next token
+            '"{exe}"x -S -c pass',
+            '"{exe}" \n-S -c pass',  # a newline is whitespace to some launchers only
+            '"{exe}" \x0b-S -c pass',
+            '"{exe}"\t-S -c pass',
+            "{exe}\tx -S -c pass",  # tab-terminated bare name
+            "{exe}\nx -S -c pass",
+            '{exe}" x -S -c pass',  # quote inside a bare name
+            '"{exe}\\" x -S -c pass',  # backslash before the closing quote
+            ' "{exe}" -c pass',  # leading whitespace
+            '"{exe} -c pass',  # unterminated quote
+        ],
+    )
+    def test_windows_layout_ambiguous_program_name_is_not_trusted(self, template, monkeypatch):
+        """Forms that CreateProcess, the C runtime and venv launchers split differently."""
+        # A fixed path: the bare forms mean something else again when it contains a space.
+        monkeypatch.setattr(sys, "executable", "C:\\Python313\\python.exe")
+        cmdline = template.format(exe=sys.executable)
+        for executable in (None, sys.executable):
+            args = (executable, cmdline, None, None)
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    # ── os.spawn* / os.exec*: Windows joins the argv, unquoted ──
+
+    def test_os_spawn_argv_is_resplit_by_the_child(self):
+        """An element holding ``-X dev -S`` reaches a Windows child as three arguments."""
+        exe = sys.executable
+
+        def check(argv):
+            return _is_auto_inheriting_python_launch("os.spawn", (0, exe, argv, None))
+
+        assert check(["python", "-c", "pass"]) is True
+        assert check(["python", "-X dev -S", "-c", "pass"]) is False
+        assert check(["python", "-Wignore -S", "-c", "pass"]) is False
+        assert check(["python", '"-S"', "-c", "pass"]) is False
+        assert check(("python", b"-S", "-c", "pass")) is False
+        assert check(["python", "my script.py", "-S"]) is True
+        assert check(["python", Path("script.py"), "-S"]) is True
+
+    def test_os_spawn_unusable_argv_returns_false(self):
+        class BadPath:
+            def __fspath__(self):
+                raise TypeError("not a real path")
+
+        for argv in (["python", 123], ["python", BadPath()], "python -c pass", None):
+            args = (0, sys.executable, argv, None)
+            assert _is_auto_inheriting_python_launch("os.spawn", args) is False
+
+    def test_os_exec_argv_is_joined_on_windows_only(self, monkeypatch):
+        # A fixed, space-free path so that joining argv doesn't split argv[0] as well.
+        monkeypatch.setattr(sys, "executable", "/opt/python/bin/python3")
+        args = (sys.executable, [sys.executable, "-Wignore -S", "-c", "pass"], {})
+        monkeypatch.setattr(_core, "_WINDOWS", True)
+        assert _is_auto_inheriting_python_launch("os.exec", args) is False
+        # POSIX execve passes the element through whole: it is -W's (invalid) value.
+        monkeypatch.setattr(_core, "_WINDOWS", False)
+        assert _is_auto_inheriting_python_launch("os.exec", args) is True
+        for windows in (True, False):
+            monkeypatch.setattr(_core, "_WINDOWS", windows)
+            plain = (sys.executable, ["python", "-S", "-c", "pass"], {})
+            assert _is_auto_inheriting_python_launch("os.exec", plain) is False
 
 
 class TestLockedPayloadIntegrity:
@@ -1237,21 +1646,28 @@ class TestFrameMutationHelpers:
 class TestParseWindowsCmdline:
     """Tests for _parse_windows_cmdline (Windows command-line parser)."""
 
+    @staticmethod
+    def _split(cmdline: str) -> tuple[str, list[str]]:
+        parsed = _parse_windows_cmdline(cmdline)
+        assert parsed is not None, cmdline
+        program, argv = parsed
+        return program, list(argv)
+
     def test_unquoted_exe_with_args(self):
-        # pre_args excludes the -c terminator and everything after.
-        result = _parse_windows_cmdline("python.exe -c pass")
-        assert result == ("python.exe", ["python.exe"])
+        assert self._split("python.exe -c pass") == (
+            "python.exe",
+            ["python.exe", "-c", "pass"],
+        )
 
     def test_unquoted_exe_no_args(self):
-        result = _parse_windows_cmdline("python.exe")
-        assert result == ("python.exe", ["python.exe"])
+        assert self._split("python.exe") == ("python.exe", ["python.exe"])
+        assert self._split("python.exe  \t ") == ("python.exe", ["python.exe"])
 
     def test_quoted_exe(self):
-        result = _parse_windows_cmdline('"C:\\Program Files\\Python\\python.exe" -c pass')
-        assert result == (
-            "C:\\Program Files\\Python\\python.exe",
-            ["C:\\Program Files\\Python\\python.exe"],
-        )
+        exe = "C:\\Program Files\\Python\\python.exe"
+        assert self._split(f'"{exe}" -c pass') == (exe, [exe, "-c", "pass"])
+        assert self._split(f'"{exe}"') == (exe, [exe])
+        assert self._split('"" -S') == ("", ["", "-S"])
 
     def test_quoted_exe_unterminated_quote(self):
         # Quoted exe with no closing quote — return None (can't parse safely).
@@ -1261,13 +1677,84 @@ class TestParseWindowsCmdline:
         assert _parse_windows_cmdline("") is None
         assert _parse_windows_cmdline("   ") is None
 
-    def test_pre_args_stops_at_minus_c(self):
-        result = _parse_windows_cmdline("python.exe -S -c 'script body'")
-        assert result == ("python.exe", ["python.exe", "-S"])  # stops before -c
+    @pytest.mark.parametrize(
+        "cmdline",
+        [
+            '"python.exe"-S',  # closing quote not followed by a space
+            '"python.exe"\t-S',
+            'python.exe"-S" x',  # quote inside a bare name
+            "python.exe\t-S",  # bare name ended by a tab
+            "python.exe\n-S",
+            '"python.exe\\" -S',  # backslash before the closing quote
+            '"python.exe" \n-S',  # separator run continues with other whitespace
+            "python.exe \r-S",
+            " python.exe -S",  # leading whitespace
+        ],
+    )
+    def test_ambiguous_program_name_returns_none(self, cmdline):
+        assert _parse_windows_cmdline(cmdline) is None
 
-    def test_pre_args_stops_at_minus_m(self):
-        result = _parse_windows_cmdline("python.exe -I -m mymod arg")
-        assert result == ("python.exe", ["python.exe", "-I"])  # stops before -m
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            # Each expectation is what python.exe's C runtime produces (checked
+            # against real children by test_windows_cmdline_split_matches_real_child).
+            ("-S -c pass", ["-S", "-c", "pass"]),
+            ("  -S \t -c\tpass  ", ["-S", "-c", "pass"]),
+            ('"-S" -"S" -""S "-"S', ["-S", "-S", "-S", "-S"]),
+            ('"c d" e" "f', ["c d", "e f"]),
+            ('""', [""]),
+            ('"" "" x', ["", "", "x"]),
+            ('a\\"b', ['a"b']),  # 1 backslash + quote: literal quote
+            ('e\\\\"f g"', ["e\\f g"]),  # 2 backslashes + quote: one backslash, quote toggles
+            ('h\\\\\\"i', ['h\\"i']),  # 3: one backslash and a literal quote
+            ('\\\\\\\\"x y\\\\\\\\" z', ["\\\\x y\\\\", "z"]),
+            ("a\\\\ b\\", ["a\\\\", "b\\"]),  # backslashes not before a quote are literal
+            ("C:\\dir\\file.py", ["C:\\dir\\file.py"]),
+            ('"a""b" "c"" d" x', ['a"b', 'c" d', "x"]),  # "" inside quotes: one literal quote
+            ('"a"""b', ['a"b']),
+            ('"unterminated quote here', ["unterminated quote here"]),
+            ("a\nb\rc", ["a\nb\rc"]),  # only space and tab separate arguments
+            ('-c "print(\'x\')\nprint(\\"y\\")" -S', ["-c", "print('x')\nprint(\"y\")", "-S"]),
+        ],
+    )
+    def test_arguments_split_by_c_runtime_rules(self, args, expected):
+        assert self._split(f"python.exe {args}") == ("python.exe", ["python.exe", *expected])
+
+    def test_arguments_are_split_lazily(self):
+        """The flag check stops at ``-c``: a long body full of quotes is never scanned."""
+        body = "print('a b')\nprint(1)\n" * 1000
+        parsed = _parse_windows_cmdline(f'python.exe -I -c "{body}" -S')
+        assert parsed is not None
+        _program, argv = parsed
+        assert _has_site_bypass_flag(argv) is False
+        # The iterator is still parked right after "-c"; the body is the next token.
+        assert next(argv) == body
+        assert list(argv) == ["-S"]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows command-line layout")
+    @pytest.mark.parametrize(
+        "args",
+        [
+            '"-S" -c "{probe}"',
+            '-"S" -c "{probe}"',
+            '-c "{probe}" a\\"b "c d" e\\\\"f g" h\\\\\\"i',
+            '-c "{probe}" "a""b" "c"" d" x ""',
+            '-c "{probe}" a\\\\ b\\ "unterminated quote',
+            "-X -c -S -c \"{probe}\" 'x y'",
+            '-I\t-c\t"{probe}"\t-S',
+        ],
+    )
+    def test_windows_cmdline_split_matches_real_child(self, args):
+        """The interpreter's own view of the command line agrees with the parser."""
+        probe = "import sys,json;print(json.dumps(sys.orig_argv[1:]))"
+        cmdline = f'"{sys.executable}" ' + args.format(probe=probe)
+        result = subprocess.run(  # nosec B603 B607
+            cmdline, capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, result.stderr
+        _program, argv = self._split(cmdline)
+        assert json.loads(result.stdout) == argv[1:]
 
 
 class TestScopeSubprocessPropagation:

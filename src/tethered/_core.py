@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
 
@@ -973,43 +973,97 @@ def _extract_subprocess_env(event: str, args: tuple[Any, ...]) -> tuple[bool, An
 # policy and is subject to external_subprocess_policy.
 _SITE_BYPASS_FLAG_CHARS = "S"
 
+# CPython's interpreter options (``SHORT_OPTS`` and ``longopts`` in
+# ``Python/getopt.c``; the same for 3.10-3.14 except that ``-P`` and the
+# ``--help-*`` forms are new in 3.11).  A flag stands alone or in a cluster
+# (``-IS``).  A value option takes the rest of its token (``-Wdefault``) or,
+# when it ends the token, the whole next token — which is therefore never an
+# option, whatever it looks like.  ``-c`` and ``-m`` also end the options.
+# The interpreter rejects every other option with a usage error (bar one
+# oddity, a ``-`` ending a cluster), so those are treated as unparseable.
+_INTERPRETER_FLAGS = frozenset("bBdEhiIOPqRsStuvVx?")
+_INTERPRETER_VALUE_OPTIONS = frozenset("cmWX")
+_INTERPRETER_LONG_FLAGS = frozenset(
+    ("--help", "--help-all", "--help-env", "--help-xoptions", "--version")
+)
+_INTERPRETER_LONG_VALUE_OPTION = "--check-hash-based-pycs"
 
-def _has_site_bypass_flag(argv: Any) -> bool:
-    """Return True if ``argv`` includes a Python flag that disables ``site.py``.
+# ``os.exec*`` hands the child an argv array on POSIX, but on Windows the C
+# runtime joins the elements into one command line (see _join_windows_argv).
+_WINDOWS = sys.platform == "win32"
 
-    Inspects interpreter flags appearing before any ``-c`` / ``-m`` terminator.
-    Only ``-S`` (or combined forms containing ``S`` like ``-IS``) actually
-    disables ``site.py``; ``-I`` and ``-E`` keep ``site.py`` enabled and so
-    are NOT bypass flags.  Returns False for non-list/tuple argvs and for
-    argvs that don't reach a bypass flag before the terminator.
+
+def _interpreter_flags(argv: Any) -> str | None:
+    """Return the single-letter flags that ``argv`` passes to the interpreter.
+
+    ``argv`` is the interpreter's argument vector, program name first: a
+    list or tuple (POSIX layout) or the lazily split tokens of a Windows
+    command line.  Options are read with the boundaries CPython's own
+    ``_PyOS_GetOpt`` uses, so a token counts only where the interpreter
+    treats it as an option: the value of ``-X`` / ``-W`` /
+    ``--check-hash-based-pycs`` is skipped, and parsing stops at ``-c`` /
+    ``-m`` (joined to their value or not), at ``--``, at ``-`` and at the
+    script path — everything after those belongs to the program.
+
+    Returns ``None`` when the options cannot be parsed: ``argv`` is not a
+    sequence of ``str`` / ``bytes`` / ``os.PathLike``, or it uses an option
+    the interpreter does not know.  Callers must not treat that as a normal
+    launch.
 
     POSIX ``subprocess.Popen`` accepts ``bytes`` and ``os.PathLike`` argv
-    elements (which CPython decodes at startup), so we run those through
+    elements (which CPython decodes at startup), so those go through
     ``os.fsdecode`` to match the char sequence the kernel will see —
-    otherwise an attacker could pass ``b"-S"`` to slip past a naive
-    ``isinstance(arg, str)`` check.
+    otherwise ``b"-S"`` would slip past an ``isinstance(arg, str)`` check.
     """
-    if not isinstance(argv, (list, tuple)):
-        return False
-    # argv[0] is the executable name; interpreter flags start at argv[1].
-    for arg in argv[1:]:
+    if isinstance(argv, (str, bytes)):
+        return None
+    try:
+        args = iter(argv)
+    except TypeError:
+        return None
+    next(args, None)  # argv[0] is the program name, never an option
+    flags = ""
+    for arg in args:
         if isinstance(arg, (bytes, os.PathLike)):
             try:
                 arg = os.fsdecode(arg)
             except (TypeError, ValueError):
-                continue
+                return None
         if not isinstance(arg, str):
+            return None
+        if arg in ("-", "--") or not arg.startswith("-"):
+            break  # stdin, the end-of-options marker, or the script path
+        if arg.startswith("--"):
+            if arg == _INTERPRETER_LONG_VALUE_OPTION:
+                next(args, None)  # its value
+            elif arg not in _INTERPRETER_LONG_FLAGS:
+                return None
             continue
-        if arg in ("-c", "-m"):
-            return False  # flags after -c/-m belong to user code, not interpreter
-        # Combined-flag forms like "-IS" are valid; check each char (skip "--long-form").
-        if (
-            arg.startswith("-")
-            and not arg.startswith("--")
-            and any(c in arg[1:] for c in _SITE_BYPASS_FLAG_CHARS)
-        ):
-            return True
-    return False
+        for end, char in enumerate(arg[1:], 2):
+            if char in _INTERPRETER_VALUE_OPTIONS:
+                if char in "cm":
+                    return flags  # the code / module, then the program's own args
+                if end == len(arg):
+                    next(args, None)  # the value is the whole next token
+                break
+            if char not in _INTERPRETER_FLAGS:
+                return None
+            flags += char
+    return flags
+
+
+def _has_site_bypass_flag(argv: Any) -> bool:
+    """Return True unless ``argv`` provably leaves ``site.py`` enabled.
+
+    True when the interpreter options in ``argv`` (program name first)
+    include ``-S`` — alone or in a cluster such as ``-IS`` — or cannot be
+    parsed at all.  ``-I`` and ``-E`` keep ``site.py`` enabled and so are
+    NOT bypass flags.  :func:`_interpreter_flags` decides what counts as an
+    interpreter option: ``-S`` after the script path, or as the value of
+    another option, is not one.
+    """
+    flags = _interpreter_flags(argv)
+    return flags is None or any(c in flags for c in _SITE_BYPASS_FLAG_CHARS)
 
 
 def _normalize_exe_path(value: Any) -> str | None:
@@ -1023,47 +1077,108 @@ def _normalize_exe_path(value: Any) -> str | None:
     return os.path.normcase(os.path.normpath(s))
 
 
-def _parse_windows_cmdline(cmdline: str) -> tuple[str, list[str]] | None:
-    """Best-effort parse of a Windows ``subprocess.Popen`` command-line string.
+def _iter_windows_argv(program: str, args: str) -> Iterator[str]:
+    """Yield ``program``, then ``args`` split the way the Microsoft C runtime does.
 
-    Returns ``(executable, argv)`` where ``argv`` is suitable for passing
-    to :func:`_has_site_bypass_flag`.  Returns ``None`` if the executable
-    can't be extracted.
-
-    The Windows command-line format the audit event sees is
-    ``<exe-quoted-or-bare> <args...>``.  We extract the executable, then
-    whitespace-split the remainder until the first ``-c`` / ``-m``
-    terminator and stop — the script body that follows ``-c`` may contain
-    embedded quotes and newlines that ``shlex`` rejects (and that we don't
-    need to parse anyway, since interpreter flags always come before the
-    terminator).  Interpreter flags like ``-S`` never contain spaces or
-    quotes, so plain whitespace splitting is sufficient for the
-    site-bypass check.
+    Follows ``parse_command_line`` in the UCRT, which builds the ``argv``
+    that ``python.exe`` receives: spaces and tabs separate arguments unless
+    quoted; a quote toggles quoting and is dropped; 2n backslashes before a
+    quote yield n backslashes and the quote toggles, 2n+1 yield n
+    backslashes and a literal quote; ``""`` inside quotes is one literal
+    quote; any other backslash is literal.  An unterminated quote runs to
+    the end of the line, so every string splits.
     """
-    s = cmdline.strip()
-    if not s:
-        return None
-    if s.startswith('"'):
-        close = s.find('"', 1)
-        if close == -1:
-            return None
-        exe = s[1:close]
-        rest = s[close + 1 :].lstrip()
-    else:
-        space = s.find(" ")
-        if space == -1:
-            exe = s
-            rest = ""
-        else:
-            exe = s[:space]
-            rest = s[space + 1 :].lstrip()
+    yield program
+    pos, end = 0, len(args)
+    while True:
+        while pos < end and args[pos] in " \t":
+            pos += 1
+        if pos == end:
+            return
+        arg: list[str] = []
+        quoted = False
+        while True:
+            start = pos
+            while pos < end and args[pos] == "\\":
+                pos += 1
+            slashes = pos - start
+            keep = True
+            if pos < end and args[pos] == '"':
+                if slashes % 2 == 0:
+                    if quoted and args[pos + 1 : pos + 2] == '"':
+                        pos += 1  # "" inside quotes: drop one, keep the other
+                    else:
+                        keep = False
+                        quoted = not quoted
+                slashes //= 2
+            arg.append("\\" * slashes)
+            if pos == end or (not quoted and args[pos] in " \t"):
+                break
+            if keep:
+                arg.append(args[pos])
+            pos += 1
+        yield "".join(arg)
 
-    pre_args: list[str] = []
-    for tok in rest.split():
-        if tok in ("-c", "-m"):
-            break
-        pre_args.append(tok)
-    return exe, [exe, *pre_args]
+
+def _parse_windows_cmdline(cmdline: str) -> tuple[str, Iterator[str]] | None:
+    """Split a Windows command line the way the launched process will.
+
+    Returns ``(program, argv)``: the program-name token, and a lazy iterator
+    over the whole argument vector (``program`` first) suitable for passing
+    to :func:`_has_site_bypass_flag`.  The arguments are split by
+    :func:`_iter_windows_argv` only as far as the caller consumes them, so a
+    long ``-c`` body full of quotes and newlines is never scanned.
+
+    Returns ``None`` unless the program name is written in a form that
+    everything reading the command line splits alike: ``"quoted"`` (no
+    backslash before the closing quote) or a bare token without quotes,
+    followed by a space or the end of the line.  ``CreateProcess``, the C
+    runtime and the venv launchers that re-issue the command line each have
+    their own rules for the first token; given a quote inside it, no space
+    after the closing quote, or a tab or newline as the separator, they
+    disagree about where the arguments begin, which can turn a script
+    argument into an interpreter option.  Such a line is not treated as a
+    Python launch whose options are known.
+    """
+    if cmdline.startswith('"'):
+        end = cmdline.find('"', 1)
+        if end == -1 or cmdline[end - 1] == "\\":
+            return None
+        program = cmdline[1:end]
+        end += 1
+    else:
+        end = 0
+        while end < len(cmdline) and cmdline[end] != '"' and not cmdline[end].isspace():
+            end += 1
+        program = cmdline[:end]
+        if not program:
+            return None
+    rest = cmdline[end:]
+    args = rest.lstrip(" \t")
+    if rest[:1] not in ("", " ") or args[:1].isspace():
+        return None
+    return program, _iter_windows_argv(program, args)
+
+
+def _join_windows_argv(argv: Any) -> str | None:
+    """Return the command line Windows builds from an ``os.spawn*`` / ``os.exec*`` argv.
+
+    The C runtime joins the elements with single spaces and does not quote
+    them, and the child splits the result again — so an element containing a
+    space or a quote does not arrive as one argument.  Returns ``None`` when
+    ``argv`` is not a list or tuple of ``str`` / ``bytes`` / ``os.PathLike``.
+    """
+    if not isinstance(argv, (list, tuple)):
+        return None
+    parts: list[str] = []
+    for arg in argv:
+        if not isinstance(arg, (str, bytes, os.PathLike)):
+            return None
+        try:
+            parts.append(os.fsdecode(arg))
+        except (TypeError, ValueError):
+            return None
+    return " ".join(parts)
 
 
 def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool:
@@ -1073,16 +1188,23 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
 
     1. The executable is exactly ``sys.executable`` (same Python interpreter,
        has tethered installed in its site-packages).
-    2. The argv doesn't include ``-S`` (which disables ``site.py`` and so
-       skips ``tethered.pth``).  ``-I`` and ``-E`` keep ``site.py`` enabled
-       and are NOT treated as bypass flags.
+    2. Its interpreter options don't include ``-S`` (which disables
+       ``site.py`` and so skips ``tethered.pth``) and can be parsed.  ``-I``
+       and ``-E`` keep ``site.py`` enabled and are NOT treated as bypass
+       flags.
 
     Handles both POSIX and Windows audit-event layouts.  On POSIX,
-    ``subprocess.Popen`` fires with ``(executable, argv_list, cwd, env)``.
-    On Windows, ``Popen`` builds a command line and fires with
-    ``(None, command_line_string, cwd, env)`` — we parse the command line
-    with :func:`_parse_windows_cmdline` to recover the executable and the
-    pre-terminator tokens for the flag check.
+    ``subprocess.Popen`` fires with ``(executable, argv_list, cwd, env)``
+    and the child receives ``argv_list`` as is; its ``argv[0]`` must name
+    ``sys.executable`` as well, because that is what tells the child which
+    installation or venv it is.
+
+    On Windows the child receives one command-line string and splits it
+    itself: ``Popen`` fires with ``(executable_or_None, command_line_string,
+    cwd, env)``, and ``os.spawn*`` / ``os.exec*`` fire with an argv list
+    that the C runtime then joins.  Either way the string is split with
+    :func:`_parse_windows_cmdline`; the launched image is ``executable``
+    when given, else the command line's first token.
 
     Used by ``_handle_subprocess`` to skip ``external_subprocess_policy``
     enforcement on launches that auto-inherit handles.  Returns False for
@@ -1097,14 +1219,28 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
     else:
         return False
 
-    # Windows ``subprocess.Popen``: executable=None, argv is the command-line
-    # string.  Parse it ourselves; ``shlex`` chokes on -c-script bodies with
-    # embedded quotes and newlines.
-    if executable is None and isinstance(argv, str):
+    # ``os.spawn`` is raised on Windows only; ``os.exec`` on every platform.
+    if event == "os.spawn" or (event == "os.exec" and _WINDOWS):
+        argv = _join_windows_argv(argv)
+
+    if isinstance(argv, str):
         parsed = _parse_windows_cmdline(argv)
         if parsed is None:
             return False
-        executable, argv = parsed
+        program, argv = parsed
+        if executable is None:
+            executable = program
+    elif (
+        not isinstance(argv, (list, tuple))
+        or not argv
+        or _normalize_exe_path(argv[0]) != _normalize_exe_path(sys.executable)
+    ):
+        # POSIX hands the child ``argv`` as is, and an interpreter works out
+        # which installation or venv it belongs to from argv[0], not from the
+        # file that was executed: started as "python" it looks that name up
+        # on PATH and can come up outside this venv, where no tethered.pth is
+        # processed.  (On Windows the executable itself decides.)
+        return False
 
     exe_norm = _normalize_exe_path(executable)
     if exe_norm is None:
