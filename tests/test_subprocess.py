@@ -4245,6 +4245,66 @@ class TestLaunchesThatBypassPopen:
             self._venv_spawn(cfg, env, monkeypatch)
         assert env == {"PATH": "C:\\Windows"}
 
+    # ── third-party copies of the Windows spawner (joblib's loky, billiard) ─
+
+    def _third_party_venv_spawn(self, cfg, child_env, monkeypatch):
+        """A pool library's own ``Popen.__init__``: same redirect, another module and local name."""
+        monkeypatch.setattr(sys, "_base_executable", self._OTHER, raising=False)
+        namespace = {
+            "__name__": "somepool.backend.popen_win32",
+            "handle": _handle_subprocess,
+            "cfg": cfg,
+            "args": self._winapi_args(self._OTHER),
+        }
+        exec(  # nosec B102 — controlled local source for the test fixture
+            "def __init__(child_env):\n"
+            "    handle(cfg, '_winapi.CreateProcess', args)\n"
+            "    return child_env\n",
+            namespace,
+        )
+        return namespace["__init__"](child_env)
+
+    def test_third_party_venv_spawn_is_a_launch_of_sys_executable(self, monkeypatch):
+        """Not external under ``block``, and the private env is completed in place."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        child_env = {"PATH": "C:\\Windows", "__PYVENV_LAUNCHER__": sys.executable}
+        result = self._third_party_venv_spawn(cfg, child_env, monkeypatch)
+        assert result is child_env
+        assert child_env[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        assert child_env["PATH"] == "C:\\Windows"
+
+    def test_locked_third_party_venv_spawn_with_a_stripped_env_is_refused(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        child_env = {"__PYVENV_LAUNCHER__": sys.executable}
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"_winapi\.CreateProcess\(.*env strips"
+        ):
+            self._third_party_venv_spawn(cfg, child_env, monkeypatch)
+        assert _CHILD_POLICY_ENV not in child_env
+
+    @pytest.mark.parametrize(
+        "child_env",
+        [
+            pytest.param({"PATH": "C:\\Windows"}, id="no-launcher-variable"),
+            pytest.param({"__PYVENV_LAUNCHER__": "C:\\elsewhere\\python.exe"}, id="other-venv"),
+            pytest.param(None, id="no-mapping"),
+        ],
+    )
+    def test_third_party_launch_of_the_base_interpreter_as_such_is_external(
+        self, child_env, monkeypatch
+    ):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        before = dict(child_env) if child_env is not None else None
+        with pytest.raises(tethered.SubprocessBlocked):
+            self._third_party_venv_spawn(cfg, child_env, monkeypatch)
+        assert child_env == before
+
+    def test_venv_launcher_env_lookup_gives_up_beyond_the_frame_cap(self, monkeypatch):
+        """Only this module's own frames are skipped, and only so many of them."""
+        monkeypatch.setattr(_core, "_FRAME_WALK_DEPTH_CAP", 0)
+        assert _core._find_venv_launcher_env() is None
+
     # ── _posixsubprocess.fork_exec (CPython 3.14+) ─────────────────────
 
     def test_fork_exec_of_python_inheriting_a_cleaned_environment_gets_it_repaired(

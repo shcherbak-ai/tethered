@@ -2063,22 +2063,59 @@ def _resolve_winapi_launch(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], dict
     Returns ``(popen_args, private_env)``.  ``private_env`` is that private
     copy when there is one: ``CreateProcess`` reads the mapping after the
     audit event, so completing it in place reaches the child (rebinding the
-    local would not — the argument is already passed).  For any other caller
-    the environment is unknown and the launch is treated as inheriting the
-    process environment.
+    local would not — the argument is already passed).  Third-party copies
+    of that spawner are recognized by the same redirect (see
+    :func:`_find_venv_launcher_env`).  For any other caller the environment
+    is unknown and the launch is treated as inheriting the process
+    environment.
     """
     executable, cmdline, cwd = (*args, None, None, None)[:3]
     env = None
+    launches_base = _same_path(executable, getattr(sys, "_base_executable", None))
     frame = _find_launch_frame("__init__", "multiprocessing.popen_spawn_win32")
     if frame is not None:
         env = frame.f_locals.get("env")
         if type(env) is not dict:
             env = None
-        elif _same_path(executable, getattr(sys, "_base_executable", None)) and _same_path(
-            env.get("__PYVENV_LAUNCHER__"), sys.executable
-        ):
-            executable = sys.executable
+    elif launches_base:
+        env = _find_venv_launcher_env()
+    if (
+        env is not None
+        and launches_base
+        and _same_path(env.get("__PYVENV_LAUNCHER__"), sys.executable)
+    ):
+        executable = sys.executable
     return (executable, cmdline, cwd, env), env
+
+
+def _find_venv_launcher_env() -> dict[Any, Any] | None:
+    """Find the environment a third-party copy of multiprocessing's spawner is passing.
+
+    Process-pool libraries such as joblib's loky and billiard carry their own
+    copy of ``multiprocessing.popen_spawn_win32``.  Inside a virtual
+    environment they do what it does: launch ``sys._base_executable`` with a
+    private environment in which ``__PYVENV_LAUNCHER__`` is ``sys.executable``
+    (bpo-35797).  The frame that called ``_winapi.CreateProcess`` holds that
+    mapping in a local whose name differs between libraries, so the mapping is
+    recognized by that entry rather than by name.
+
+    Returns the mapping, or ``None`` when the calling frame has no such local
+    — the launch is then one of the base interpreter as such.
+    """
+    f: Any = sys._getframe(1)
+    depth = 0
+    while f is not None and depth < _FRAME_WALK_DEPTH_CAP:
+        if f.f_globals.get("__name__") != __name__:
+            # The first frame outside this module is the one that made the call.
+            for value in f.f_locals.values():
+                if type(value) is dict and _same_path(
+                    value.get("__PYVENV_LAUNCHER__"), sys.executable
+                ):
+                    return value
+            return None
+        f = f.f_back
+        depth += 1
+    return None
 
 
 def _resolve_fork_exec_launch(args: tuple[Any, ...]) -> tuple[Any, ...]:
