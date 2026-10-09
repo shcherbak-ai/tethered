@@ -41,6 +41,7 @@ Entries marked **Breaking**, here and under Security, can break a configuration 
 - Inside a scope, a child launched with an explicit `env=` that is not a `dict` (`UserDict`, `MappingProxyType`) receives a copy of that mapping. Before, it received the parent's environment instead.
 - On Windows, log messages and `SubprocessBlocked.description` for an external launch name the program instead of `subprocess.Popen(None)`.
 - `_normalize_host` re-strips whitespace hidden behind a trailing dot (`"host\r."`).
+- `scope()` overlap warnings judge each rule the way the policy parses it. A scope rule identical to a rule of the global policy no longer draws "has no overlap with global policy" when it starts with or contains a character set (`[ab].example.com:443`), is an unbracketed IPv6 address whose last group is numeric (`2001:db8::1`, `::1`), or is a wildcard with a trailing dot. Also no longer reported as broader: a port-specific rule inside an any-port rule of the same pattern or of a containing network, a wildcard inside a `*`-suffix wildcard (`*.s3.amazonaws.com` under `*.amazonaws.com`), and `localhost` or a loopback address without a port when localhost is allowed. A hostname rule containing `/` is now reported like any other hostname rule; it used to be skipped.
 
 ### Security
 
