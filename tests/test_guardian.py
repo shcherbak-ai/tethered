@@ -1567,6 +1567,35 @@ class TestGuardianEventCoverage:
         bare_guardian.tamper()
         sys.audit(event, "tethered.pth", POLICY_VAR)
 
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14), reason="concurrent.interpreters arrived in Python 3.14"
+    )
+    def test_events_from_other_interpreters_are_left_alone(self, bare_guardian, capfd):
+        """A C audit hook is process-wide, but the guardian's objects belong to one interpreter.
+
+        Another interpreter has its own GIL and its own tethered instance
+        (via ``tethered.pth``).  The guardian must not verify — let alone
+        raise this interpreter's exception classes — on its behalf.
+        """
+        interpreters = pytest.importorskip("concurrent.interpreters")
+        other = interpreters.create()
+        try:
+            bare_guardian.tamper()
+            with pytest.raises(tethered.EgressBlocked):
+                sys.audit("socket.tethered_test_probe")
+            other.exec(
+                "import sys\n"
+                "sys.audit('socket.tethered_test_probe')\n"
+                "sys.audit('subprocess.Popen', 'prog', ['prog'], None, None)\n"
+                "sys.audit('open', 'site-packages/tethered.pth', 'w', 0)\n"
+                "sys.audit('os.putenv', '_TETHERED_CHILD_POLICY', 'x')\n"
+            )
+        finally:
+            other.close()
+        # ... while this interpreter's events are still refused.
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit("open", "site-packages/tethered.pth", "w", 0)
+
     def test_socket_events_still_raise_egress_blocked(self, bare_guardian, capfd):
         sys.audit("socket.tethered_test_probe")
         bare_guardian.tamper()

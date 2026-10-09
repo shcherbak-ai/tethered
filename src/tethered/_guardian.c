@@ -151,6 +151,21 @@ static const char      *expected_caller_names[EXPECTED_CALLER_COUNT] = {
 static THREAD_LOCAL int resolving_depth = 0;
 
 /*
+ * The interpreter that activated the guardian.
+ *
+ * A C audit hook is process-wide: it also runs for events raised in other
+ * interpreters.  Those have their own modules, since 3.12 possibly their
+ * own GIL, and — through tethered.pth — their own tethered instance.  All
+ * of the guardian's state consists of objects of one interpreter, which
+ * must not be read, called or raised from another, so the hook leaves
+ * other interpreters' events alone.
+ *
+ * Written before guardian_active is set, and read by the hook only after
+ * it has seen guardian_active set.
+ */
+static PyInterpreterState *guardian_interp = NULL;
+
+/*
  * The live snapshot.  A static array that is never freed: a verification
  * that is interrupted by a re-activation or deactivation (only possible if
  * a lookup runs Python code — see verify_integrity) keeps reading valid
@@ -627,6 +642,11 @@ guardian_hook(const char *event, PyObject *args, void *userData)
     (void)userData;
 
     if (!ATOMIC_LOAD(guardian_active))
+        return 0;
+
+    /* Not this guardian's interpreter: none of its objects may be touched
+     * from here (see guardian_interp). */
+    if (PyInterpreterState_Get() != guardian_interp)
         return 0;
 
     int kind = classify_event(event);
@@ -1146,6 +1166,7 @@ py_activate(PyObject *self, PyObject *args)
     install_snapshot(staging, staging_count);
     staging = NULL; /* owned by the live snapshot now */
     swap_holdings(&next);
+    guardian_interp = PyInterpreterState_Get();
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
 
