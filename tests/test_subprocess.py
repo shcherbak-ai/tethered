@@ -2410,8 +2410,12 @@ class TestScopeSubprocessPropagation:
                 _core._scopes.get(),
             )
 
-    def test_handle_subprocess_no_frame_unlocked_warns_and_proceeds(self, monkeypatch, caplog):
-        """When the _execute_child frame is unfindable without locked mode, warn and proceed."""
+    def test_handle_subprocess_no_frame_unlocked_is_treated_as_external(self, monkeypatch, caplog):
+        """Without the _execute_child frame the scope cannot reach the child: external launch.
+
+        Outside locked mode the launch is not silently trusted — it gets
+        ``external_subprocess_policy`` (the default ``warn`` lets it proceed).
+        """
         monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: None)
         tethered.activate(allow=["*.allowed.com"])
         with (
@@ -2424,7 +2428,9 @@ class TestScopeSubprocessPropagation:
                 (sys.executable, [sys.executable], None, None),
                 _core._scopes.get(),
             )
-        assert any("scope subprocess propagation unavailable" in r.message for r in caplog.records)
+        messages = [r.message for r in caplog.records]
+        assert any("could not establish the policy environment" in m for m in messages)
+        assert any("external subprocess launch detected" in m for m in messages)
 
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     def test_handle_subprocess_inject_failure_locked_fails_closed(self, monkeypatch):
@@ -3577,3 +3583,415 @@ class TestOnePolicyKey:
             subprocess.run(  # nosec B603
                 [sys.executable, "-c", "print('ran')"], env=env, capture_output=True, timeout=30
             )
+
+
+# Exits 0 when the tethered.pth bootstrap activated a policy in the child.
+_EXIT_PROBE = (
+    "import sys; core = sys.modules.get('tethered._core'); "
+    "sys.exit(0 if core and core._config else 3)"
+)
+
+
+def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("the _execute_child frame must not be touched on this path")
+
+
+def _spawn_argv(code: str) -> list[str]:
+    """argv for ``os.spawn*`` / ``os.posix_spawn`` (Windows ``os.spawn*`` does not quote)."""
+    argv = [sys.executable, "-c", code]
+    if sys.platform == "win32":
+        return [subprocess.list2cmdline([arg]) for arg in argv]
+    return argv
+
+
+def _whitelist_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delete every variable not on a keep-list, as applications do at startup."""
+    keep = set(_minimal_child_env())
+    for name in list(os.environ):
+        if name not in keep:
+            monkeypatch.delenv(name)
+
+
+class TestLaunchEnvEstablished:
+    """A Python child gets the policy payload put into its launch environment.
+
+    A launch of ``sys.executable`` used to count as auto-inheriting from the
+    executable and arguments alone.  Whether the child's environment carried
+    ``_TETHERED_CHILD_POLICY`` was not considered outside locked mode, so a
+    sanitized ``env=`` — or a cleaned-up ``os.environ`` — gave a child with
+    no policy, no warning and no block.
+    """
+
+    _SCOPE = _ScopeConfig(policy=AllowPolicy(["api.example.com"]), label="established")
+    _ROUTES = (("os.exec", ()), ("os.posix_spawn", ()), ("os.spawn", (0,)))
+
+    @staticmethod
+    def _handle_in_frame(cfg, env, scope_stack=()):
+        """Handle a ``subprocess.Popen`` launch of ``sys.executable`` from ``_execute_child``."""
+        args = _popen_args(env)
+        return _call_in_execute_child(
+            lambda: _handle_subprocess(cfg, "subprocess.Popen", args, scope_stack), env
+        )
+
+    # ── explicit env= ──────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_explicit_env_without_the_payload_gets_a_constructed_copy(self, kind):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        env_arg = _as_mapping(kind, {"PATH": "/usr/bin"})
+        injected = self._handle_in_frame(cfg, env_arg)
+        assert injected == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        assert dict(env_arg) == {"PATH": "/usr/bin"}
+
+    @pytest.mark.parametrize("stale", [_PERMISSIVE_PAYLOAD, "{not json", "", '{"global": null}'])
+    def test_explicit_env_with_another_payload_gets_the_right_one(self, stale):
+        cfg = _launch_cfg()
+        env_arg = {"PATH": "/usr/bin", _CHILD_POLICY_ENV: stale}
+        injected = self._handle_in_frame(cfg, env_arg)
+        assert injected[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        assert env_arg[_CHILD_POLICY_ENV] == stale
+
+    def test_explicit_env_carrying_the_right_payload_is_left_alone(self):
+        cfg = _launch_cfg()
+        env_arg = {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        assert self._handle_in_frame(cfg, env_arg) is env_arg
+
+    def test_scope_is_added_to_an_env_carrying_the_at_rest_payload(self):
+        cfg = _launch_cfg()
+        env_arg = {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        injected = self._handle_in_frame(cfg, env_arg, (self._SCOPE,))
+        assert injected is not env_arg
+        payload = json.loads(injected[_CHILD_POLICY_ENV])
+        assert payload["global"] == json.loads(_core._canonical_payload(cfg))["global"]
+        assert [s["label"] for s in payload["scopes"]] == ["established"]
+
+    def test_explicit_env_carrying_the_scoped_payload_is_left_alone(self):
+        cfg = _launch_cfg()
+        env_arg = {_CHILD_POLICY_ENV: _core._launch_payload(cfg, (self._SCOPE,))}
+        assert self._handle_in_frame(cfg, env_arg, (self._SCOPE,)) is env_arg
+
+    # ── inherited environment ──────────────────────────────────────────
+
+    def test_inherited_env_with_the_right_payload_needs_no_frame(self, monkeypatch):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(None))
+
+    @pytest.mark.parametrize("left_behind", [None, _PERMISSIVE_PAYLOAD, "{not json"])
+    def test_inherited_env_is_repaired_in_os_environ(self, left_behind, monkeypatch):
+        """A cleaned-up ``os.environ`` gets the payload back; no frame mutation is needed."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        if left_behind is None:
+            monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        else:
+            monkeypatch.setenv(_CHILD_POLICY_ENV, left_behind)
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(None))
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    def test_inherited_env_with_scope_gets_a_copy_of_os_environ(self, monkeypatch):
+        cfg = _launch_cfg()
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        monkeypatch.setenv("TETHERED_SENTINEL", "from-environ")
+        injected = self._handle_in_frame(cfg, None, (self._SCOPE,))
+        assert injected["TETHERED_SENTINEL"] == "from-environ"
+        assert json.loads(injected[_CHILD_POLICY_ENV])["scopes"][0]["label"] == "established"
+        # The process environment keeps the at-rest payload: scopes are per launch.
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    # ── when the frame cannot be written ───────────────────────────────
+
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    def test_launch_that_cannot_be_injected_is_external(self, policy, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: None)
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        args = _popen_args({"PATH": "/usr/bin"})
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(
+                    tethered.SubprocessBlocked, match=r"could not be given the launch-site policy"
+                ):
+                    _handle_subprocess(cfg, "subprocess.Popen", args)
+            else:
+                _handle_subprocess(cfg, "subprocess.Popen", args)
+        messages = [r.message for r in caplog.records]
+        assert any("could not locate subprocess._execute_child frame" in m for m in messages)
+        assert any("external subprocess launch detected" in m for m in messages) is (
+            policy == "warn"
+        )
+
+    def test_failed_frame_write_is_external_too(self, monkeypatch):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: object())
+        monkeypatch.setattr(_core, "_inject_scope_env", lambda frame, env: False)
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            _handle_subprocess(cfg, "subprocess.Popen", _popen_args({"PATH": "/usr/bin"}))
+
+    def test_locked_rewrites_another_serialization_of_the_canonical_global(self):
+        cfg = _launch_cfg(locked=True)
+        canonical = _core._canonical_payload(cfg)
+        reformatted = json.dumps(json.loads(canonical), indent=1)
+        injected = self._handle_in_frame(cfg, {_CHILD_POLICY_ENV: reformatted})
+        assert injected[_CHILD_POLICY_ENV] == canonical
+
+    def test_locked_fails_closed_when_the_rewrite_is_impossible(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        reformatted = json.dumps(json.loads(_core._canonical_payload(cfg)), indent=1)
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: None)
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"could not locate subprocess\._execute_child frame"
+        ):
+            _handle_subprocess(
+                cfg, "subprocess.Popen", _popen_args({_CHILD_POLICY_ENV: reformatted})
+            )
+
+    # ── launch routes with no frame to write to ────────────────────────
+
+    @pytest.mark.parametrize(("event", "prefix"), _ROUTES)
+    def test_route_without_a_frame_inherits_a_repaired_environment(
+        self, event, prefix, monkeypatch
+    ):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        _handle_subprocess(cfg, event, (*prefix, sys.executable, [sys.executable], None))
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    @pytest.mark.parametrize(("event", "prefix"), _ROUTES)
+    def test_route_without_a_frame_accepts_an_env_carrying_the_payload(self, event, prefix):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        for payload in (_core._canonical_payload(cfg), _core._launch_payload(cfg, (self._SCOPE,))):
+            env = {_CHILD_POLICY_ENV: payload}
+            _handle_subprocess(cfg, event, (*prefix, sys.executable, [sys.executable], env))
+
+    @pytest.mark.parametrize(("event", "prefix"), _ROUTES)
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    def test_route_without_a_frame_and_without_the_payload_is_external(
+        self, event, prefix, policy, caplog
+    ):
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        args = (*prefix, sys.executable, [sys.executable], {"PATH": "/usr/bin"})
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(tethered.SubprocessBlocked, match=r"cannot be rewritten"):
+                    _handle_subprocess(cfg, event, args)
+            else:
+                _handle_subprocess(cfg, event, args)
+        assert any("external subprocess launch" in r.message for r in caplog.records) is (
+            policy != "allow"
+        )
+
+    @pytest.mark.parametrize(("event", "prefix"), _ROUTES)
+    def test_locked_route_without_a_frame_keeps_refusing(self, event, prefix, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"os\.environ strips"):
+            _handle_subprocess(cfg, event, (*prefix, sys.executable, [sys.executable], None))
+        assert _CHILD_POLICY_ENV not in os.environ
+
+    def test_scope_does_not_make_a_route_without_a_frame_external(self, monkeypatch):
+        """Documented limit: the child gets the at-rest global, the scope does not travel."""
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        _handle_subprocess(cfg, "os.exec", (sys.executable, [sys.executable], None), (self._SCOPE,))
+
+    # ── external launches ──────────────────────────────────────────────
+
+    def test_external_launch_is_not_given_a_constructed_env(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        cfg = _launch_cfg(external_subprocess_policy="warn")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _handle_subprocess(
+                cfg, "subprocess.Popen", _popen_args({"PATH": "/usr/bin"}, "/bin/sh")
+            )
+        assert any("external subprocess launch detected" in r.message for r in caplog.records)
+
+    def test_external_inheriting_launch_gets_a_repaired_environment_too(self, monkeypatch):
+        """Whatever it starts later inherits the payload."""
+        cfg = _launch_cfg(external_subprocess_policy="allow")
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        _handle_subprocess(cfg, "os.system", ("echo hi",))
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    # ── scope() without activate() ─────────────────────────────────────
+
+    def test_scope_only_injects_a_payload_without_a_global(self):
+        env_arg = {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _PERMISSIVE_PAYLOAD}
+        injected = self._handle_in_frame(None, env_arg, (self._SCOPE,))
+        payload = json.loads(injected[_CHILD_POLICY_ENV])
+        assert payload["global"] is None
+        assert [s["label"] for s in payload["scopes"]] == ["established"]
+        assert injected["PATH"] == "/usr/bin"
+
+    def test_scope_only_warns_when_the_frame_is_missing(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: None)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _handle_subprocess(None, "subprocess.Popen", _popen_args(None), (self._SCOPE,))
+        assert any("scope subprocess propagation unavailable" in r.message for r in caplog.records)
+
+    def test_scope_only_leaves_other_launches_alone(self, monkeypatch):
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        _handle_subprocess(None, "subprocess.Popen", _popen_args(None, "/bin/sh"), (self._SCOPE,))
+        _handle_subprocess(
+            None, "os.exec", (sys.executable, [sys.executable], None), (self._SCOPE,)
+        )
+        _handle_subprocess(None, "subprocess.Popen", _popen_args(None), ())
+        assert _CHILD_POLICY_ENV not in os.environ
+
+    # ── real children ──────────────────────────────────────────────────
+
+    def test_children_of_the_report_reproduction_are_all_protected(self):
+        """Inherited / sanitized ``env=`` / the same inside a scope — under ``block``."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        minimal = _minimal_child_env()
+        assert _launch_probe()["active"] is True
+        assert _launch_probe(env=minimal)["active"] is True
+        with tethered.scope(allow=[]):
+            scoped = _launch_probe(env=minimal)
+        assert scoped["active"] is True
+        assert scoped["scopes"] == 1
+        assert _CHILD_POLICY_ENV not in minimal
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_child_with_a_sanitized_env_of_any_type_is_protected(self, kind):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        state = _launch_probe(env=_as_mapping(kind, _minimal_child_env()))
+        assert state["active"] is True
+        assert state["allow"] == ["*.example.com"]
+        assert state["scopes"] == 0
+
+    def test_child_with_a_copied_environment_is_protected(self):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        assert _launch_probe(env=dict(os.environ))["allow"] == ["*.example.com"]
+
+    def test_child_with_a_stale_payload_gets_the_parents_policy(self):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        env = {**_minimal_child_env(), _CHILD_POLICY_ENV: _PERMISSIVE_PAYLOAD}
+        assert _launch_probe(env=env)["allow"] == ["*.example.com"]
+
+    def test_child_is_protected_after_a_whitelist_cleanup_of_os_environ(self, monkeypatch):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        _whitelist_cleanup(monkeypatch)
+        assert _CHILD_POLICY_ENV not in os.environ
+        assert _launch_probe()["allow"] == ["*.example.com"]
+        with tethered.scope(allow=["api.example.com"]):
+            assert _launch_probe()["scopes"] == 1
+
+    def test_sanitized_env_is_silent_under_the_default_policy(self, caplog):
+        """Nothing is external about the launch once the payload is in place."""
+        tethered.activate(allow=["*.example.com"])
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _launch_probe(env=_minimal_child_env())["active"] is True
+        assert not [r.message for r in caplog.records if " launch" in r.message]
+
+    @pytest.mark.parametrize("api", ["run", "Popen", "check_output"])
+    def test_each_subprocess_api_establishes_the_payload(self, api):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        argv = [sys.executable, "-c", _CHILD_STATE_PROBE]
+        env = _minimal_child_env()
+        if api == "run":
+            out = subprocess.run(  # nosec B603
+                argv, env=env, capture_output=True, text=True, timeout=30
+            ).stdout
+        elif api == "Popen":
+            with subprocess.Popen(  # nosec B603
+                argv, env=env, stdout=subprocess.PIPE, text=True
+            ) as proc:
+                out, _ = proc.communicate(timeout=30)
+        else:
+            out = subprocess.check_output(argv, env=env, text=True, timeout=30)  # nosec B603
+        assert json.loads(out)["active"] is True
+
+    async def test_asyncio_subprocess_with_a_sanitized_env_is_protected(self):
+        tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _CHILD_STATE_PROBE,
+            env=_minimal_child_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        assert json.loads(stdout)["active"] is True, stderr
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="os.spawn* raises os.spawn on Windows only")
+    def test_os_spawnv_child_is_protected_after_a_whitelist_cleanup(self, monkeypatch):
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        _whitelist_cleanup(monkeypatch)
+        assert os.spawnv(os.P_WAIT, sys.executable, _spawn_argv(_EXIT_PROBE)) == 0  # nosec B606
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="os.spawn* raises os.spawn on Windows only")
+    def test_os_spawnve_with_a_sanitized_env_is_external(self):
+        """No frame to write to: the launch is refused under ``block`` instead of trusted.
+
+        Only the refusal is exercised for real.  A successful ``os.spawnve``
+        with an explicit environment crashes the interpreter intermittently
+        on Windows (access violation in the C runtime, with or without
+        tethered); the accepted case is covered at handler level.
+        """
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        argv = _spawn_argv(_EXIT_PROBE)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"cannot be rewritten"):
+            os.spawnve(os.P_WAIT, sys.executable, argv, _minimal_child_env())  # nosec B606
+
+    @pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="os.posix_spawn is POSIX-only")
+    def test_os_posix_spawn_with_a_sanitized_env_is_external(self):
+        """No frame to write to: the launch is refused under ``block`` instead of trusted."""
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        argv = _spawn_argv(_EXIT_PROBE)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"cannot be rewritten"):
+            os.posix_spawn(sys.executable, argv, _minimal_child_env())  # nosec B606
+        pid = os.posix_spawn(sys.executable, argv, dict(os.environ))  # nosec B606
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+
+
+def _mean_microseconds(fn, iterations: int = 500) -> float:
+    """Per-call mean wall time of ``fn`` in microseconds, after a warm-up."""
+    for _ in range(50):
+        fn()
+    start = time.perf_counter()
+    for _ in range(iterations):
+        fn()
+    return (time.perf_counter() - start) / iterations * 1_000_000
+
+
+class TestLaunchEnvPerformance:
+    """Bounds on the per-launch cost of establishing the environment.
+
+    Same spirit as ``TestScopeSubprocessPerformance``: ceilings ~100x the
+    expected value, so they trip on structural regressions and not on slow CI.
+    """
+
+    def test_common_case_is_cheap_and_free_of_frame_mutation(self, monkeypatch):
+        """Inherited environment that already carries the right payload, no scope."""
+        tethered.activate(allow=["*.example.com"])
+        cfg = _core._config
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        monkeypatch.setattr(_core, "_inject_scope_env", _fail_if_called)
+        args = _popen_args(None)
+
+        per_us = _mean_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
+        # Expected: ~20µs, dominated by classifying the executable; ceiling 2ms.
+        assert per_us < 2000, f"common-case launch handling took {per_us:.2f}µs / call"
+
+    def test_explicit_env_carrying_the_payload_is_bounded(self, monkeypatch):
+        """One read of the mapping, no copy handed to the child, no frame mutation."""
+        tethered.activate(allow=["*.example.com"])
+        cfg = _core._config
+        monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
+        args = _popen_args({f"VAR_{i}": "x" * 40 for i in range(100)} | dict(os.environ))
+
+        per_us = _mean_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
+        # Expected: ~50µs for a ~200-variable environment; ceiling 5ms.
+        assert per_us < 5000, f"explicit-env launch handling took {per_us:.2f}µs / call"
+
+    def test_env_change_events_for_other_variables_are_near_free(self):
+        """Every ``os.environ`` assignment in the process pays this."""
+        tethered.activate(allow=["*.example.com"])
+
+        per_us = _mean_microseconds(lambda: _audit_hook("os.putenv", ("PATH", "/usr/bin")), 2000)
+        # Expected: ~0.5µs; ceiling 100µs.
+        assert per_us < 100, f"os.putenv audit dispatch took {per_us:.2f}µs / call"

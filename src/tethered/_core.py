@@ -1765,7 +1765,7 @@ def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
     Returns ``True`` on success.  Returns ``False`` and logs a warning on
     any failure (ctypes unavailable in sandboxed CPython, write-protected
     frame, etc.) — caller decides whether that is fail-closed (locked mode)
-    or warn-and-degrade.
+    or treat-as-external.
     """
     try:
         frame.f_locals["env"] = new_env
@@ -2014,7 +2014,7 @@ def _handle_subprocess(
     args: tuple[Any, ...],
     scope_stack: tuple[_ScopeConfig, ...] = (),
 ) -> None:
-    """Enforce subprocess launch policy.
+    """Enforce subprocess launch policy and establish the child's policy payload.
 
     ``cfg`` is ``None`` when only scopes are active (no :func:`activate` ever
     called) — the audit hook still fires so scope policy can propagate to
@@ -2022,79 +2022,15 @@ def _handle_subprocess(
     once by ``_audit_hook`` and passed in to keep the per-event ContextVar
     reads consistent.
     """
-    # Locked-mode payload-integrity enforcement.  Verify that the policy the
-    # child will see has a 'global' field equal — type-exactly — to the one
-    # in the parent's canonical payload (the immutable ``_serialized_payload``;
-    # the mutable ``_global_payload_dict`` is not trusted).  Two source paths:
-    #   1. Explicit env — read once through the mapping interface, whatever
-    #      its type (dict, UserDict, MappingProxyType, os.environ ...), so
-    #      the check sees what the launch API will read.
-    #   2. Inherited env (None, or no env argument) — the child gets the
-    #      native process environment.  ``os.environ`` shows Python-level
-    #      mutation (os.environ.pop / __setitem__ / __delitem__), and
-    #      ``_env_dirty`` covers os.putenv() / os.unsetenv(), which bypass
-    #      it.  Changes made below Python (ctypes → libc setenv / unsetenv)
-    #      raise no audit event and are NOT caught.
-    # Refuse on absence ("strip"), corruption ("not valid JSON"), or
-    # differing 'global' field ("substitution").  Substituted scopes are
-    # allowed: scopes can only narrow within the checked global ceiling, so
-    # they can't widen child enforcement past the parent.  The comparison
-    # never raises, so no stray exception escapes the audit hook in place of
-    # ``SubprocessBlocked``.  Locked mode requires activate(), so cfg is
-    # non-None here.
-    #
-    # Outside locked mode nothing is refused, but a native change that
-    # os.environ cannot show is undone: the payload is re-asserted before
-    # the child inherits the environment.
-    if cfg is not None:
-        _has_env, env_value = _extract_subprocess_env(event, args)
-        payload = _canonical_payload(cfg)
-        if env_value is None:
-            if cfg.locked:
-                state = _process_env_state(payload)
-                if state not in ("exact", "same-global"):
-                    _refuse_launch(
-                        event, _describe_subprocess_launch(event, args), "os.environ", state
-                    )
-            elif _env_dirty:
-                _propagate_policy_to_env(cfg)
-        elif cfg.locked:
-            pairs = _snapshot_env(env_value)
-            state = "unreadable" if pairs is None else _launch_env_state(pairs, payload, payload)
-            if state not in ("exact", "same-global"):
-                _refuse_launch(event, _describe_subprocess_launch(event, args), "env", state)
-
-    # Auto-inheriting Python child launches are covered by tethered.pth →
-    # _autoactivate.  For those launches:
-    #   - Inject a per-launch env via frame mutation when scopes are active,
-    #     so the child observes the parent's effective policy at the launch
-    #     site (global + scopes) rather than just the at-rest global.
-    #   - Skip external_subprocess_policy (it's for launches auto-inherit
-    #     can't reach: non-Python children, different interpreters, or
-    #     ``-S``-flag launches that disable ``site.py``).
-    if _is_auto_inheriting_python_launch(event, args):
-        if scope_stack:
-            failure = _inject_launch_env(event, args, scope_stack, cfg)
+    popen = event == "subprocess.Popen"
+    if cfg is None:
+        # scope() without activate(): no global payload and no
+        # external_subprocess_policy.  The scope chain reaches a Python
+        # child through the ``_execute_child`` frame; no other route has an
+        # env channel tethered can write to.
+        if scope_stack and popen and _is_auto_inheriting_python_launch(event, args):
+            failure = _inject_launch_env(event, args, scope_stack, None)
             if failure is not None:
-                # The per-launch environment could not be put in place: no
-                # subprocess._execute_child frame in the stack (a debugger
-                # wrapper, a future CPython refactor, a platform without the
-                # standard implementation), an ``env=`` that cannot be read
-                # as a mapping, or a failed frame write.  Locked mode fails
-                # closed (better safe than silent).  Otherwise warn and let
-                # the launch proceed with whatever its environment carries.
-                if cfg is not None and cfg.locked:
-                    desc = _describe_subprocess_launch(event, args)
-                    logger.warning(
-                        "tethered: blocked subprocess launch in locked mode — %s: %s",
-                        failure,
-                        desc,
-                    )
-                    raise SubprocessBlocked(
-                        event,
-                        f"{desc} — {failure}; scope subprocess propagation "
-                        "unavailable and locked mode requires fail-closed behavior",
-                    )
                 logger.warning(
                     "tethered: scope subprocess propagation unavailable (%s); "
                     "the child will not inherit the active scope",
@@ -2102,19 +2038,108 @@ def _handle_subprocess(
                 )
         return
 
-    # Non-auto-inheriting launch (os.system, external executable, Python
-    # with ``-S``).  Scope cannot propagate through these paths
-    # (no env channel to inject into), but external_subprocess_policy still
-    # applies when a global config is present.  Scope-only without global:
-    # nothing to enforce here, return silently.
-    if cfg is None:
-        return
+    # Auto-inheriting Python child launches are covered by tethered.pth →
+    # _autoactivate — provided their environment carries the payload, which
+    # is what the rest of this function establishes.
+    is_python = _is_auto_inheriting_python_launch(event, args)
+    _has_env, env_value = _extract_subprocess_env(event, args)
 
+    # ── The environment the child will actually receive ────────────────
+    # ``payload`` (from the immutable ``_serialized_payload``) is the only
+    # reference; the mutable ``_global_payload_dict`` is not trusted.
+    #
+    #   - Inherited (``env`` is None, or the route has no env argument): the
+    #     child gets the native process environment.  ``os.environ`` shows
+    #     Python-level mutation (os.environ.pop / __setitem__ / __delitem__)
+    #     and ``_env_dirty`` covers os.putenv() / os.unsetenv(), which bypass
+    #     it.  Changes made below Python (ctypes → libc setenv / unsetenv)
+    #     raise no audit event and are NOT caught.  Locked mode refuses;
+    #     otherwise the payload is re-asserted, which also repairs an
+    #     ordinary whitelist cleanup of ``os.environ``.
+    #   - Explicit: read once through the mapping interface, whatever the
+    #     type (dict, UserDict, MappingProxyType, os.environ ...), so the
+    #     check sees what the launch API will read.  Locked mode refuses
+    #     absence ("strip"), corruption ("not valid JSON"), a differing
+    #     'global' ("substitution") and more than one spelling of the key.
+    #     A differing scope list is not refused: scopes can only narrow
+    #     within the checked global ceiling, so they can't widen child
+    #     enforcement past the parent.
+    #
+    # The comparison never raises, so no stray exception escapes the audit
+    # hook in place of ``SubprocessBlocked``.  Locked mode requires
+    # activate(), so cfg is non-None here.
+    payload = _canonical_payload(cfg)
+    acceptable = True  # the environment carries the canonical global, once
+    needs_rewrite = False  # ... but not exactly what this launch must carry
+    if env_value is None:
+        state = _process_env_state(payload)
+        if state != "exact":
+            if not cfg.locked:
+                _propagate_policy_to_env(cfg)
+            elif state != "same-global":
+                _refuse_launch(event, _describe_subprocess_launch(event, args), "os.environ", state)
+        # Scopes never live in os.environ; they need the per-launch copy.
+        needs_rewrite = popen and bool(scope_stack)
+    elif cfg.locked or is_python:
+        expected = _launch_payload(cfg, scope_stack) if popen else payload
+        pairs = _snapshot_env(env_value)
+        state = "unreadable" if pairs is None else _launch_env_state(pairs, expected, payload)
+        acceptable = state in ("exact", "same-global")
+        if cfg.locked and not acceptable:
+            _refuse_launch(event, _describe_subprocess_launch(event, args), "env", state)
+        needs_rewrite = state != "exact"
+
+    # ── Python children: make the environment right ────────────────────
+    # They skip external_subprocess_policy (it is for launches auto-inherit
+    # can't reach: non-Python children, different interpreters, ``-S``) —
+    # unless the payload cannot be put in place, which makes the launch one
+    # auto-inherit can't reach.
+    reason = ""
+    if is_python:
+        if popen:
+            if not needs_rewrite:
+                return  # common case: nothing to change, no frame mutation
+            failure = _inject_launch_env(event, args, scope_stack, cfg)
+            if failure is None:
+                return
+            # No subprocess._execute_child frame in the stack (a debugger
+            # wrapper, a future CPython refactor, a platform without the
+            # standard implementation), an ``env=`` that cannot be read as a
+            # mapping, or a failed frame write.  Locked mode fails closed
+            # (better safe than silent); otherwise the launch is no longer
+            # one tethered can vouch for.
+            desc = _describe_subprocess_launch(event, args)
+            if cfg.locked:
+                logger.warning(
+                    "tethered: blocked subprocess launch in locked mode — %s: %s", failure, desc
+                )
+                raise SubprocessBlocked(
+                    event,
+                    f"{desc} — {failure}; the child's policy environment could not "
+                    "be established and locked mode requires fail-closed behavior",
+                )
+            logger.warning(
+                "tethered: could not establish the policy environment of %s (%s); "
+                "treating the launch as external",
+                desc,
+                failure,
+            )
+            reason = " — its environment could not be given the launch-site policy"
+        elif acceptable:
+            # No env channel to write to on this route.  The child gets the
+            # at-rest global; an active scope does not travel (documented).
+            return
+        else:
+            reason = f" — its environment lacks {_CHILD_POLICY_ENV} and cannot be rewritten"
+
+    # ── External launches ──────────────────────────────────────────────
+    # os.system, an external executable, Python with ``-S``, or a Python
+    # child that cannot be given the policy.
     sp = cfg.external_subprocess_policy
     if sp == "allow":
         return
 
-    desc = _describe_subprocess_launch(event, args)
+    desc = _describe_subprocess_launch(event, args) + reason
 
     if sp == "warn":
         logger.warning("tethered: external subprocess launch detected: %s", desc)

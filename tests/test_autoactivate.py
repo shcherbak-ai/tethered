@@ -325,10 +325,11 @@ class TestAutoactivateIntegration:
         assert result.returncode == 0, result.stderr.decode()
         assert b"locked" in result.stdout
 
-    def test_env_strip_in_non_locked_mode_no_inheritance(self):
-        """env={} in non-locked mode succeeds but the child has no policy."""
+    def test_env_strip_in_non_locked_mode_still_inherits(self):
+        """A sanitized env= in non-locked mode succeeds and the child still gets the policy."""
         tethered.activate(allow=["*.example.com"])
-        # Stripping env loses the propagation var; child runs uncontrolled (documented gap).
+        # The caller's env lacks the propagation var; tethered puts it into the
+        # environment the child receives (the caller's dict is left alone).
         # Pass a minimal env so Python can still find its standard library on Windows.
         minimal_env = {
             k: v
@@ -346,7 +347,8 @@ class TestAutoactivateIntegration:
             env=minimal_env,
         )
         assert result.returncode == 0, result.stderr.decode()
-        assert b"inactive" in result.stdout
+        assert result.stdout.strip() == b"active"
+        assert _CHILD_POLICY_ENV not in minimal_env
 
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     def test_env_strip_in_locked_mode_blocked(self):
