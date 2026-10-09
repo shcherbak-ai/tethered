@@ -18,6 +18,7 @@ import site
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import types
 import unittest.mock
@@ -2350,6 +2351,217 @@ class TestResolverWindow:
         assert _core._c_guardian.is_active() is False
         with pytest.raises(RuntimeError, match="active guardian"):
             _core._c_guardian.resolve("localhost", 80, 0, 0, 0, 0)
+
+
+# ── The guardian's own audit hook can be refused by another hook ───
+
+# An audit hook cannot be removed, so a hook that vetoes others is only ever
+# installed in a child process.  This runs first in each child.
+_VETOING_HOOK_PRELUDE = '''
+import json, os, sys
+
+import tethered
+import tethered._core as core
+
+guardian = core._c_guardian
+PROBE = "tethered._guardian.probe"
+VARIABLE = "_TETHERED_CHILD_POLICY"
+
+# tethered's Python hook goes in first, so that only the guardian's C hook
+# meets the veto.
+core._install_hook()
+
+seen = []  # the two events of interest, in the order they were raised
+veto = {}  # event -> exception class the hook below answers it with
+
+def vetoing_hook(event, args):
+    if event in ("sys.addaudithook", PROBE):
+        seen.append(event)
+        if event in veto:
+            raise veto[event]("vetoed by another hook")
+
+sys.addaudithook(vetoing_hook)
+
+def lock(token):
+    """Try to lock a policy: "locked", or the exception that came out."""
+    del seen[:]
+    try:
+        tethered.activate(allow=["allowed.test"], locked=True, lock_token=token)
+    except Exception as exc:
+        return [type(exc).__name__, str(exc)]
+    return "locked"
+
+def state():
+    config = None if core._config is None else "set"
+    return [config, guardian.is_active(), os.environ.get(VARIABLE)]
+
+def enforced():
+    """Is the guardian's C hook acting?  Only it answers a tampered policy."""
+    held = core._config
+    core._config = None
+    try:
+        sys.audit("socket.tethered_test_probe")
+    except tethered.EgressBlocked:
+        return True
+    finally:
+        core._config = held
+    return False
+
+out = {}
+'''
+
+_ADD = "sys.addaudithook"
+_PROBE = "tethered._guardian.probe"
+_HOOK_REFUSED = "another audit hook in this process refused tethered's audit hook"
+
+
+def _run_beside_a_vetoing_hook(body: str) -> dict:
+    script = _VETOING_HOOK_PRELUDE + textwrap.dedent(body) + "\nprint(json.dumps(out))\n"
+    env = {k: v for k, v in os.environ.items() if k != _core._CHILD_POLICY_ENV}
+    child = subprocess.run(  # nosec B603
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert child.returncode == 0, child.stderr
+    return json.loads(child.stdout.splitlines()[-1])
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestHookInstallation:
+    """A locked policy is only as good as the guardian's audit hook.
+
+    ``PySys_AddAuditHook`` asks the hooks already installed, and when one of
+    them answers with a ``RuntimeError`` it adds nothing and still reports
+    success.  ``activate(locked=True)`` used to return normally then, with
+    nothing enforced.
+    """
+
+    def test_a_refused_hook_fails_the_activation(self):
+        out = _run_beside_a_vetoing_hook(
+            """
+            veto["sys.addaudithook"] = RuntimeError
+            out["attempt"] = lock(object())
+            out["events"] = list(seen)
+            out["state"] = state()
+            """
+        )
+        kind, message = out["attempt"]
+        assert kind == "RuntimeError"
+        assert _HOOK_REFUSED in message
+        assert "it raised on the sys.addaudithook event" in message
+        assert out["events"] == [_ADD, _PROBE]
+        # All-or-nothing: no config, no lock, nothing published.
+        assert out["state"] == [None, False, None]
+
+    def test_the_policy_that_was_active_stays_as_it_was(self):
+        out = _run_beside_a_vetoing_hook(
+            """
+            tethered.activate(allow=["first.test"])
+            before = core._config, os.environ[VARIABLE]
+            veto["sys.addaudithook"] = RuntimeError
+            out["attempt"] = lock(object())[0]
+            out["unchanged"] = [
+                core._config is before[0],
+                os.environ[VARIABLE] == before[1],
+                guardian.is_active(),
+            ]
+            try:
+                sys.audit("socket.connect", None, ("203.0.113.9", 443))
+            except tethered.EgressBlocked as exc:
+                out["still enforced"] = str(exc)
+            """
+        )
+        assert out["attempt"] == "RuntimeError"
+        assert out["unchanged"] == [True, True, False]
+        assert out["still enforced"] == (
+            "Blocked by tethered: 203.0.113.9:443 is not in the allow list"
+        )
+
+    def test_a_later_attempt_installs_the_hook_and_only_once(self):
+        out = _run_beside_a_vetoing_hook(
+            """
+            token = object()
+            veto["sys.addaudithook"] = RuntimeError
+            out["first"] = [lock(token)[0], list(seen)]
+            veto.clear()
+            out["second"] = [lock(token), list(seen), enforced()]
+            tethered.deactivate(lock_token=token)
+            out["third"] = [lock(token), list(seen), enforced()]
+            """
+        )
+        assert out["first"] == ["RuntimeError", [_ADD, _PROBE]]
+        # It looks before it adds, adds, and looks again ...
+        assert out["second"] == ["locked", [_PROBE, _ADD, _PROBE], True]
+        # ... and once the hook is confirmed, never again.
+        assert out["third"] == ["locked", [], True]
+
+    def test_a_python_hook_refusing_the_probe_changes_nothing(self):
+        """C hooks are called before Python hooks: the guardian has seen its probe by then."""
+        out = _run_beside_a_vetoing_hook(
+            """
+            veto[PROBE] = RuntimeError
+            out["attempt"] = [lock(object()), list(seen), enforced()]
+            """
+        )
+        assert out["attempt"] == ["locked", [_ADD, _PROBE], True]
+
+    def test_no_second_hook_while_a_first_cannot_be_ruled_out(self):
+        """A refused probe says nothing; without an answer the hook is not added again."""
+        out = _run_beside_a_vetoing_hook(
+            """
+            token = object()
+            veto["sys.addaudithook"] = veto[PROBE] = RuntimeError
+            out["first"] = [lock(token), list(seen)]
+            del veto["sys.addaudithook"]
+            out["second"] = [lock(token), list(seen), state()]
+            veto.clear()
+            out["third"] = [lock(token), list(seen), enforced()]
+            """
+        )
+        first, first_events = out["first"]
+        second, second_events, second_state = out["second"]
+        for kind, message in (first, second):
+            assert kind == "RuntimeError"
+            assert _HOOK_REFUSED in message
+            assert "it raised on the probe event" in message
+        assert first_events == [_ADD, _PROBE]
+        assert second_events == [_PROBE]  # looked, could not tell, added nothing
+        assert second_state == [None, False, None]
+        assert out["third"] == ["locked", [_PROBE, _ADD, _PROBE], True]
+
+    def test_a_refusal_that_is_not_a_runtime_error_is_passed_on(self):
+        """CPython swallows only ``RuntimeError``; anything else already failed loudly."""
+        out = _run_beside_a_vetoing_hook(
+            """
+            token = object()
+            veto["sys.addaudithook"] = PermissionError
+            out["first"] = [lock(token), list(seen), state()]
+            veto.clear()
+            out["second"] = [lock(token), list(seen), enforced()]
+            """
+        )
+        assert out["first"] == [
+            ["PermissionError", "vetoed by another hook"],
+            [_ADD],
+            [None, False, None],
+        ]
+        assert out["second"] == ["locked", [_ADD, _PROBE], True]
+
+    def test_the_probe_is_raised_once_per_process(self):
+        """Other hooks see one private event, the first time a policy is locked."""
+        out = _run_beside_a_vetoing_hook(
+            """
+            token = object()
+            out["first"] = [lock(token), list(seen)]
+            tethered.deactivate(lock_token=token)
+            out["second"] = [lock(token), list(seen)]
+            del seen[:]
+            sys.audit(PROBE)  # anyone may raise an event of that name: it is only a name
+            out["by name"] = [list(seen), guardian.is_active(), enforced()]
+            """
+        )
+        assert out["first"] == ["locked", [_ADD, _PROBE]]
+        assert out["second"] == ["locked", []]
+        assert out["by name"] == [[_PROBE], True, True]
 
 
 class TestTetheredLockedException:

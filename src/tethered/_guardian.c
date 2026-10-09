@@ -952,10 +952,25 @@ other_interpreter_event(const char *event, PyObject *args)
     return refuse_other_interpreter(event, kind, args);
 }
 
+/*
+ * The event with which ensure_hook_installed() asks the hook whether it is
+ * installed.  Recognised by the address of the name, not its text, so no
+ * other code can raise it: sys.audit() from Python passes a string of its
+ * own.  hook_probe_seen is written here and read there, on one thread and
+ * with the main GIL held (only activate() raises the probe).
+ */
+static const char hook_probe_event[] = "tethered._guardian.probe";
+static int hook_probe_seen = 0;
+
 static int
 guardian_hook(const char *event, PyObject *args, void *userData)
 {
     (void)userData;
+
+    if (event == hook_probe_event) {
+        hook_probe_seen = 1;
+        return 0;
+    }
 
     if (!ATOMIC_LOAD(guardian_active))
         return 0;
@@ -1020,6 +1035,82 @@ guardian_hook(const char *event, PyObject *args, void *userData)
      * this operation: refuse it. */
     write_tamper_alert();
     return raise_refused(event);
+}
+
+/* ── Installing the hook ─────────────────────────────────────────── */
+
+/*
+ * PySys_AddAuditHook() first raises a "sys.addaudithook" event.  If an
+ * existing hook answers it with a RuntimeError, the new hook is not added
+ * and the call reports success all the same ("callers cannot assume that
+ * their hook has been added unless they control all existing hooks").  A
+ * guardian without its hook would lock a policy and enforce nothing, so
+ * the hook is asked whether it is there before anything is committed.
+ */
+
+enum {
+    HOOK_ABSENT,  /* every hook that exists was called, and ours was not */
+    HOOK_LIVE,    /* ours was called */
+    HOOK_UNKNOWN  /* a hook refused the probe before all had been called */
+};
+
+/* Raise the probe event and say what came of it.  Leaves no exception. */
+static int
+probe_hook(void)
+{
+    hook_probe_seen = 0;
+    int refused = PySys_Audit(hook_probe_event, NULL) < 0;
+    if (refused)
+        PyErr_Clear();
+    if (hook_probe_seen)
+        return HOOK_LIVE;
+    /* C hooks are called in the order they were added, then the Python
+     * hooks; the first refusal ends the round.  Ours not having run proves
+     * its absence only if nothing ended the round early. */
+    return refused ? HOOK_UNKNOWN : HOOK_ABSENT;
+}
+
+/*
+ * Make sure guardian_hook is installed, adding it if it is not — and never
+ * a second time.  Returns 0, or -1 with an exception set, in which case
+ * nothing is remembered as installed and a later activation tries again.
+ *
+ * The hook is process-lifetime: installing it for an activation that then
+ * fails is harmless (it does nothing while the guardian is inactive).
+ */
+static int
+ensure_hook_installed(void)
+{
+    static int installed = 0; /* confirmed by a probe */
+    static int added = 0;     /* PySys_AddAuditHook() has reported success */
+
+    if (installed)
+        return 0;
+
+    /* An earlier attempt may have left a hook that could not be confirmed
+     * then: look before adding another. */
+    int state = added ? probe_hook() : HOOK_ABSENT;
+    if (state == HOOK_ABSENT) {
+        /* Fails for an existing hook that refuses with anything but a
+         * RuntimeError, and for lack of memory: nothing was added. */
+        if (PySys_AddAuditHook(guardian_hook, NULL) < 0)
+            return -1;
+        added = 1;
+        state = probe_hook();
+    }
+    if (state != HOOK_LIVE) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "tethered: another audit hook in this process refused tethered's "
+            "audit hook (it raised on %s), so a locked policy could not be "
+            "enforced and none was activated",
+            state == HOOK_ABSENT
+                ? "the sys.addaudithook event"
+                : "the probe event that confirms the hook is installed");
+        return -1;
+    }
+    installed = 1;
+    return 0;
 }
 
 /* ── Snapshot management ─────────────────────────────────────────── */
@@ -1406,15 +1497,10 @@ py_activate(PyObject *self, PyObject *args)
      * inactive.
      */
 
-    /* The audit hook is process-lifetime: installing it for an activation
-     * that then fails is harmless (it is a no-op while the guardian is
-     * inactive). */
-    static int hook_installed = 0;
-    if (!hook_installed) {
-        if (PySys_AddAuditHook(guardian_hook, NULL) < 0)
-            return NULL;
-        hook_installed = 1;
-    }
+    /* Without its hook the guardian would enforce nothing: no hook, no
+     * activation. */
+    if (ensure_hook_installed() < 0)
+        return NULL;
 
     Holdings next = EMPTY_HOLDINGS;
     SnapshotEntry *staging = NULL;
@@ -1707,7 +1793,9 @@ static PyMethodDef guardian_methods[] = {
      "activate(core_namespace, config, token, snapshot): lock the policy.\n\n"
      "core_namespace is tethered._core's module dict; the guardian reads\n"
      "the exception classes and resolver callers from it and binds\n"
-     "core_namespace['_config'] = config as part of its own commit."},
+     "core_namespace['_config'] = config as part of its own commit.\n\n"
+     "Raises RuntimeError, having changed nothing, when another audit hook\n"
+     "of the process keeps the guardian's own hook from being installed."},
     {"deactivate",  py_deactivate,  METH_VARARGS,
      "deactivate(token, replacement=None) -> bool: unlock.\n\n"
      "Requires the lock token object (compared by identity).  Binds\n"
