@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tethered._core import _serialize_allow_list
 from tethered._policy import (
     AllowPolicy,
     _could_be_ip,
@@ -328,10 +329,130 @@ class TestAllowPolicyBracketNotation:
         assert policy.is_allowed("2001:db8::1", 443) is True
         assert policy.is_allowed("2001:db8::1", 80) is False
 
-    def test_bracketed_invalid_becomes_host_rule(self):
-        policy = AllowPolicy(["[not-an-ip]"])
-        assert policy.is_allowed("not-an-ip") is True
-        assert policy.is_allowed("other") is False
+    def test_bracketed_ipv4(self):
+        policy = AllowPolicy(["[192.0.2.1]"], allow_localhost=False)
+        assert policy.is_allowed("192.0.2.1", 80) is True
+        assert policy.is_allowed("192.0.2.2", 80) is False
+
+    def test_bracketed_ipv4_with_port(self):
+        policy = AllowPolicy(["[192.0.2.1]:443"], allow_localhost=False)
+        assert policy.is_allowed("192.0.2.1", 443) is True
+        assert policy.is_allowed("192.0.2.1", 80) is False
+
+    def test_bracketed_ipv4_network_with_port(self):
+        policy = AllowPolicy(["[10.0.0.0]/8:5432"], allow_localhost=False)
+        assert policy.is_allowed("10.1.2.3", 5432) is True
+        assert policy.is_allowed("10.1.2.3", 80) is False
+        assert policy.is_allowed("11.1.2.3", 5432) is False
+
+    def test_bracketed_non_ip_is_a_character_set(self):
+        """Brackets that hold no IP address are fnmatch syntax, not a hostname."""
+        policy = AllowPolicy(["[not-an-ip]"], allow_localhost=False)
+        assert policy.is_allowed("not-an-ip") is False
+        assert policy.is_allowed("n") is True
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "[2001:db8::1]:abc",
+            "[2001:db8::1]:-1",
+            "[2001:db8::1]:",
+            "[2001:db8::1]:44x",
+            "[2001:db8::1]:\u0664\u0664\u0663",
+            "[2001:db8::]/32:abc",
+            "[2001:db8::]/32:-1",
+            "[2001:db8::]/32:",
+            "[192.0.2.1]:http",
+        ],
+    )
+    def test_bracketed_invalid_port_raises(self, rule):
+        """A malformed port must not widen the rule to every port."""
+        with pytest.raises(ValueError, match="invalid port"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize("rule", ["[2001:db8::1]:65536", "[2001:db8::]/32:70000"])
+    def test_bracketed_out_of_range_port_raises(self, rule):
+        with pytest.raises(ValueError, match="out of valid range"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "[2001:db8::1]garbage",
+            "[2001:db8::1]443",
+            "[2001:db8::1].example.com",
+            "[2001:db8::1]x:443",
+            "[192.0.2.1]garbage",
+        ],
+    )
+    def test_bracketed_trailing_text_raises(self, rule):
+        with pytest.raises(ValueError, match=r"unexpected text .* after '\]'"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "[2001:db8::]/",
+            "[2001:db8::]/129",
+            "[2001:db8::]/abc",
+            "[2001:db8::]/32/48",
+            "[2001:db8::]/:443",
+            "[192.0.2.0]/33",
+        ],
+    )
+    def test_bracketed_invalid_prefix_raises(self, rule):
+        with pytest.raises(ValueError, match="invalid network prefix"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize("rule", ["[2001:db8::/32]", "[2001:db8::1", "[2001:db8::*]:443"])
+    def test_bracketed_malformed_ip_raises(self, rule):
+        """Not a bracketed IP and, because of the colons, not a hostname pattern either."""
+        with pytest.raises(ValueError, match="not a valid HOST:PORT rule"):
+            AllowPolicy([rule])
+
+
+class TestAllowPolicyLeadingCharacterSet:
+    """A rule may start with an fnmatch ``[seq]`` set; it is not a bracketed IP."""
+
+    def test_leading_set_with_port(self):
+        policy = AllowPolicy(["[ab].example.com:443"], allow_localhost=False)
+        assert policy.is_allowed("a.example.com", 443) is True
+        assert policy.is_allowed("b.example.com", 443) is True
+        assert policy.is_allowed("c.example.com", 443) is False
+        assert policy.is_allowed("a.example.com", 80) is False
+        # The pre-fix parse: exact hostname "ab" on any port.
+        assert policy.is_allowed("ab", 443) is False
+
+    def test_leading_set_without_port(self):
+        policy = AllowPolicy(["[ab].example.com"], allow_localhost=False)
+        assert policy.is_allowed("a.example.com", 80) is True
+        assert policy.is_allowed("ab.example.com", 80) is False
+
+    def test_leading_negated_set(self):
+        policy = AllowPolicy(["[!a].example.com:443"], allow_localhost=False)
+        assert policy.is_allowed("b.example.com", 443) is True
+        assert policy.is_allowed("a.example.com", 443) is False
+
+    def test_leading_digit_set_is_not_an_ip(self):
+        policy = AllowPolicy(["[12].example.com"], allow_localhost=False)
+        assert policy.is_allowed("1.example.com") is True
+        assert policy.is_allowed("3.example.com") is False
+
+    def test_leading_set_out_of_range_port_raises(self):
+        with pytest.raises(ValueError, match="out of valid range"):
+            AllowPolicy(["[ab].example.com:99999"])
+
+    def test_bracketed_star_is_not_match_all(self):
+        """``[*]`` used to be unwrapped to ``*`` behind the match-all guard's back."""
+        policy = AllowPolicy(["[*]"], allow_localhost=False)
+        assert policy.is_allowed("evil.example", 443) is False
+        assert policy.is_allowed("8.8.8.8", 53) is False
+
+    def test_leading_set_round_trips_through_serialization(self):
+        policy = AllowPolicy(["[ab].example.com:443"])
+        serialized = _serialize_allow_list(policy)
+        assert serialized == ["[ab].example.com:443"]
+        assert AllowPolicy(serialized)._host_rules == policy._host_rules
 
 
 class TestAllowPolicyIPWildcard:
@@ -502,6 +623,23 @@ class TestNormalizationConsistency:
         policy = AllowPolicy(["api.stripe.com.."])
         assert policy.is_allowed("api.stripe.com..") is True
 
+    def test_double_trailing_dot_rule_round_trips_through_serialization(self):
+        """The serialized form re-parses to the same rule instead of losing the second dot."""
+        policy = AllowPolicy(["api.stripe.com..", "*.example.com.."], allow_localhost=False)
+        serialized = _serialize_allow_list(policy)
+        assert serialized == ["*.example.com..", "api.stripe.com.."]
+
+        rebuilt = AllowPolicy(serialized, allow_localhost=False)
+        assert rebuilt._exact_hosts_any_port == policy._exact_hosts_any_port
+        assert rebuilt._host_rules == policy._host_rules
+        assert rebuilt.is_allowed("api.stripe.com") is False
+
+    def test_whitespace_before_trailing_dot_is_stripped(self):
+        """``"host ."`` must not keep a trailing space that a re-parse would strip."""
+        policy = AllowPolicy(["api.stripe.com ."], allow_localhost=False)
+        assert policy.is_allowed("api.stripe.com") is True
+        assert _serialize_allow_list(policy) == ["api.stripe.com"]
+
 
 class TestHostnameNormalizationEdgeCases:
     """Adversarial hostname normalization inputs."""
@@ -660,19 +798,64 @@ class TestUnicodeNormalization:
 
 
 class TestPortParsingNonAsciiDigits:
-    """Non-ASCII digits should not be treated as port numbers."""
+    """Non-ASCII digits are not port numbers; the rule is rejected, not kept as a dead rule."""
 
     def test_superscript_digit_not_port(self):
         """Superscript ² (U+00B2) should not be parsed as port digit."""
-        # Should not crash and should treat as a hostname pattern
-        policy = AllowPolicy(["host:\u00b2"])
-        # The rule "host:²" should be treated as a hostname, not host:port
-        assert policy.is_allowed("host:\u00b2") is True
+        with pytest.raises(ValueError, match="not a valid HOST:PORT rule"):
+            AllowPolicy(["host:\u00b2"])
 
     def test_arabic_indic_digit_not_port(self):
         """Arabic-Indic digits should not be parsed as port."""
-        policy = AllowPolicy(["host:\u0660\u0661\u0662"])
-        assert policy.is_allowed("host:\u0660\u0661\u0662") is True
+        with pytest.raises(ValueError, match="not a valid HOST:PORT rule"):
+            AllowPolicy(["host:\u0660\u0661\u0662"])
+
+
+class TestMalformedPortRejected:
+    """A hostname rule that still contains ``:`` after parsing can never match a hostname."""
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "host.example:abc",
+            "host.example:-1",
+            "host.example:",
+            "host.example: 443",
+            "host.example:443:80",
+            "*.example.com:https",
+            "[ab].example.com:abc",
+        ],
+    )
+    def test_malformed_port_raises(self, rule):
+        with pytest.raises(ValueError, match="not a valid HOST:PORT rule"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize("rule", ["2001:db8::zz", "2001:db8::1/200", "fe80::*", "2001:db8:*"])
+    def test_malformed_ipv6_raises(self, rule):
+        """Mistyped IPv6 addresses/CIDRs and wildcards over IPv6 text are rejected."""
+        with pytest.raises(ValueError, match="CIDR notation"):
+            AllowPolicy([rule])
+
+    @pytest.mark.parametrize("rule", [":443", ".", " . "])
+    def test_rule_without_host_raises(self, rule):
+        """An empty host would serialize to a rule the child process rejects."""
+        with pytest.raises(ValueError, match="has no host"):
+            AllowPolicy([rule])
+
+    def test_unbracketed_ipv6_forms_unchanged(self):
+        policy = AllowPolicy(["2001:db8::1", "2001:db9::/32", "::ffff:192.0.2.1"])
+        assert policy.is_allowed("2001:db8::1", 443) is True
+        assert policy.is_allowed("2001:db8::2", 443) is False
+        assert policy.is_allowed("2001:db9::5", 80) is True
+        assert policy.is_allowed("192.0.2.2", 80) is False
+        assert policy.is_allowed("::ffff:192.0.2.1", 80) is True
+
+    def test_ipv4_and_cidr_ports_unchanged(self):
+        policy = AllowPolicy(["192.0.2.1:8080", "10.0.0.0/8:5432"], allow_localhost=False)
+        assert policy.is_allowed("192.0.2.1", 8080) is True
+        assert policy.is_allowed("192.0.2.1", 80) is False
+        assert policy.is_allowed("10.9.9.9", 5432) is True
+        assert policy.is_allowed("10.9.9.9", 80) is False
 
 
 class TestIPv4MappedLocalhostUnspecified:

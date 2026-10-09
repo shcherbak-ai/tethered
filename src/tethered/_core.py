@@ -2042,11 +2042,22 @@ def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
     serialization must be reproducible across interpreters: sort the
     combined list.  Sorting is round-trip stable — every entry is a
     normalized string, so parse → re-serialize yields the identical list.
+
+    ``AllowPolicy`` strips exactly one trailing dot from a port-less rule,
+    so a stored pattern that still ends in a dot (from ``"host.."``) gets
+    that dot back here; otherwise the child would strip the remaining one
+    and hold a different rule than the parent.
     """
+
+    def host_rule(pattern: str, port: int | None) -> str:
+        if port is not None:
+            return f"{pattern}:{port}"
+        return pattern + "." if pattern.endswith(".") else pattern
+
     return sorted(
-        list(policy._exact_hosts_any_port)
-        + [f"{h}:{p}" for h, p in policy._exact_hosts]
-        + [r.pattern if r.port is None else f"{r.pattern}:{r.port}" for r in policy._host_rules]
+        [host_rule(h, None) for h in policy._exact_hosts_any_port]
+        + [host_rule(h, p) for h, p in policy._exact_hosts]
+        + [host_rule(r.pattern, r.port) for r in policy._host_rules]
         + [_serialize_network_rule(r) for r in policy._network_rules]
     )
 

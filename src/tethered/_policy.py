@@ -91,45 +91,32 @@ class AllowPolicy:
                 )
                 raise ValueError(msg)
 
-            # Strip exactly one trailing dot from FQDNs (not IPs, not CIDRs)
+            # Strip exactly one trailing dot from FQDNs (not IPs, not CIDRs).
+            # The rstrip keeps the result free of outer whitespace, like the
+            # initial strip() does, so a serialized rule re-parses unchanged.
             if rule.endswith(".") and not rule.endswith("/"):
-                rule = rule[:-1]
+                rule = rule[:-1].rstrip()
 
             port: int | None = None
 
-            # Handle bracketed IPv6: [::1]:443, [2001:db8::1], [2001:db8::]/32
+            # Bracketed IP: [::1], [2001:db8::1]:443, [2001:db8::]/32[:443].
+            # Brackets that do not hold an IP address are an fnmatch character
+            # set ("[ab].example.com:443") and take the hostname path below.
             if rule.startswith("["):
-                bracket_end = rule.find("]")
-                if bracket_end != -1:
-                    ipv6_part = rule[1:bracket_end]
-                    remainder = rule[bracket_end + 1 :]
-                    # CIDR suffix: [2001:db8::]/32 or [2001:db8::]/32:443
-                    if remainder.startswith("/"):
-                        cidr_and_rest = remainder[1:]
-                        if ":" in cidr_and_rest:
-                            cidr_str, port_str = cidr_and_rest.rsplit(":", 1)
-                            if port_str.isascii() and port_str.isdigit():
-                                port = _validate_port(int(port_str))
-                            ipv6_part += "/" + cidr_str
-                        else:
-                            ipv6_part += "/" + cidr_and_rest
-                    elif (
-                        remainder.startswith(":")
-                        and remainder[1:].isascii()
-                        and remainder[1:].isdigit()
-                    ):
-                        port = _validate_port(int(remainder[1:]))
-                    try:
-                        network = ipaddress.ip_network(ipv6_part, strict=False)
-                        network_rules.append(_NetworkRule(network=network, port=port))
-                    except ValueError:
-                        host_rules.append(_HostRule(pattern=ipv6_part, port=port))
+                bracketed = _parse_bracketed_ip(rule, raw)
+                if bracketed is not None:
+                    network, port = bracketed
+                    network_rules.append(_NetworkRule(network=network, port=port))
                     continue
 
             if _has_port_suffix(rule):
                 rule_part, port_str = rule.rsplit(":", 1)
                 port = _validate_port(int(port_str))
                 rule = rule_part
+
+            if not rule:
+                msg = f"allow rule {raw!r} has no host. Use 'HOST' or 'HOST:PORT'."
+                raise ValueError(msg)
 
             # Try to parse as CIDR network or IP address
             try:
@@ -139,21 +126,36 @@ class AllowPolicy:
             except ValueError:
                 pass
 
+            # A hostname never contains ":".  What is left here is a malformed
+            # port ("host:abc", "host:-1", "host:"), a mistyped IPv6 address
+            # or CIDR, or a wildcard over the *text* of IPv6 addresses.  The
+            # first two would be rules that can never match; the last one
+            # depends on how str() formats an address and is what CIDR rules
+            # are for.  Reject them all instead of keeping such a rule.
+            if ":" in rule:
+                msg = (
+                    f"allow rule {raw!r} is not a valid HOST:PORT rule, IP address or "
+                    f"CIDR range. A port must be a number in the range 0-65535 "
+                    f"(e.g. 'api.stripe.com:443'). Write an IPv6 address with a port or "
+                    f"prefix as '[ADDR]:PORT', '[ADDR]/PREFIX' or '[ADDR]/PREFIX:PORT' "
+                    f"(e.g. '[2001:db8::1]:443'), and an IPv6 range in CIDR notation "
+                    f"(e.g. '2001:db8::/32')."
+                )
+                raise ValueError(msg)
+
             # Reject overly broad wildcards — the host portion (without port)
             # must contain at least one literal character that isn't a wildcard
             # or dot. Patterns like *, *.*, *?*, ?* match all destinations.
             # Patterns with only ? (like ???.??) are allowed because ? matches
             # exactly one character — they are bounded, not open-ended.
-            if "*" in rule:
-                host_part_for_check = rule.split(":")[0] if ":" in rule else rule
-                if all(c in "*?." for c in host_part_for_check):
-                    msg = (
-                        f"allow rule {raw!r} matches ALL destinations, "
-                        f"which disables egress control entirely. "
-                        f"Use specific hostname patterns instead "
-                        f"(e.g. '*.stripe.com:443')."
-                    )
-                    raise ValueError(msg)
+            if "*" in rule and all(c in "*?." for c in rule):
+                msg = (
+                    f"allow rule {raw!r} matches ALL destinations, "
+                    f"which disables egress control entirely. "
+                    f"Use specific hostname patterns instead "
+                    f"(e.g. '*.stripe.com:443')."
+                )
+                raise ValueError(msg)
 
             # It's a hostname pattern
             host_rules.append(_HostRule(pattern=rule, port=port))
@@ -406,6 +408,59 @@ def _is_ip_like(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _parse_bracketed_ip(
+    rule: str, raw: str
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, int | None] | None:
+    """Parse ``[ADDR]``, ``[ADDR]:PORT``, ``[ADDR]/PREFIX`` or ``[ADDR]/PREFIX:PORT``.
+
+    Returns ``None`` when the text inside the brackets is not an IP address:
+    the rule is then an ordinary hostname pattern that starts with an
+    ``fnmatch`` character set.  Once the brackets do hold an IP address the
+    whole rule has to be well-formed — trailing text and malformed ports
+    raise ``ValueError`` instead of being dropped, because dropping a port
+    silently widens the rule to every port.
+    """
+    bracket_end = rule.find("]")
+    if bracket_end == -1:
+        return None
+    addr = rule[1:bracket_end]
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+
+    # What follows the bracket is "", "/PREFIX", ":PORT" or "/PREFIX:PORT".
+    remainder = rule[bracket_end + 1 :]
+    prefix, colon, port_str = remainder.partition(":")
+    if prefix and not prefix.startswith("/"):
+        msg = (
+            f"allow rule {raw!r} has unexpected text {remainder!r} after ']'. "
+            f"Use '[ADDR]', '[ADDR]:PORT', '[ADDR]/PREFIX' or '[ADDR]/PREFIX:PORT' "
+            f"(e.g. '[2001:db8::1]:443')."
+        )
+        raise ValueError(msg)
+
+    port: int | None = None
+    if colon:
+        if not (port_str.isascii() and port_str.isdigit()):
+            msg = (
+                f"allow rule {raw!r} has an invalid port {port_str!r}. "
+                f"A port must be a number in the range 0-65535 (e.g. '[2001:db8::1]:443')."
+            )
+            raise ValueError(msg)
+        port = _validate_port(int(port_str))
+
+    try:
+        network = ipaddress.ip_network(addr + prefix, strict=False)
+    except ValueError:
+        msg = (
+            f"allow rule {raw!r} has an invalid network prefix {prefix[1:]!r} "
+            f"(e.g. '[2001:db8::]/32')."
+        )
+        raise ValueError(msg) from None
+    return network, port
 
 
 def _has_port_suffix(rule: str) -> bool:

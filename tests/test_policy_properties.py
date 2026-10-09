@@ -6,17 +6,19 @@ hold across the entire space — pattern-matching corner cases (CIDR
 boundaries, port handling, wildcard suffix bounds, monotonicity) where
 hand-written examples are most likely to miss something.
 
-All tests are pure: they construct ``AllowPolicy`` and call ``is_allowed``.
-No audit hooks, no network, no filesystem.
+All tests are pure: they construct ``AllowPolicy``, call ``is_allowed`` and
+serialize the policy.  No audit hooks, no network, no filesystem.
 """
 
 from __future__ import annotations
 
+import collections
 import ipaddress
 
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
+from tethered._core import _serialize_allow_list
 from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
 
 # Constrained alphabets keep generated hostnames short, ASCII-only, and
@@ -125,3 +127,86 @@ class TestWildcardSuffix:
         assume(not host.endswith(".stripe.com"))
         policy = AllowPolicy(["*.stripe.com"], allow_localhost=False)
         assert policy.is_allowed(host) is False
+
+
+def _is_accepted(rule: str) -> bool:
+    try:
+        AllowPolicy([rule])
+    except ValueError:
+        return False
+    return True
+
+
+def _bracketed(addr, prefix, port):
+    text = f"[{addr}]"
+    if prefix is not None:
+        text += f"/{prefix}"
+    if port is not None:
+        text += f":{port}"
+    return text
+
+
+def _decorate(core, port, dots, upper, pad):
+    text = core if port is None else f"{core}:{port}"
+    text += "." * dots
+    if upper:
+        text = text.upper()
+    return f"{pad}{text}{pad}"
+
+
+_pattern_label = st.one_of(_label, st.sampled_from(["*", "?", "a*", "*b", "[ab]", "[!a]", "[0-9]"]))
+_address_and_prefix = st.ip_addresses().flatmap(
+    lambda addr: st.tuples(st.just(addr), st.one_of(st.none(), st.integers(0, addr.max_prefixlen)))
+)
+_rule_core = st.one_of(
+    # Hostname patterns, including ones that start with an fnmatch character set.
+    st.lists(_pattern_label, min_size=1, max_size=4).map(".".join),
+    # Unbracketed addresses and CIDR ranges.
+    _address_and_prefix.map(lambda ap: str(ap[0]) if ap[1] is None else f"{ap[0]}/{ap[1]}"),
+    # Bracketed addresses and CIDR ranges, with and without a port.
+    st.builds(lambda ap, port: _bracketed(*ap, port), _address_and_prefix, st.none() | _port),
+)
+# Well-formed rules in every spelling the parser normalizes (port, FQDN dots,
+# case, padding), plus short strings over the syntax characters: whatever the
+# parser accepts — however odd — has to survive the trip to a child process.
+_accepted_rule = st.one_of(
+    st.builds(
+        _decorate,
+        _rule_core,
+        st.none() | _port,
+        st.integers(0, 2),
+        st.booleans(),
+        st.sampled_from(["", " "]),
+    ),
+    st.text(alphabet="ab19.*?[]!:/-% ", min_size=1, max_size=10),
+).filter(_is_accepted)
+
+
+def _rules(policy):
+    return (
+        policy._exact_hosts_any_port,
+        policy._exact_hosts,
+        policy._exact_hosts_with_port,
+        collections.Counter(policy._host_rules),
+        collections.Counter(policy._network_rules),
+    )
+
+
+class TestSerializationRoundTrip:
+    """A child process rebuilds its policy from the parent's serialized allow list.
+
+    The rebuilt policy has to hold the same rules, and serializing it again
+    has to give the identical list: locked mode compares the two lists, and
+    a rule the parent accepted but the child rejects (or reads differently)
+    would leave the child with a different policy than its parent.
+    """
+
+    @given(rules=st.lists(_accepted_rule, max_size=5))
+    def test_serialized_rules_rebuild_the_same_policy(self, rules):
+        policy = AllowPolicy(rules, allow_localhost=False)
+        serialized = _serialize_allow_list(policy)
+
+        rebuilt = AllowPolicy(serialized, allow_localhost=False)
+
+        assert _rules(rebuilt) == _rules(policy)
+        assert _serialize_allow_list(rebuilt) == serialized
