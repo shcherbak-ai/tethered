@@ -11,7 +11,7 @@
 
 ## Auto-propagation to Python child processes
 
-Python children **automatically inherit** the parent's tethered policy. `tethered.activate()` populates `_TETHERED_CHILD_POLICY` in the environment; a small `tethered.pth` file shipped with the package runs `tethered._autoactivate` on every Python interpreter startup, re-engaging tethered with the same policy before user code runs. This works for `multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn/uvicorn workers, and plain `subprocess.run([sys.executable, ...])`:
+Python children **automatically inherit** the parent's tethered policy. `tethered.activate()` populates `_TETHERED_CHILD_POLICY` in the environment; a small `tethered.pth` file shipped with the package runs `tethered._autoactivate` on Python interpreter startup, re-engaging tethered with the same policy before user code runs. This works for `multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn/uvicorn workers, and plain `subprocess.run([sys.executable, ...])`:
 
 ```python
 import tethered, subprocess, sys
@@ -27,13 +27,23 @@ subprocess.run(
 
 On Linux, `os.fork()` already copies tethered's audit hook into child processes, so gunicorn workers were already covered. The `.pth` mechanism extends the same protection to **spawn-mode** children — macOS/Windows multiprocessing, `ProcessPoolExecutor` on those platforms, and any explicit `subprocess.run([sys.executable, ...])` everywhere.
 
+**The bootstrap has to be installed where Python runs it.** `site.py` executes `tethered.pth` only from a site directory: the interpreter's site-packages, or the per-user site-packages when enabled. `pip install tethered` and `uv add tethered` put it there. An editable install (`pip install -e .`) and `pip install --target` + `PYTHONPATH` do not. In that case `activate()` logs a warning, no Python child auto-inherits, and every `sys.executable` launch is treated as external (see [below](#parent-side-enforcement-of-external-subprocess-launches)).
+
+**The payload is established at launch, not only at `activate()`.** The subprocess hook makes sure each Python child's launch environment carries the payload. When `subprocess` is given an explicit `env=` (a mapping of any type) that lacks it, the child receives a copy with the payload added; the caller's mapping is not modified. When the child inherits the environment and the variable has been removed from `os.environ` (for example by a keep-list cleanup at startup), it is written back before the launch. In locked mode a missing or altered payload is refused instead (see [hardening](#locked-mode-hardening-of-the-auto-propagation-channel)). One route is out of reach: `multiprocessing` spawn / forkserver launches on POSIX with Python 3.10–3.13 raise no audit event, so nothing is checked or repaired for them.
+
+A blocked call in a pool worker reaches the parent as `EgressBlocked`: the exception is picklable with all its attributes, so `multiprocessing.Pool` and `ProcessPoolExecutor` re-raise it in the parent.
+
 ## Locked-mode propagation
 
-If the parent activated with `locked=True`, child processes also auto-activate in locked mode — each child gets a fresh per-process `lock_token`. The parent has no special control over the child's lock (correct: separate processes). If the C extension isn't available in the child's environment (rare), the child logs a warning and falls back to non-locked enforcement.
+If the parent activated with `locked=True`, child processes also auto-activate in locked mode — each child gets a fresh per-process `lock_token`. The parent has no special control over the child's lock (correct: separate processes).
+
+When the inherited policy has `locked` or `fail_closed` set and cannot be established in the child, the child refuses to start: the bootstrap raises `SystemExit`, interpreter startup fails, and the process exits with status 1 before any user code runs. This covers a payload that fails validation (a field of the wrong type, an unknown field), `activate()` raising, a malformed inherited scope, and locked mode when the C extension is not available in the child. With neither flag set, the problem is logged as a warning and the child continues without the part that failed; unknown payload fields are ignored. A value that is not a JSON object carries no flags: it is logged and ignored, and the child starts without a policy.
+
+The same bootstrap runs when a subinterpreter is created in a process whose environment carries the payload. A locked policy cannot be established there (the C extension holds one lock per process and cannot be loaded into an isolated subinterpreter), so while a locked policy is published, creating a subinterpreter fails. See [SECURITY.md](../SECURITY.md#locked-mode--what-it-does-and-does-not-do) for what this does and does not cover.
 
 ## Parent-side enforcement of "external" subprocess launches
 
-The `.pth` mechanism only protects **Python** children that launch via `sys.executable` (the same interpreter, with tethered installed). Everything else falls outside auto-inherit's reach: non-Python tools (`curl`, `bash`, `ffmpeg`), different Python interpreters (`/usr/bin/python3` without tethered), or `sys.executable` launched with `-S` (which disables `site.py` and so the `.pth` bootstrap). `-I` and `-E` keep `site.py` enabled and so are NOT bypass flags — auto-inherit works under those. `external_subprocess_policy` controls parent-side enforcement on the launches the bootstrap can't reach:
+The `.pth` mechanism only protects **Python** children that launch via `sys.executable` (the same interpreter, with tethered installed). Everything else falls outside auto-inherit's reach: non-Python tools (`curl`, `bash`, `ffmpeg`), different Python interpreters (`/usr/bin/python3` without tethered), or `sys.executable` launched with `-S` (which disables `site.py` and so the `.pth` bootstrap). `-I` and `-E` keep `site.py` enabled and so are NOT bypass flags — auto-inherit works under those, unless tethered is installed in the per-user site-packages (`pip install --user`), which `-s` and `-I` skip. `external_subprocess_policy` controls parent-side enforcement on the launches the bootstrap can't reach:
 
 | Policy | Behavior |
 |---|---|
@@ -47,13 +57,24 @@ What counts as "external" vs auto-inheriting:
 |---|---|
 | `subprocess.run([sys.executable, "-c", ...])` | No (auto-inherits) |
 | `subprocess.run([sys.executable, "script.py"])` | No (auto-inherits) |
-| `subprocess.run([sys.executable, "-I", "-c", ...])` | No (auto-inherits — `-I` keeps `site.py` enabled) |
+| `subprocess.run([sys.executable, "script.py", "-S"])` | No (auto-inherits — `-S` after the script path is the script's argument) |
+| `subprocess.run([sys.executable, "-I", "-c", ...])` | No (auto-inherits — `-I` keeps `site.py` enabled); Yes if tethered is in the per-user site-packages |
 | `subprocess.run([sys.executable, "-E", "-c", ...])` | No (auto-inherits — `-E` only ignores `PYTHON*` env vars) |
 | `multiprocessing.Pool` workers (uses `sys.executable`) | No (auto-inherits) |
 | `subprocess.run([sys.executable, "-S", ...])` | Yes (`-S` disables `site.py`) |
+| `subprocess.run([sys.executable, "-X", "-c", "-S", "-c", ...])` | Yes (`-c` is the value of `-X` here, so `-S` is an interpreter option) |
+| `sys.executable` with an option the interpreter does not know | Yes (the options cannot be parsed) |
+| `subprocess.run(["python", ...], executable=sys.executable)` | POSIX: Yes (`argv[0]` is not `sys.executable`). Windows: No |
+| Any Python launch when no `tethered.pth` is in a processed site directory | Yes (the child would not auto-activate) |
+| `os.execve` / `os.spawnve` / `os.posix_spawn` of `sys.executable` with an explicit env that lacks the payload | Yes (that environment cannot be rewritten) |
+| A `subprocess` launch of `sys.executable` whose environment cannot be given the payload (unreadable `env=`, launch frame not found or not writable) | Yes (locked mode refuses it) |
+| `multiprocessing` workers after `multiprocessing.set_executable(<other interpreter>)` | Yes (different interpreter) |
 | `subprocess.run(["/usr/bin/python3", ...])` | Yes (different interpreter) |
 | `subprocess.run(["curl", ...])` | Yes (non-Python) |
 | `os.system("rm -rf /")` | Yes (non-Python) |
+| Direct `_winapi.CreateProcess` of a non-Python program (Windows) | Yes (non-Python) |
+
+Interpreter options are read with the boundaries CPython itself uses, so `-S` counts only where the interpreter would treat it as an option. On Windows it is recognized when quoted inside a command-line string and when `executable=` is given. `multiprocessing` launches are classified on Windows and, from Python 3.14, on POSIX; on POSIX with Python 3.10–3.13 they raise no audit event.
 
 ```python
 # Hard lockdown: no external subprocess launches at all.
@@ -72,6 +93,9 @@ subprocess.run([sys.executable, "-c", "pass"])
 subprocess.run([sys.executable, "-I", "-c", "pass"])
 subprocess.run([sys.executable, "-E", "-c", "pass"])
 
+# OK — "-S" after the script path belongs to the script, not the interpreter
+subprocess.run([sys.executable, "script.py", "-S"])
+
 # Blocked — non-Python launch
 import os
 os.system("curl evil.test")  # raises SubprocessBlocked
@@ -82,15 +106,16 @@ subprocess.run([sys.executable, "-S", "-c", "pass"])  # raises SubprocessBlocked
 
 ## Locked-mode hardening of the auto-propagation channel
 
-In **locked mode**, tethered adds three Python-level tamper checks to defend the auto-propagation channel against a dependency that knows tethered is installed:
+In **locked mode**, tethered adds two Python-level tamper checks to defend the auto-propagation channel against a dependency that knows tethered is installed. Before either runs, the C guardian verifies its integrity snapshot on the same events — process launches, filesystem events whose path mentions `tethered.pth`, and `os.putenv` / `os.unsetenv` of the policy variable — and refuses the operation with `SubprocessBlocked` on a mismatch, so a check that has been replaced does not get to decide.
 
-- **Payload-integrity check at every subprocess launch.** The child's policy must equal the parent's canonical payload. The canonical form is deterministic — the `allow` list is sorted — so every process holding the same policy serializes the identical payload regardless of per-process hash randomization, and env snapshots captured in one process (e.g. by a honcho-style process manager) stay valid when a spawn-mode child launches with them. This catches:
-  - explicit `env={}` that strips `_TETHERED_CHILD_POLICY`;
-  - explicit `env={..., "_TETHERED_CHILD_POLICY": "<permissive value>"}` substitution;
-  - inherited env (`env=None`) where `os.environ` has been mutated to strip or substitute the var (via `os.environ.pop`, `os.environ[...] = ...`, or a direct `ctypes` call to libc `setenv`/`unsetenv` — the check inspects `os.environ` at launch time regardless of how it was set).
-- **`tethered.pth` filesystem-tamper check.** Refuses Python-level deletion (`os.remove` audit event — fired by `os.remove`, `os.unlink`, `pathlib.Path.unlink`, `shutil.rmtree`), rename touching the path (`os.rename` — also `os.replace`), write-mode `open` of the cached path (also covers `shutil.copy`, `pathlib.Path.write_*`), and `os.chmod` of the path (catches a permission-strip attack that would make site.py silently skip the file). Note: `os.truncate` is unfixable — CPython doesn't fire an audit event for it.
+- **Payload-integrity check at every process launch tethered sees.** The child's policy must equal the parent's canonical payload; the comparison is type-exact, on canonical JSON text (`0` is not `false`). The canonical form is deterministic — the `allow` list is sorted — so every process holding the same policy serializes the identical payload regardless of per-process hash randomization, and env snapshots captured in one process (e.g. by a honcho-style process manager) stay valid when a spawn-mode child launches with them. The check covers `subprocess`, `os.system`, `os.exec*`, `os.spawn*`, `os.posix_spawn` and `os.startfile`, and `multiprocessing` / `ProcessPoolExecutor` launches on Windows and, from Python 3.14, on POSIX. `multiprocessing` spawn / forkserver launches on POSIX with Python 3.10–3.13 raise no audit event and are not checked. This catches:
+  - an explicit environment that strips `_TETHERED_CHILD_POLICY` — `env={}` or a mapping of any other type;
+  - explicit `env={..., "_TETHERED_CHILD_POLICY": "<permissive value>"}` substitution, and a value that is not valid JSON;
+  - more than one spelling of the key in one environment (Windows environment names are case-insensitive, so `_tethered_child_policy` is the same variable there; on POSIX the `str` and `bytes` spellings of the name);
+  - inherited env (`env=None`) where the variable has been stripped or substituted through `os.environ` (`os.environ.pop`, `os.environ[...] = ...`) or through `os.putenv()` / `os.unsetenv()`, which `os.environ` does not show and tethered tracks through their audit events. A change made below Python — `ctypes` calling libc `setenv` / `unsetenv` — raises no audit event and is **not** caught.
+- **`tethered.pth` filesystem-tamper check.** Refuses Python-level deletion (`os.remove` audit event — fired by `os.remove`, `os.unlink`, `pathlib.Path.unlink`, `shutil.rmtree`), rename touching the path (`os.rename` — also `os.replace`), write-mode `open` of the cached path (also covers `shutil.copy`, `pathlib.Path.write_*`), `os.chmod` of the path (catches a permission-strip attack that would make site.py silently skip the file), and `os.truncate` of the path. `os.ftruncate` carries a file descriptor, which cannot be matched against the path, but a writable descriptor for the file cannot be obtained through `open` / `os.open` while the policy is locked. Paths are compared lexically, so a different path to the same file is not matched.
 
-All three are no-ops outside locked mode (the user opted into the strict mode for hardening). And all three have the same `ctypes`-bypass caveat called out in [SECURITY.md](../SECURITY.md): a deliberately-malicious dep with `ctypes` access can call libc `unlink`, `setenv`, and `connect` directly, bypassing every audit-event-based defense tethered ships.
+Both checks apply only in locked mode. Outside it, a launch environment that lacks the payload is not refused: tethered re-establishes the payload or treats the launch as external, as described above. And both have the same `ctypes`-bypass caveat called out in [SECURITY.md](../SECURITY.md): a deliberately-malicious dep with `ctypes` access can call libc `unlink`, `setenv`, and `connect` directly, bypassing every audit-event-based defense tethered ships. SECURITY.md also lists what in-process Python code can still do against locked mode [without `ctypes`](../SECURITY.md#locked-mode--what-it-does-and-does-not-do).
 
 ## Scopes propagate to subprocesses too
 
@@ -120,20 +145,22 @@ def do_work():
 
 Race-free across threads (frame-locals are per-call, not shared global state): two threads can be in different scopes and concurrently launch subprocesses that each receive their parent thread's scope.
 
-**How it works.** When `subprocess.Popen._execute_child` fires the `subprocess.Popen` audit event, tethered walks the call stack to the `_execute_child` frame and rewrites its `env` local to a per-call dict containing the scope-aware `_TETHERED_CHILD_POLICY` payload. The child reads this on startup. PEP 667 makes this a write-through proxy on Python 3.13+; on 3.10–3.12 tethered uses `ctypes.pythonapi.PyFrame_LocalsToFast` to push the fast-locals slot.
+**How it works.** When `subprocess.Popen._execute_child` fires the `subprocess.Popen` audit event, tethered walks the call stack to the `_execute_child` frame and rewrites its `env` local to a per-call dict containing the scope-aware `_TETHERED_CHILD_POLICY` payload. The child reads this on startup. PEP 667 makes this a write-through proxy on Python 3.13+; on 3.10–3.12 tethered uses `ctypes.pythonapi.PyFrame_LocalsToFast` to push the fast-locals slot. The rewrite is not specific to scopes: it happens whenever the launch environment does not already carry exactly the right payload, for example an explicit `env=` without it. The per-call dict is a copy of the caller's mapping, whatever its type, with every spelling of the key replaced by the one canonical entry.
 
 **Limitations.**
 
-- Scope cannot propagate through `os.system`, `os.exec*`, or `os.startfile` — those launch paths have no env channel that tethered can intercept. Those launches still receive the parent's at-rest global only and remain subject to `external_subprocess_policy`.
-- **Scope cannot propagate through `multiprocessing.Pool` / `ProcessPoolExecutor` in spawn mode.** These launch paths call `_posixsubprocess.fork_exec` (POSIX) or `_winapi.CreateProcess` (Windows) directly, bypassing `subprocess.Popen` entirely. The `subprocess.Popen` audit event never fires, so frame mutation has nothing to hook. Workers see only the parent's GLOBAL policy (which propagates via inherited `os.environ`). For scope propagation to multiprocessing workers, use **fork mode** (`mp.get_context("fork").Pool(...)`, Linux only) — fork copies the entire process state including the `_scopes` ContextVar, so children inherit scopes via OS-level state copy. Or restructure to launch workers via `subprocess.run([sys.executable, ...])` directly. `asyncio.create_subprocess_exec` IS supported because it uses `subprocess.Popen` internally.
+- Scope cannot propagate through `os.system`, `os.exec*`, or `os.startfile` — those launch paths have no env channel that tethered can intercept. Those launches still receive the parent's at-rest global only and remain subject to `external_subprocess_policy`. For the same reason an `os.exec*` / `os.spawn*` / `os.posix_spawn` launch of `sys.executable` with an explicit env that lacks the payload is treated as external.
+- **Scope cannot propagate through `multiprocessing.Pool` / `ProcessPoolExecutor` in spawn mode.** These launch paths call `_posixsubprocess.fork_exec` (POSIX) or `_winapi.CreateProcess` (Windows) directly, bypassing `subprocess.Popen` entirely. The `subprocess.Popen` audit event never fires, so the `_execute_child` frame mutation has nothing to hook. tethered does handle `_winapi.CreateProcess` and, from Python 3.14, `_posixsubprocess.fork_exec` for the payload check, payload repair and `external_subprocess_policy`, but the scope chain does not travel. Workers see only the parent's GLOBAL policy (which propagates via inherited `os.environ`). For scope propagation to multiprocessing workers, use **fork mode** (`mp.get_context("fork").Pool(...)`, Linux only) — fork copies the entire process state including the `_scopes` ContextVar, so children inherit scopes via OS-level state copy. Or restructure to launch workers via `subprocess.run([sys.executable, ...])` directly. `asyncio.create_subprocess_exec` IS supported because it uses `subprocess.Popen` internally.
 - Forked children inherit scope at fork time and persist it for their lifetime — they are independent processes, so the parent's `with` exit doesn't reach them.
-- In locked mode, the child's canonical `global` field is byte-checked; the scopes part is not byte-checked because scopes can only narrow within the byte-checked global ceiling.
+- In locked mode, the child's canonical `global` field is compared type-exactly as canonical JSON; the scopes part is not compared because scopes can only narrow within the checked global ceiling.
 
 ## What's inherited and what isn't
 
 The child re-activates with: `allow`, `allow_localhost`, `log_only`, `fail_closed`, `external_subprocess_policy`, `locked` (with a fresh per-process token), and the active scope chain (each scope's `allow`, `allow_localhost`, `log_only`, `fail_closed`, `label`, `hint`).
 
 Not inherited: `on_blocked` (callbacks can't cross process boundaries), the parent's exact `lock_token` (identity-compared; can't survive serialization).
+
+Inherited scopes are pushed onto the scope stack of the context the child starts in (its main thread) and are never exited. Like any scope they are context-local, not a process-wide floor: code that copies that context (asyncio tasks) carries them, a thread the child starts does not, and a grandchild launched from such a thread receives the global policy only. A grandchild launched through `subprocess` from the inheriting context receives them.
 
 Auto-activation runs before user code, so a child that re-runs application startup (e.g. a Django dev server under a process manager, a spawn-mode worker re-importing settings) will typically call `activate()` again. That call is an idempotent no-op when the requested policy is identical to the inherited one — including `locked=True` — so import-time `activate()` keeps working in children. A *differing* policy still raises `TetheredLocked` in locked mode.
 
