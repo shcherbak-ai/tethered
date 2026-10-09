@@ -19,7 +19,7 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from tethered._core import _serialize_allow_list
-from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
+from tethered._policy import AllowPolicy, _could_be_ip, _NetworkRule, _normalize_host
 
 # Constrained alphabets keep generated hostnames short, ASCII-only, and
 # unable to look like IPs or localhost — so localhost detection doesn't
@@ -78,6 +78,86 @@ class TestCidrMembership:
         network = ipaddress.ip_network(f"{net_addr}/{prefix}", strict=False)
         policy = AllowPolicy([str(network)], allow_localhost=False)
         assert policy.is_allowed(str(query)) is (query in network)
+
+    @given(
+        net_addr=st.ip_addresses(v=4),
+        prefix=st.integers(min_value=0, max_value=32),
+        query=st.ip_addresses(v=4),
+    )
+    def test_ipv4_mapped_query_matches_like_its_ipv4_address(self, net_addr, prefix, query):
+        network = ipaddress.ip_network(f"{net_addr}/{prefix}", strict=False)
+        policy = AllowPolicy([str(network)], allow_localhost=False)
+        assert policy.is_allowed(f"::ffff:{query}") is (query in network)
+
+    @given(
+        net_addr=st.ip_addresses(),
+        prefix_fraction=st.floats(min_value=0, max_value=1),
+        query=st.ip_addresses(),
+    )
+    def test_any_port_rule_lookup_agrees_with_ipaddress(self, net_addr, prefix_fraction, query):
+        """Mixed families included: an address is never inside a network of the other family."""
+        prefix = round(prefix_fraction * net_addr.max_prefixlen)
+        network = ipaddress.ip_network(f"{net_addr}/{prefix}", strict=False)
+        policy = AllowPolicy([str(network)], allow_localhost=False)
+        assert policy._has_any_port_rule(str(query)) is (query in network)
+
+
+class TestNetworkRuleRepresentation:
+    """A network rule keeps integers; ``network`` rebuilds the ``ipaddress`` object."""
+
+    @given(
+        net_addr=st.ip_addresses(),
+        prefix_fraction=st.floats(min_value=0, max_value=1),
+        port=st.none() | st.integers(min_value=0, max_value=65535),
+    )
+    def test_network_survives_the_integer_representation(self, net_addr, prefix_fraction, port):
+        prefix = round(prefix_fraction * net_addr.max_prefixlen)
+        network = ipaddress.ip_network(f"{net_addr}/{prefix}", strict=False)
+
+        rule = _NetworkRule.from_network(network, port)
+
+        assert rule.network == network
+        assert rule == (
+            network.version,
+            int(network.network_address),
+            int(network.netmask),
+            network.prefixlen,
+            port,
+        )
+
+    @given(
+        rule_addr=st.ip_addresses(),
+        rule_fraction=st.floats(min_value=0, max_value=1),
+        # None reuses the rule's address, so that nested blocks come up often.
+        scope_addr=st.none() | st.ip_addresses(),
+        scope_fraction=st.floats(min_value=0, max_value=1),
+        rule_port=st.none() | st.sampled_from([80, 443]),
+        scope_port=st.none() | st.sampled_from([80, 443]),
+    )
+    def test_cidr_overlap_agrees_with_ipaddress(
+        self, rule_addr, rule_fraction, scope_addr, scope_fraction, rule_port, scope_port
+    ):
+        """The scope-overlap check compares integers; ``ipaddress.overlaps`` is the reference."""
+        scope_addr = rule_addr if scope_addr is None else scope_addr
+        rule_net = ipaddress.ip_network(
+            f"{rule_addr}/{round(rule_fraction * rule_addr.max_prefixlen)}", strict=False
+        )
+        scope_net = ipaddress.ip_network(
+            f"{scope_addr}/{round(scope_fraction * scope_addr.max_prefixlen)}", strict=False
+        )
+        rule_text = f"[{rule_net.network_address}]/{rule_net.prefixlen}"
+        if rule_port is not None:
+            rule_text += f":{rule_port}"
+        policy = AllowPolicy([rule_text])
+
+        ports_disjoint = None not in (rule_port, scope_port) and rule_port != scope_port
+        if not scope_net.overlaps(rule_net) or ports_disjoint:
+            expected = "none"
+        elif scope_net.prefixlen >= rule_net.prefixlen and scope_port == rule_port:
+            expected = "full"
+        else:
+            expected = "partial"
+        assert policy._check_cidr_overlap(scope_net, scope_port) == expected
 
 
 class TestPortRestriction:

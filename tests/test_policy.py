@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,6 +13,7 @@ from tethered._policy import (
     AllowPolicy,
     _could_be_ip,
     _has_port_suffix,
+    _HostRule,
     _is_ip_like,
     _is_localhost,
     _NetworkRule,
@@ -901,19 +902,170 @@ class TestCIDREdgeCases:
         # This should return False, not raise TypeError
         assert policy.is_allowed("192.0.2.1") is False
 
-    def test_cross_family_typeerror_caught(self):
-        """Non-standard network objects are safely skipped by isinstance guard."""
-        policy = AllowPolicy(["10.0.0.0/8"])
-        # Replace the network with a mock that raises TypeError on __contains__
-        mock_network = MagicMock()
-        mock_network.__contains__ = MagicMock(side_effect=TypeError("cross-family"))
+    def test_cross_family_never_matches_by_integer_coincidence(self):
+        """Networks are matched as integers, so the address family has to be compared too.
 
-        object.__setattr__(
-            policy,
-            "_network_rules",
-            (_NetworkRule(network=mock_network, port=None),),
+        ``::a00:1`` and ``10.0.0.1`` are the same integer.
+        """
+        v4_policy = AllowPolicy(["10.0.0.0/8"], allow_localhost=False)
+        assert v4_policy.is_allowed("10.0.0.1") is True
+        assert v4_policy.is_allowed("::a00:1") is False
+
+        v6_policy = AllowPolicy(["::a00:0/120"], allow_localhost=False)
+        assert v6_policy.is_allowed("::a00:1") is True
+        assert v6_policy.is_allowed("10.0.0.1") is False
+        assert v6_policy._has_any_port_rule("::a00:1") is True
+        assert v6_policy._has_any_port_rule("10.0.0.1") is False
+
+    def test_ipv4_mapped_checked_against_both_families(self):
+        policy = AllowPolicy(["192.0.2.0/24:443", "::ffff:198.51.100.0/120"], allow_localhost=False)
+        # Through the embedded IPv4 address, against the IPv4 network.
+        assert policy.is_allowed("::ffff:192.0.2.9", 443) is True
+        assert policy.is_allowed("::ffff:192.0.2.9", 80) is False
+        # As the IPv6 address it is, against the IPv6 network.
+        assert policy.is_allowed("::ffff:198.51.100.9", 80) is True
+        # A plain IPv4 address is not matched against an IPv4-mapped IPv6 network.
+        assert policy.is_allowed("198.51.100.9", 80) is False
+        assert policy.is_allowed("::ffff:203.0.113.9", 443) is False
+
+    def test_scope_id_on_rule_is_ignored(self):
+        """A zone index never took part in matching; the stored network has none."""
+        policy = AllowPolicy(["fe80::1%eth0"], allow_localhost=False)
+        assert policy.is_allowed("fe80::1%eth0") is True
+        assert policy.is_allowed("fe80::1") is True
+        assert policy.is_allowed("fe80::2%eth0") is False
+        assert _serialize_allow_list(policy) == ["fe80::1/128"]
+
+
+class TestRuleImmutability:
+    """Rules are tuples of primitives: nothing reachable from a policy can be rewritten.
+
+    The locked-mode guardian verifies only the identity of each policy slot,
+    so a rule whose fields could be reassigned in place would silently widen
+    a locked policy.
+    """
+
+    def test_network_rule_fields_cannot_be_reassigned(self):
+        policy = AllowPolicy(["203.0.113.0/24"], allow_localhost=False)
+        (rule,) = policy._network_rules
+        loopback = ipaddress.ip_network("127.0.0.0/8")
+
+        for name, value in [
+            ("network", loopback),
+            ("version", 4),
+            ("net", int(loopback.network_address)),
+            ("mask", int(loopback.netmask)),
+            ("prefixlen", 8),
+            ("port", 1),
+            ("anything_else", 1),
+        ]:
+            with pytest.raises(AttributeError):
+                object.__setattr__(rule, name, value)
+            with pytest.raises(AttributeError):
+                setattr(rule, name, value)
+
+        assert rule.network == ipaddress.ip_network("203.0.113.0/24")
+        assert policy.is_allowed("127.0.0.1") is False
+        assert policy.is_allowed("203.0.113.7") is True
+
+    def test_host_rule_fields_cannot_be_reassigned(self):
+        policy = AllowPolicy(["*.example.com:443"], allow_localhost=False)
+        (rule,) = policy._host_rules
+
+        for name, value in [("pattern", "*"), ("port", None), ("anything_else", 1)]:
+            with pytest.raises(AttributeError):
+                object.__setattr__(rule, name, value)
+            with pytest.raises(AttributeError):
+                setattr(rule, name, value)
+
+        assert rule == ("*.example.com", 443)
+        assert policy.is_allowed("evil.test", 443) is False
+        assert policy.is_allowed("api.example.com", 80) is False
+
+    def test_rules_have_no_instance_dict_and_only_primitive_fields(self):
+        policy = AllowPolicy(["*.example.com:443", "10.0.0.0/8", "[2001:db8::]/32:443"])
+        for rule in (*policy._host_rules, *policy._network_rules):
+            assert isinstance(rule, tuple)
+            assert not hasattr(rule, "__dict__")
+            assert all(type(field) in (str, int, type(None)) for field in rule)
+
+    def test_every_policy_slot_is_deeply_immutable(self):
+        policy = AllowPolicy(
+            ["api.example.com", "db.example.com:5432", "*.example.com:443", "10.0.0.0/8:80"]
         )
-        assert policy.is_allowed("192.0.2.1") is False
+
+        def assert_immutable(value):
+            if isinstance(value, (tuple, frozenset)):
+                for item in value:
+                    assert_immutable(item)
+            else:
+                assert type(value) in (str, int, bool, type(None)), value
+
+        for slot in AllowPolicy.__slots__:
+            assert_immutable(getattr(policy, slot))
+
+    def test_matching_reads_exact_tuples_that_mirror_the_rules(self):
+        policy = AllowPolicy(["*.example.com:443", "a?.example.org", "10.0.0.0/8", "[::1]:53"])
+        assert policy._host_rule_fields == tuple((r.pattern, r.port) for r in policy._host_rules)
+        assert policy._network_rule_fields == tuple(
+            (r.version, r.net, r.mask, r.port) for r in policy._network_rules
+        )
+        for fields in (*policy._host_rule_fields, *policy._network_rule_fields):
+            assert type(fields) is tuple
+
+    @pytest.mark.parametrize(
+        ("name", "replacement"),
+        [
+            ("network", property(lambda self: ipaddress.ip_network("0.0.0.0/0"))),
+            ("version", property(lambda self: 4)),
+            ("net", property(lambda self: 0)),
+            ("mask", property(lambda self: 0)),
+            ("prefixlen", property(lambda self: 0)),
+            ("port", property(lambda self: None)),
+            ("__iter__", lambda self: iter((4, 0, 0, 0, None))),
+            ("__getitem__", lambda self, index: (4, 0, 0, 0, None)[index]),
+            ("__eq__", lambda self, other: True),
+        ],
+    )
+    def test_patching_the_network_rule_class_does_not_change_decisions(
+        self, monkeypatch, name, replacement
+    ):
+        policy = AllowPolicy(["203.0.113.0/24:443"], allow_localhost=False)
+        monkeypatch.setattr(_NetworkRule, name, replacement)
+
+        assert policy.is_allowed("203.0.113.7", 443) is True
+        assert policy.is_allowed("203.0.113.7", 80) is False
+        assert policy.is_allowed("127.0.0.1", 443) is False
+        assert policy.is_allowed("198.51.100.1", 443) is False
+        assert policy._has_any_port_rule("203.0.113.7") is False
+
+    @pytest.mark.parametrize(
+        ("name", "replacement"),
+        [
+            ("pattern", property(lambda self: "*")),
+            ("port", property(lambda self: None)),
+            ("__iter__", lambda self: iter(("*", None))),
+            ("__getitem__", lambda self, index: ("*", None)[index]),
+        ],
+    )
+    def test_patching_the_host_rule_class_does_not_change_decisions(
+        self, monkeypatch, name, replacement
+    ):
+        policy = AllowPolicy(["*.example.com:443", "192.0.2.*:443"], allow_localhost=False)
+        monkeypatch.setattr(_HostRule, name, replacement)
+
+        assert policy.is_allowed("api.example.com", 443) is True
+        assert policy.is_allowed("api.example.com", 80) is False
+        assert policy.is_allowed("evil.test", 443) is False
+        assert policy.is_allowed("192.0.2.1", 443) is True
+        assert policy.is_allowed("198.51.100.1", 443) is False
+        assert policy._has_any_port_rule("api.example.com") is False
+
+    def test_network_property_rebuilds_the_parsed_network(self):
+        for text in ["10.0.0.0/8", "192.0.2.1", "2001:db8::/32", "::1", "0.0.0.0/0", "::/0"]:
+            (rule,) = AllowPolicy([text])._network_rules
+            assert rule.network == ipaddress.ip_network(text)
+            assert _NetworkRule.from_network(rule.network, rule.port) == rule
 
 
 class TestScopeIdStripping:

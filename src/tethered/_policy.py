@@ -7,25 +7,57 @@ import ipaddress
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from typing import NamedTuple
 
 logger = logging.getLogger("tethered")
 
+# Rules are tuples of primitives so that a policy is immutable all the way
+# down.  The locked-mode guardian verifies the *identity* of each AllowPolicy
+# slot, which says nothing about objects reachable through it: a frozen
+# dataclass can still be rewritten with ``object.__setattr__``, and so can the
+# attributes of an ``ipaddress`` network.  A tuple of ints and strings cannot.
 
-@dataclass(frozen=True, slots=True)
-class _HostRule:
+
+class _HostRule(NamedTuple):
     """A parsed allow rule for hostname matching."""
 
     pattern: str  # lowercase, e.g. "*.stripe.com" or "api.example.com"
     port: int | None  # None means any port
 
 
-@dataclass(frozen=True, slots=True)
-class _NetworkRule:
-    """A parsed allow rule for CIDR matching."""
+class _NetworkRule(NamedTuple):
+    """A parsed allow rule for CIDR matching, held as integers."""
 
-    network: ipaddress.IPv4Network | ipaddress.IPv6Network
-    port: int | None
+    version: int  # 4 or 6
+    net: int  # network address
+    mask: int  # netmask
+    prefixlen: int
+    port: int | None  # None means any port
+
+    @classmethod
+    def from_network(
+        cls,
+        network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+        port: int | None,
+    ) -> _NetworkRule:
+        return cls(
+            network.version,
+            int(network.network_address),
+            int(network.netmask),
+            network.prefixlen,
+            port,
+        )
+
+    @property
+    def network(self) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+        """The network as an ``ipaddress`` object, rebuilt on every access.
+
+        For serialization and tests — matching and the scope-overlap check
+        work on the integer fields and never come through here.
+        """
+        if self.version == 4:
+            return ipaddress.IPv4Network((self.net, self.prefixlen))
+        return ipaddress.IPv6Network((self.net, self.prefixlen))
 
 
 def _could_be_ip(host: str) -> bool:
@@ -54,6 +86,10 @@ class AllowPolicy:
     """Immutable policy object built from an allow list.
 
     Thread-safe to read from multiple threads after construction.
+
+    Every slot holds a ``bool``, ``frozenset`` or ``tuple`` whose contents
+    are strings, integers and tuples of those — nothing with an attribute
+    that could be reassigned after the fact.
     """
 
     __slots__ = (
@@ -61,7 +97,9 @@ class AllowPolicy:
         "_exact_hosts",
         "_exact_hosts_any_port",
         "_exact_hosts_with_port",
+        "_host_rule_fields",
         "_host_rules",
+        "_network_rule_fields",
         "_network_rules",
     )
 
@@ -99,8 +137,7 @@ class AllowPolicy:
             if rule.startswith("["):
                 bracketed = _parse_bracketed_ip(rule, raw)
                 if bracketed is not None:
-                    network, port = bracketed
-                    network_rules.append(_NetworkRule(network=network, port=port))
+                    network_rules.append(_NetworkRule.from_network(*bracketed))
                     continue
 
             if _has_port_suffix(rule):
@@ -123,7 +160,7 @@ class AllowPolicy:
             # Try to parse as CIDR network or IP address
             try:
                 network = ipaddress.ip_network(rule, strict=False)
-                network_rules.append(_NetworkRule(network=network, port=port))
+                network_rules.append(_NetworkRule.from_network(network, port))
                 continue
             except ValueError:
                 pass
@@ -192,20 +229,33 @@ class AllowPolicy:
         self._exact_hosts_with_port: frozenset[str] = frozenset(exact_hosts_with_port)
         self._host_rules: tuple[_HostRule, ...] = tuple(wildcard_rules)
         self._network_rules: tuple[_NetworkRule, ...] = tuple(network_rules)
+        # Plain-tuple copies of the rule fields, which is what the matching
+        # methods read.  Unpacking an exact tuple looks nothing up on the rule
+        # classes, so whatever is patched onto _HostRule or _NetworkRule (a
+        # field, ``network``, ``__iter__``) cannot change a decision.  CPython
+        # also unpacks exact tuples faster than instances of a tuple subclass.
+        self._host_rule_fields: tuple[tuple[str, int | None], ...] = tuple(
+            (r.pattern, r.port) for r in wildcard_rules
+        )
+        self._network_rule_fields: tuple[tuple[int, int, int, int | None], ...] = tuple(
+            (r.version, r.net, r.mask, r.port) for r in network_rules
+        )
 
     def _has_any_port_rule(self, host: str) -> bool:
         """Check if a host has a port-unrestricted rule (exact or wildcard or CIDR)."""
         host_lower = _normalize_host(host)
         if host_lower in self._exact_hosts_any_port:
             return True
-        for rule in self._host_rules:
-            if rule.port is None and fnmatch.fnmatchcase(host_lower, rule.pattern):
+        for pattern, rule_port in self._host_rule_fields:
+            if rule_port is None and fnmatch.fnmatchcase(host_lower, pattern):
                 return True
         if _could_be_ip(host_lower):
             try:
                 ip = ipaddress.ip_address(host_lower)
-                for rule in self._network_rules:
-                    if rule.port is None and ip in rule.network:
+                ip_version = ip.version
+                ip_int = int(ip)
+                for version, net, mask, rule_port in self._network_rule_fields:
+                    if rule_port is None and version == ip_version and ip_int & mask == net:
                         return True
             except ValueError:
                 pass
@@ -241,10 +291,10 @@ class AllowPolicy:
         if port is None and hostname in self._exact_hosts_with_port:
             return True
         # Fall through to wildcard rules
-        for rule in self._host_rules:
-            if rule.port is not None and port is not None and rule.port != port:
+        for pattern, rule_port in self._host_rule_fields:
+            if rule_port is not None and port is not None and rule_port != port:
                 continue
-            if fnmatch.fnmatchcase(hostname, rule.pattern):
+            if fnmatch.fnmatchcase(hostname, pattern):
                 return True
         return False
 
@@ -258,27 +308,31 @@ class AllowPolicy:
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
             ipv4_mapped = ip.ipv4_mapped
 
-        # Check CIDR network rules (isinstance guard avoids cross-family TypeError)
-        for rule in self._network_rules:
-            if rule.port is not None and port is not None and rule.port != port:
+        # Check CIDR network rules.  An address is inside a network of its own
+        # family when its masked integer equals the network address — the test
+        # ``ipaddress`` itself applies.  An IPv4-mapped IPv6 address is checked
+        # against IPv4 networks as well, through the IPv4 address it embeds.
+        ip_version = ip.version
+        ip_int = int(ip)
+        mapped_int = int(ipv4_mapped) if ipv4_mapped is not None else None
+        for version, net, mask, rule_port in self._network_rule_fields:
+            if rule_port is not None and port is not None and rule_port != port:
                 continue
-            if isinstance(rule.network, ipaddress.IPv4Network):
-                if isinstance(ip, ipaddress.IPv4Address) and ip in rule.network:
+            if version == ip_version:
+                if ip_int & mask == net:
                     return True
-                if ipv4_mapped is not None and ipv4_mapped in rule.network:
-                    return True
-            elif isinstance(ip, ipaddress.IPv6Address) and ip in rule.network:
+            elif mapped_int is not None and mapped_int & mask == net:
                 return True
 
         # Check wildcard host rules (e.g. "192.0.2.*")
         ip_str = str(ip)
         mapped_str = str(ipv4_mapped) if ipv4_mapped is not None else None
-        for rule in self._host_rules:
-            if rule.port is not None and port is not None and rule.port != port:
+        for pattern, rule_port in self._host_rule_fields:
+            if rule_port is not None and port is not None and rule_port != port:
                 continue
-            if fnmatch.fnmatchcase(ip_str, rule.pattern):
+            if fnmatch.fnmatchcase(ip_str, pattern):
                 return True
-            if mapped_str is not None and fnmatch.fnmatchcase(mapped_str, rule.pattern):
+            if mapped_str is not None and fnmatch.fnmatchcase(mapped_str, pattern):
                 return True
 
         return False
@@ -347,14 +401,21 @@ class AllowPolicy:
             "full" — an identical or narrower CIDR exists in this policy.
         """
         best = "none"
+        version = network.version
+        net = int(network.network_address)
+        mask = int(network.netmask)
         for rule in self._network_rules:
-            if not network.overlaps(rule.network):
+            # Two CIDR blocks of one family overlap exactly when they agree on
+            # every bit of the shorter prefix — the bits both netmasks keep.
+            # (Integers again: rebuilding rule.network for every rule on every
+            # scope() would cost far more than this comparison.)
+            if rule.version != version or (net ^ rule.net) & mask & rule.mask:
                 continue
             # Networks overlap — check port compatibility
             if port is not None and rule.port is not None and port != rule.port:
                 continue  # disjoint ports on this rule — try the next one
             ports_match = port == rule.port
-            network_narrower = network.prefixlen >= rule.network.prefixlen
+            network_narrower = network.prefixlen >= rule.prefixlen
             if network_narrower and ports_match:
                 return "full"
             best = "partial"

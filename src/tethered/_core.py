@@ -2020,14 +2020,18 @@ def _serialize_network_rule(rule: Any) -> str:
     parser cannot tell where the address ends and the port begins.  Bracket
     IPv6 networks when a port is present so the serialized form matches the
     bracketed syntax accepted by ``AllowPolicy`` (``[2001:db8::]/32:443``).
+
+    A rule stores its network as integers; ``rule.network`` rebuilds the
+    ``ipaddress`` object on each access, so it is read once here.
     """
+    network = rule.network
     if rule.port is None:
-        return str(rule.network)
-    if rule.network.version == 6:
-        addr, _, prefix = str(rule.network).partition("/")
+        return str(network)
+    if network.version == 6:
+        addr, _, prefix = str(network).partition("/")
         bracketed = f"[{addr}]/{prefix}" if prefix else f"[{addr}]"
         return f"{bracketed}:{rule.port}"
-    return f"{rule.network}:{rule.port}"
+    return f"{network}:{rule.port}"
 
 
 def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
