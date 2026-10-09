@@ -4821,6 +4821,28 @@ class TestScopeOverlapFollowsThePolicyParser:
             ("none", "x[ab].example.com")
         ]
 
+    @pytest.mark.parametrize(
+        ("global_allow", "scope_rule", "activate_kwargs"),
+        [
+            # Reported as never matching, although the global rule covers it.
+            (["*.example.*"], "*.example.com", {}),
+            (["*.example.*"], "x[ab].example.com", {}),
+            # Reported as broader, although the two share no hostname.
+            (["??.example.com"], "[ab].example.com", {}),
+            (["??.example.com"], "*.api.example.com", {}),
+            # Reported as never matching, although the addresses are allowed.
+            (["10.0.0.0/24"], "10.0.0.*", {"allow_localhost": False}),
+            (["192.0.2.*"], "192.0.2.0/24", {"allow_localhost": False}),
+            (["api.example.com:443"], "127.0.0.0/8", {}),
+            (["api.example.com:443"], "local*", {}),
+        ],
+    )
+    def test_nothing_is_reported_when_the_overlap_cannot_be_told(
+        self, caplog, global_allow, scope_rule, activate_kwargs
+    ):
+        """A guess would be logged as a fact; these used to be wrong ones."""
+        assert self._overlap_warnings(caplog, global_allow, [scope_rule], **activate_kwargs) == []
+
     def test_warning_names_the_rule_as_the_user_wrote_it(self, caplog):
         written = "  Dead.Example.TEST.:443 "
         tethered.activate(allow=["api.stripe.com:443"])

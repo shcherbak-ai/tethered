@@ -2699,7 +2699,9 @@ class scope:
 
         Each rule is judged as ``scope_policy`` parsed it (``_parsed_rules``
         has one entry per ``allow`` entry, in the same order); ``allow`` only
-        supplies the text the user wrote, for the message.
+        supplies the text the user wrote, for the message.  A rule whose
+        overlap cannot be told ("unknown") is not reported: the message would
+        state a guess as a fact.
         """
         # strict=False: the two always pair up, and a warning pass is not the
         # place to raise if they ever did not.

@@ -358,6 +358,10 @@ class AllowPolicy:
             "none" — no connection can satisfy both the rule and this policy.
             "partial" — some overlap, but the rule is broader than this policy.
             "full" — this policy allows everything the rule allows.
+            "unknown" — none of these is certain.  Two wildcard patterns, or
+                a pattern and a range of addresses, cannot always be compared
+                from their text, and a guess would be reported to the user as
+                a fact.
         """
         if isinstance(rule, _NetworkRule):
             version, net, mask, prefixlen, port = rule
@@ -372,7 +376,14 @@ class AllowPolicy:
                 ):
                     return "full"
             if prefixlen < (32 if version == 4 else 128):
-                # A range that no single rule covers: partial or no overlap.
+                # A range that no single network rule covers: partial or no
+                # overlap, as far as network rules go.  The localhost allowance
+                # and wildcards over address text ("192.0.2.*") allow addresses
+                # too, and how much of the range they allow is not worked out.
+                if (self._allow_localhost and _touches_localhost(version, net, mask)) or any(
+                    _may_match_address_text(pattern) for pattern, _ in self._host_rule_fields
+                ):
+                    return "unknown"
                 return self._check_cidr_overlap(rule.network, port)
             # A single address is one destination, like an exact hostname.  A
             # wildcard over address text ("192.0.2.*"), the localhost allowance
@@ -404,6 +415,11 @@ class AllowPolicy:
             "full" — a wildcard rule of this policy is sure to cover the scope rule:
                 the same pattern, or "*" + text that the scope pattern ends with,
                 on the same port or on any port.
+            "unknown" — a rule of this policy may overlap the scope rule in a
+                way that cannot be told from the two patterns (see
+                ``_wildcard_relation``), or the pattern may match the text of
+                an address that a network rule or the localhost allowance
+                covers.  Short of "full", that leaves nothing certain.
         """
 
         def _ports_overlap(global_port: int | None) -> bool:
@@ -413,19 +429,25 @@ class AllowPolicy:
 
         # Best result across all global rules: full > partial > none
         best = "none"
+        # Set when a rule may overlap the scope rule in a way that is not
+        # worked out here: nothing short of "full" is certain then.
+        unsure = False
 
-        # Check global wildcard rules for one that matches every hostname of
-        # the scope rule: the same pattern, or "*" + text that the scope
-        # pattern ends with.  That is "full" on the scope rule's port or on
-        # any port, and "partial" when only the scope rule is open to all ports
+        # Check global wildcard rules.  One that matches every hostname of the
+        # scope rule is "full" on the scope rule's port or on any port, and
+        # "partial" when only the scope rule is open to all ports.
         for rule_pattern, rule_port in self._host_rule_fields:
-            if rule_pattern == pattern or (
-                pattern.endswith(rule_pattern[1:]) and _is_suffix_wildcard(rule_pattern)
-            ):
+            if not _ports_overlap(rule_port):
+                continue  # no port in common: no connection satisfies both
+            relation = _wildcard_relation(pattern, rule_pattern)
+            if relation == "inside":
                 if rule_port is None or rule_port == port:
                     return "full"
-                if _ports_overlap(rule_port):
-                    best = "partial"
+                best = "partial"
+            elif relation == "wider":
+                best = "partial"
+            elif relation == "unknown":
+                unsure = True
 
         # Check exact hostnames — a wildcard matching an exact host is always
         # "partial" at best because the wildcard covers more hosts
@@ -438,21 +460,16 @@ class AllowPolicy:
                 best = "partial"
                 break
 
-        # Check overlap with global wildcards via suffix heuristic
-        if best == "none":
-            for rule in self._host_rules:
-                scope_suffix = pattern.lstrip("*?")
-                rule_suffix = rule.pattern.lstrip("*?")
-                if (
-                    scope_suffix
-                    and rule_suffix
-                    and (scope_suffix.endswith(rule_suffix) or rule_suffix.endswith(scope_suffix))
-                    and _ports_overlap(rule.port)
-                ):
-                    best = "partial"
-                    break
+        # A pattern is matched against the text of an address as well, and
+        # nothing above compares it with this policy's network rules or with
+        # its localhost allowance.
+        if (
+            (self._network_rule_fields or self._allow_localhost)
+            and _may_match_address_text(pattern)
+        ) or (self._allow_localhost and fnmatch.fnmatchcase("localhost", pattern)):
+            unsure = True
 
-        return best
+        return "unknown" if unsure else best
 
     def _check_cidr_overlap(
         self,
@@ -571,6 +588,92 @@ def _is_suffix_wildcard(pattern: str) -> bool:
     """
     text = pattern[1:]
     return pattern.startswith("*") and not _is_wildcard_pattern(text) and "]" not in text
+
+
+def _literal_ends(pattern: str) -> tuple[str, str]:
+    """Return text that every match of a wildcard pattern starts and ends with.
+
+    The text before the first "*", "?" or "[", and the text after the last
+    "*", "?" or "]".  A bracket that is not part of a character set is literal
+    and only makes an end shorter than it could be, never wrong.
+    """
+    start = min(i for i in (pattern.find("*"), pattern.find("?"), pattern.find("[")) if i >= 0)
+    end = max(pattern.rfind("*"), pattern.rfind("?"), pattern.rfind("]"))
+    return pattern[:start], pattern[end + 1 :]
+
+
+def _wildcard_relation(pattern: str, other: str) -> str:
+    """Say how the hostnames of wildcard ``pattern`` relate to those of wildcard ``other``.
+
+    Only what is certain is said:
+        "inside" — ``other`` matches every hostname ``pattern`` matches.
+        "wider" — ``pattern`` matches every hostname of ``other``, and more.
+        "apart" — no hostname matches both.
+        "unknown" — anything else.  Deciding it would take comparing the two
+            patterns as automata; the shapes handled here ("*" + text, and
+            patterns that must start or end differently) are the ones that
+            allow lists are made of.
+    """
+    if pattern == other:
+        return "inside"
+    if _is_suffix_wildcard(other):
+        text = other[1:]
+        if pattern.endswith(text):
+            return "inside"  # every match ends with the text ``other`` asks for
+        if _is_suffix_wildcard(pattern) and text.endswith(pattern[1:]):
+            return "wider"  # ``other`` asks for a longer ending than ``pattern``
+    start, end = _literal_ends(pattern)
+    other_start, other_end = _literal_ends(other)
+    if not (start.startswith(other_start) or other_start.startswith(start)):
+        return "apart"
+    if not (end.endswith(other_end) or other_end.endswith(end)):
+        return "apart"
+    return "unknown"
+
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_DIGITS_AND_DOTS = frozenset("0123456789.")
+
+
+def _may_match_address_text(pattern: str) -> bool:
+    """Return False only for a wildcard pattern that matches no IP address text.
+
+    Address text is what ``str()`` gives for an address: digits and dots for
+    IPv4; hex digits and colons for IPv6, where an IPv4-mapped address can end
+    in dotted digits.  A pattern holds no ":" itself, so only a wildcard can
+    match one.  Its literal characters therefore have to be hex digits up to
+    its first literal dot, and digits or dots after it.  A character set
+    counts as a wildcard, which errs toward True.
+    """
+    shape = _CHAR_SET_RE.sub("?", pattern) if "[" in pattern else pattern
+    before_dot, _, after_dot = shape.replace("*", "").replace("?", "").partition(".")
+    return _HEX_DIGITS.issuperset(before_dot) and _DIGITS_AND_DOTS.issuperset(after_dot)
+
+
+# What _is_localhost() accepts, as (version, network address, netmask): the
+# loopback and unspecified addresses, and their IPv4-mapped IPv6 forms.
+_LOCALHOST_NETWORKS = tuple(
+    (network.version, int(network.network_address), int(network.netmask))
+    for network in map(
+        ipaddress.ip_network,
+        (
+            "127.0.0.0/8",
+            "0.0.0.0/32",  # nosec B104
+            "::1/128",
+            "::/128",
+            "::ffff:127.0.0.0/104",
+            "::ffff:0.0.0.0/128",
+        ),
+    )
+)
+
+
+def _touches_localhost(version: int, net: int, mask: int) -> bool:
+    """Return True if the network holds, or lies within, addresses that count as localhost."""
+    return any(
+        version == local_version and not (net ^ local_net) & mask & local_mask
+        for local_version, local_net, local_mask in _LOCALHOST_NETWORKS
+    )
 
 
 # An fnmatch character set: "[seq]" or "[!seq]", where a "]" directly after

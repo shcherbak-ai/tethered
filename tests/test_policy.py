@@ -19,8 +19,12 @@ from tethered._policy import (
     _is_localhost,
     _is_suffix_wildcard,
     _is_wildcard_pattern,
+    _literal_ends,
+    _may_match_address_text,
     _NetworkRule,
     _normalize_host,
+    _touches_localhost,
+    _wildcard_relation,
 )
 
 
@@ -1294,12 +1298,223 @@ class TestRuleOverlap:
         assert self._overlap(global_allow, scope_rule, allow_localhost=True) == "full"
         assert self._overlap(global_allow, scope_rule, allow_localhost=False) == "none"
 
+    @pytest.mark.parametrize(
+        ("global_allow", "allow_localhost", "scope_rule"),
+        [
+            # Two wildcards that neither contain each other for certain nor
+            # have to start or end differently.  (True answers, in order:
+            # full, full, none, none, none, partial, partial.)
+            (["*.example.*"], False, "*.example.com"),
+            (["*.example.*"], False, "x[ab].example.com"),
+            (["??.example.com"], False, "[ab].example.com"),
+            (["[ab].example.com"], False, "x[ab].example.com"),
+            (["??.example.com"], False, "*.api.example.com"),
+            (["*.com"], False, "api.*"),
+            (["a*.example.com"], False, "*.example.com"),
+            # Certain overlap with one rule says nothing about another rule
+            # that may cover the pattern entirely ("?.example.com" does).
+            (["a.example.com", "?.example.com"], False, "[ab].example.com"),
+            (["*.example.com:443", "*.example.*"], False, "*.example.com"),
+            (["*.s3.example.com", "*.example.*"], False, "*.example.com"),
+            # A pattern over address text next to a network rule or localhost.
+            (["10.0.0.0/24"], False, "10.0.0.*"),
+            (["10.0.0.0/24"], False, "10.0.0.?"),
+            (["10.0.0.0/24:443"], False, "10.*:80"),
+            (["2001:db8::/32"], False, "2001*"),
+            (["api.example.com"], True, "127.*"),
+            (["api.example.com"], True, "local*"),
+            (["api.example.com"], True, "localhos[t]"),
+            # A range next to the localhost allowance or a pattern over address text.
+            (["api.example.com:443"], True, "127.0.0.0/8"),
+            (["api.example.com:443"], True, "127.0.0.0/7"),
+            (["api.example.com:443"], True, "0.0.0.0/0"),
+            (["api.example.com:443"], True, "::/0"),
+            (["api.example.com:443"], True, "::ffff:127.0.0.0/104"),
+            (["10.0.0.0/24"], True, "0.0.0.0/5"),
+            (["192.0.2.*"], False, "192.0.2.0/24"),
+            (["192.0.2.*:443"], False, "198.51.100.0/24:80"),
+        ],
+    )
+    def test_overlap_that_cannot_be_told_is_unknown(
+        self, global_allow, allow_localhost, scope_rule
+    ):
+        overlap = self._overlap(global_allow, scope_rule, allow_localhost=allow_localhost)
+        assert overlap == "unknown"
+
+    @pytest.mark.parametrize(
+        ("global_allow", "allow_localhost", "scope_rule", "expected"),
+        [
+            # What could not be told does not matter once a rule covers the scope rule.
+            (["*.example.*", "*.example.com"], True, "*.example.com", "full"),
+            (["10.*", "10.0.0.0/8"], True, "10.1.0.0/16", "full"),
+            (["10.0.0.0/8", "10.*"], True, "10.*", "full"),
+            # Disjoint ports rule a wildcard rule out, whatever its pattern.
+            (["*.example.*:443"], False, "*.example.com:80", "none"),
+            # Patterns that have to start or end differently share no hostname.
+            (["*.other.org"], False, "??.example.com", "none"),
+            (["api-*"], False, "www-*", "none"),
+            (["*.bar.com"], False, "*.foo.com", "none"),
+            # Hostname patterns are untouched by network rules and localhost.
+            (["10.0.0.0/24"], True, "*.example.com", "none"),
+            (["10.0.0.0/24"], True, "*.cafe.de", "none"),
+            (["10.0.0.0/24", "api.example.com:443"], True, "*.example.com", "partial"),
+            # Ranges away from localhost are untouched by its allowance.
+            (["10.0.0.0/24"], True, "10.0.0.0/8", "partial"),
+            (["10.0.0.0/24"], True, "192.168.0.0/16", "none"),
+            (["*.example.com"], True, "192.168.0.0/16", "none"),
+        ],
+    )
+    def test_what_is_certain_stays_certain(
+        self, global_allow, allow_localhost, scope_rule, expected
+    ):
+        overlap = self._overlap(global_allow, scope_rule, allow_localhost=allow_localhost)
+        assert overlap == expected
+
     def test_any_port_lookup_of_an_already_normalized_host(self):
         policy = AllowPolicy(["host"], allow_localhost=False)
         assert policy._has_any_port_rule("HOST.") is True
         assert policy._has_any_port_rule("host", _normalized=True) is True
         # Taken as given: "host." is the stored form of the rule "host..".
         assert policy._has_any_port_rule("host.", _normalized=True) is False
+
+
+class TestWildcardRelation:
+    """``_wildcard_relation`` says how two wildcard patterns relate only when it is certain."""
+
+    @pytest.mark.parametrize(
+        ("pattern", "other", "expected"),
+        [
+            ("*.example.com", "*.example.com", "inside"),
+            ("x[ab].example.*", "x[ab].example.*", "inside"),
+            ("*.s3.example.com", "*.example.com", "inside"),
+            ("api-??.example.com", "*.example.com", "inside"),
+            ("[ab].example.com", "*.example.com", "inside"),
+            ("*.example.com", "*example.com", "inside"),
+            ("*.example.com", "*.s3.example.com", "wider"),
+            ("*example.com", "*.example.com", "wider"),
+            ("*.foo.com", "*.bar.com", "apart"),
+            ("??.example.com", "*.other.org", "apart"),
+            ("*.other.org", "??.example.com", "apart"),
+            ("api-*", "www-*", "apart"),
+            ("api.*.com", "www.*.com", "apart"),
+            ("*.example.com", "*.example.*", "unknown"),
+            ("*.example.*", "*.example.com", "unknown"),
+            ("x[ab].example.com", "[ab].example.com", "unknown"),
+            ("[ab].example.com", "??.example.com", "unknown"),
+            ("*.api.example.com", "??.example.com", "unknown"),
+            ("api.*", "*.com", "unknown"),
+            ("*.example.com", "a*.example.com", "unknown"),
+            # "]" in the text after "*": it could close a character set of the other pattern.
+            ("[ab].example.com", "*].example.com", "unknown"),
+        ],
+    )
+    def test_relation(self, pattern, other, expected):
+        assert _wildcard_relation(pattern, other) == expected
+
+    @pytest.mark.parametrize(
+        ("pattern", "start", "end"),
+        [
+            ("*.example.com", "", ".example.com"),
+            ("api.*", "api.", ""),
+            ("api-??.example.com", "api-", ".example.com"),
+            ("x[ab].example.com", "x", ".example.com"),
+            ("a*b?c[de]f", "a", "f"),
+            ("?", "", ""),
+            # An unclosed "[" is literal: cutting the start there is short, not wrong.
+            ("a[b", "a", "a[b"),
+            # So is a "]" that closes nothing, and the same goes for the end.
+            ("a]b*c]d", "a]b", "d"),
+        ],
+    )
+    def test_literal_ends(self, pattern, start, end):
+        assert _literal_ends(pattern) == (start, end)
+
+
+class TestMayMatchAddressText:
+    """False only for a pattern that cannot match the text of any IP address."""
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "10.*",
+            "192.0.2.?",
+            "10.0.0.[0-9]",
+            "*.1",
+            "1?7.0.0.1",
+            "2001*",
+            "*1",
+            "fe80*",
+            "?",
+            "*ffff?10.0.0.*",
+            "dead*",  # all hex digits: it could be the start of an IPv6 address
+        ],
+    )
+    def test_may_match(self, pattern):
+        assert _may_match_address_text(pattern) is True
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "*.example.com",
+            "*.stripe.com",
+            "api-??.example.com",
+            "local*",
+            "*.cafe.de",  # letters after a dot: address text has only digits there
+            "10.*.internal",
+            "g*",
+            "*-1",
+            "*_1",
+        ],
+    )
+    def test_cannot_match(self, pattern):
+        assert _may_match_address_text(pattern) is False
+
+
+class TestTouchesLocalhost:
+    @staticmethod
+    def _touches(text):
+        (rule,) = AllowPolicy([text])._parsed_rules
+        return _touches_localhost(rule.version, rule.net, rule.mask)
+
+    @pytest.mark.parametrize(
+        "network",
+        [
+            "127.0.0.0/8",
+            "127.5.0.0/16",
+            "127.0.0.0/7",
+            "0.0.0.0/0",
+            "0.0.0.0/8",
+            "::/0",
+            "::/127",
+            "::ffff:127.0.0.0/104",
+            "::ffff:0.0.0.0/96",
+        ],
+    )
+    def test_touches(self, network):
+        assert self._touches(network) is True
+
+    @pytest.mark.parametrize(
+        "network",
+        ["10.0.0.0/8", "126.0.0.0/8", "128.0.0.0/1", "1.0.0.0/8", "2001:db8::/32", "::2/127"],
+    )
+    def test_does_not_touch(self, network):
+        assert self._touches(network) is False
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "127.0.0.1",
+            "127.255.255.254",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+            "::ffff:0.0.0.0",
+        ],
+    )
+    def test_covers_every_address_that_counts_as_localhost(self, address):
+        assert _is_localhost(address) is True
+        assert self._touches(address) is True
 
 
 class TestWildcardUnderSuffixWildcard:

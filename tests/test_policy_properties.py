@@ -13,13 +13,24 @@ serialize the policy.  No audit hooks, no network, no filesystem.
 from __future__ import annotations
 
 import collections
+import fnmatch
 import ipaddress
+import itertools
+import re
 
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from tethered._core import _serialize_allow_list
-from tethered._policy import AllowPolicy, _could_be_ip, _NetworkRule, _normalize_host
+from tethered._policy import (
+    AllowPolicy,
+    _could_be_ip,
+    _is_wildcard_pattern,
+    _may_match_address_text,
+    _NetworkRule,
+    _normalize_host,
+    _wildcard_relation,
+)
 
 # Constrained alphabets keep generated hostnames short, ASCII-only, and
 # unable to look like IPs or localhost — so localhost detection doesn't
@@ -158,6 +169,73 @@ class TestNetworkRuleRepresentation:
         else:
             expected = "partial"
         assert policy._check_cidr_overlap(scope_net, scope_port) == expected
+
+
+# Every string of up to five characters over a small alphabet, brackets
+# included: the reference that the relation of two patterns is checked against.
+_SMALL_ALPHABET = "ab.[]"
+_SMALL_STRINGS = tuple(
+    "".join(chars)
+    for length in range(6)
+    for chars in itertools.product(_SMALL_ALPHABET, repeat=length)
+)
+_wildcard_pattern = (
+    st.lists(
+        st.sampled_from(["a", "b", ".", "*", "?", "[ab]", "[!a]", "[", "]"]),
+        min_size=1,
+        max_size=5,
+    )
+    .map("".join)
+    .filter(_is_wildcard_pattern)
+)
+
+
+def _matches(pattern: str) -> frozenset[str]:
+    matcher = re.compile(fnmatch.translate(pattern)).match
+    return frozenset(s for s in _SMALL_STRINGS if matcher(s))
+
+
+class TestWildcardRelationIsSound:
+    """Whatever ``_wildcard_relation`` says other than "unknown" has to be true."""
+
+    @given(pattern=_wildcard_pattern, other=_wildcard_pattern)
+    def test_against_every_small_string(self, pattern, other):
+        relation = _wildcard_relation(pattern, other)
+        matched, other_matched = _matches(pattern), _matches(other)
+        if relation == "inside":
+            assert matched <= other_matched
+        elif relation == "wider":
+            assert other_matched < matched
+        elif relation == "apart":
+            assert not matched & other_matched
+        else:
+            assert relation == "unknown"
+
+    @given(pattern=_wildcard_pattern)
+    def test_a_pattern_is_inside_itself(self, pattern):
+        assert _wildcard_relation(pattern, pattern) == "inside"
+
+
+class TestMayMatchAddressTextIsSound:
+    """A pattern that matches the text of an address is never said to match none."""
+
+    @given(
+        ip=st.ip_addresses()
+        | st.ip_addresses(v=4).map(lambda a: ipaddress.ip_address(f"::ffff:{a}")),
+        data=st.data(),
+    )
+    def test_pattern_made_from_an_address(self, ip, data):
+        text = str(ip)
+        # A pattern holds no ":" (AllowPolicy rejects it), so a wildcard stands
+        # in for each one; other characters are replaced at random.
+        chars = ["?" if c == ":" or data.draw(st.booleans()) else c for c in text]
+        start = data.draw(st.integers(min_value=0, max_value=len(chars)))
+        end = data.draw(st.integers(min_value=start, max_value=len(chars)))
+        pattern = "".join(chars[:start]) + "*" + "".join(chars[end:])
+        assume(":" not in pattern)
+
+        assert fnmatch.fnmatchcase(text, pattern)
+        assert _may_match_address_text(pattern) is True
 
 
 class TestPortRestriction:
