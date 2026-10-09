@@ -138,7 +138,10 @@ class SubprocessBlocked(RuntimeError):
 # All per-activation state is bundled into a single frozen object that is
 # swapped atomically.  This eliminates the class of TOCTOU bugs where
 # _policy, _log_only, and _on_blocked could be read at different times
-# and see inconsistent state.  Safe on free-threaded Python (PEP 703).
+# and see inconsistent state: a hook reads ``_config`` once and works from
+# that one object.  (Nothing here has been validated without the GIL.  The
+# C guardian does not declare free-threading support, so on a free-threaded
+# build CPython re-enables the GIL when it is imported.)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,8 +211,25 @@ class _ScopeConfig:
 # ── Module-level state ──────────────────────────────────────────────
 # The audit hook is installed once. activate()/deactivate() swap the config.
 
+# Guards the one-time installation of the audit hook (_install_hook()).
 _state_lock = threading.Lock()
+
+# Serializes activate() and deactivate() from start to finish, so that the
+# config, the C guardian's state, the installed hook and the child-policy
+# environment variable always change together and describe the same policy
+# when either call returns.  Re-entrant: the environment writes made inside
+# a transition raise audit events that re-enter the hook on the same thread.
+# (_state_lock is not re-entrant; it is never held while this lock is being
+# acquired.)
+_lifecycle_lock = threading.RLock()
+
 _config: _Config | None = None
+
+_TAMPERED_POLICY_MSG = (
+    "tethered: the locked policy has failed its integrity check, so it can be "
+    "neither replaced nor deactivated — re-activating would take a fresh snapshot "
+    "of whatever has been put in place. Restart the process."
+)
 
 # IP -> hostnames mapping from intercepted getaddrinfo calls.  The key is the
 # canonical text of the address (see ``_canonical_ip``); the value is the
@@ -2884,7 +2904,7 @@ def _is_idempotent_reactivation(requested_payload: str) -> bool:
     identity.  Comparing JSON text is also exact about types: ``0`` is not
     ``false``.
 
-    Caller must hold ``_state_lock``.
+    Caller must hold ``_lifecycle_lock``.
     """
     current = _config
     if current is None or not current.locked:
@@ -2961,14 +2981,23 @@ def activate(
         TypeError: If ``lock_token`` is a singleton or an instance of an
             immutable built-in type.
         ValueError: If ``locked=True`` is used without ``lock_token``,
-            or if ``external_subprocess_policy`` is not a recognized value.
+            if ``external_subprocess_policy`` is not a recognized value, or
+            if the policy cannot be published to child processes because
+            its serialized form does not fit in an environment variable
+            (Windows limits one to 32,767 characters).
         TetheredLocked: If a locked policy is active, the correct
             ``lock_token`` is not provided, and the requested policy
             differs from the active one.  Re-activating with an identical
             policy is an idempotent no-op (``on_blocked`` and
             ``lock_token`` from the no-op call are ignored) — this keeps
             apps that call ``activate(locked=True)`` at import time
-            working inside auto-activated child processes.
+            working inside auto-activated child processes.  Also raised,
+            even with the correct token, when the active locked policy has
+            failed its integrity check.
+
+    The call is all-or-nothing: whenever it raises, the previously active
+    policy (or none), the lock, and the policy published to child processes
+    are exactly as they were.  Calls from several threads are serialized.
     """
     global _config
 
@@ -3027,45 +3056,71 @@ def activate(
         "replace a locked policy."
     )
 
-    with _state_lock:
+    with _lifecycle_lock:
         # The C guardian owns the lock: a locked policy exists only while the
         # guardian is active (locked=True requires the extension), and only
         # the guardian knows the token.  Without the extension nothing can
         # be locked, so there is nothing to check.
-        if (
-            _c_guardian is not None
-            and _c_guardian.is_active()
-            and not _c_guardian.check_token(lock_token)
-        ):
-            if _is_idempotent_reactivation(serialized_payload):
-                return
-            raise TetheredLocked(activate_locked_msg)
+        if _c_guardian is not None and _c_guardian.is_active():
+            if not _c_guardian.check_token(lock_token):
+                if _is_idempotent_reactivation(serialized_payload):
+                    return
+                raise TetheredLocked(activate_locked_msg)
+            if not _c_guardian.verify():
+                raise TetheredLocked(_TAMPERED_POLICY_MSG)
+
+        # Everything that can fail comes before anything is committed.
+        _install_hook()
+        snapshot = _build_integrity_snapshot(cfg) if locked else []
+        previous = _config
+        previous_env = os.environ.get(_CHILD_POLICY_ENV)
+        try:
+            # Publish the policy to spawn-mode child processes.  The
+            # tethered.pth shipped at the top of site-packages reads the
+            # variable in any Python interpreter that has tethered installed
+            # and re-engages tethered with the same policy.  (Fork-mode
+            # children inherit tethered state through the fork() copy.)
+            # This write is the step most likely to fail — Windows limits a
+            # variable to 32,767 characters — and, unlike the commit, it can
+            # be undone, so it goes first.
+            try:
+                _propagate_policy_to_env(cfg)
+            except ValueError as exc:
+                msg = (
+                    f"tethered: activate() failed — the policy could not be written to "
+                    f"the {_CHILD_POLICY_ENV} environment variable for child processes "
+                    f"({exc}). The serialized policy is {len(serialized_payload)} "
+                    f"characters long; Windows limits an environment variable to 32,767. "
+                    f"Nothing was changed. Shorten the allow list, for example by "
+                    f"aggregating address ranges."
+                )
+                raise ValueError(msg) from exc
+
+            # Commit.  When the guardian is involved it rebinds _config
+            # itself, in the same uninterruptible step as its own state, so
+            # that no audit event on another thread can see a config and a
+            # guardian snapshot that belong to different policies.  Its
+            # deactivate() returns False, having done nothing, when no
+            # policy was locked; the rebinding is then left to us.
+            if _c_guardian is not None and locked:
+                _c_guardian.activate(globals(), cfg, lock_token, snapshot)
+            elif _c_guardian is None or not _c_guardian.deactivate(lock_token, cfg):
+                _config = cfg
+        except BaseException:
+            # _config tells whether the commit happened: if it did not, the
+            # previous policy is still the active one and its variable goes
+            # back.
+            if _config is not cfg:
+                _restore_policy_env(previous, previous_env)
+            raise
+
+        # Mappings recorded under the previous policy are dropped.  Not part
+        # of the commit: an entry is a fact about DNS, and the new policy is
+        # consulted for whatever hostname it yields.
         with _ip_map_lock:
-            _config = cfg
             _ip_to_hostname.clear()
             _allowed_hostnames.clear()
 
-    # Manage C guardian for tamper-resistant locked enforcement
-    if _c_guardian is not None:
-        if locked:
-            snapshot = _build_integrity_snapshot(cfg)
-            try:
-                _c_guardian.activate(globals(), cfg, lock_token, snapshot)
-            except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
-                raise TetheredLocked from None
-        elif _c_guardian.is_active():
-            try:
-                _c_guardian.deactivate(lock_token)
-            except RuntimeError:  # pragma: no cover — defensive; check_token pre-validates
-                raise TetheredLocked from None
-
-    _install_hook()
-    # Propagate the policy to spawn-mode child processes via env var.  The
-    # tethered.pth shipped at the top of site-packages reads this in any
-    # Python interpreter that has tethered installed and re-engages tethered
-    # with the same policy.  Fork-mode children inherit tethered state
-    # directly via the OS fork() copy and don't need this.
-    _propagate_policy_to_env(cfg)
     # Surface a warning if the auto-propagation hook isn't where we expect.
     # Without it, child processes spawned via subprocess / multiprocessing
     # silently bypass tethered, and locked-mode FS-tamper protection has no
@@ -3095,26 +3150,61 @@ def deactivate(*, lock_token: object | None = None) -> None:
         lock_token: If the policy was activated with ``locked=True``, the
             same ``lock_token`` must be provided here. Otherwise
             ``TetheredLocked`` is raised.
+
+    Raises:
+        TetheredLocked: If a locked policy is active and ``lock_token`` is
+            not its token, or if the locked policy has failed its integrity
+            check (it then stays in place until the process exits).
     """
     global _config
 
-    with _state_lock:
+    with _lifecycle_lock:
         # The C guardian owns the lock (see activate()); without the
         # extension no policy can be locked.
         if _c_guardian is not None and _c_guardian.is_active():
-            try:
-                _c_guardian.deactivate(lock_token)
-            except RuntimeError:
-                raise TetheredLocked from None
+            if not _c_guardian.check_token(lock_token):
+                raise TetheredLocked
+            if not _c_guardian.verify():
+                raise TetheredLocked(_TAMPERED_POLICY_MSG)
+
+        previous = _config
+        previous_env = os.environ.get(_CHILD_POLICY_ENV)
+        try:
+            # As in activate(): the environment first, because that step
+            # can fail and can be undone, then the commit.  Clearing the
+            # variable keeps future child processes from inheriting a policy
+            # that is no longer active.
+            _clear_policy_from_env()
+            if _c_guardian is None or not _c_guardian.deactivate(lock_token, None):
+                _config = None
+        except BaseException:
+            if _config is not None:
+                _restore_policy_env(previous, previous_env)
+            raise
+
         with _ip_map_lock:
-            _config = None
             _ip_to_hostname.clear()
             _allowed_hostnames.clear()
 
-    # Clear the propagation env var so future child processes don't inherit
-    # a stale policy.
-    _clear_policy_from_env()
     logger.info("tethered: deactivated")
+
+
+def _restore_policy_env(previous: _Config | None, previous_env: str | None) -> None:
+    """Put ``_TETHERED_CHILD_POLICY`` back after a transition that did not commit.
+
+    ``previous`` is the config that is still active and ``previous_env``
+    the value the variable had before the transition started.  A locked
+    policy's variable is rewritten from the policy itself, through the same
+    writer that published it.  Otherwise the earlier value is restored as
+    it was — including a value tethered did not write, such as a scope-only
+    payload a child inherited without any global policy.
+    """
+    if previous is not None and previous.locked:
+        _propagate_policy_to_env(previous)
+    elif previous_env is None:
+        _clear_policy_from_env()
+    else:
+        os.environ[_CHILD_POLICY_ENV] = previous_env
 
 
 def _serialize_network_rule(rule: Any) -> str:
