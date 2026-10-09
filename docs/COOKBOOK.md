@@ -113,6 +113,26 @@ class WeatherClient:
 
 The `label=` is what users will see in `EgressBlocked.scope_label` and tethered's log messages when this scope blocks something. Use a descriptive name (`"<class>.<method>"` or `"<module>.<function>"`) so blocks are attributable to your library, not to a generic `"scope(api.weatherapi.com:443)"` derived from the allow list. Without `label=`, tethered auto-derives the label from the first few allow rules.
 
+### `scope()` in generators and under asyncio
+
+`@tethered.scope` cannot decorate a generator or async generator function; it raises `TypeError`. Inside a generator, wrap each I/O call in its own `with tethered.scope(...)` block and do not `yield` inside one. A scope that is open across a `yield` stays active in the consumer's context until the generator resumes, so your caller's code would run under your restriction.
+
+```python
+def iter_pages(client):
+    url = FIRST_PAGE
+    while url:
+        with tethered.scope(allow=["api.mylib.com:443"], label="mylib.iter_pages"):
+            page = client.get(url).json()  # the I/O call is scoped
+        yield page["items"]  # no scope is open across the yield
+        url = page.get("next")
+```
+
+When your library is used from asyncio:
+
+- **Lookups run in an executor thread.** asyncio resolves names with `loop.getaddrinfo`, which runs in a thread that does not carry your scope. The scope's DNS-time check does not apply to that lookup; the connection that follows is checked against the scope. If the host application has called `activate()`, its policy does apply to the lookup.
+- **Await tasks inside the block.** A task created inside a `with tethered.scope(...)` block keeps the scope after the block exits. If the application has not called `activate()`, a hostname such a task looks up after the block has exited is no longer recorded, and its connection is blocked.
+- **Windows.** On the default `ProactorEventLoop`, connections raise no audit event, so your scope's connect-time check does not run. tethered logs a one-time warning. The event loop belongs to the application, so a library cannot fix this: state in your documentation that full enforcement on Windows needs `asyncio.SelectorEventLoop`.
+
 ### Surface actionable guidance via `hint=`
 
 When a `scope()` blocks a connection inside your library, the host process sees `EgressBlocked` with a default message that names the host and the scope label — but not what to do next. `hint=` gives you a single source of truth for the egress contract (and the docs URL) so that one line of guidance lands in the host's traceback automatically:
@@ -157,7 +177,7 @@ except tethered.EgressBlocked as exc:
     raise click.ClickException(exc.scope_hint or str(exc)) from exc
 ```
 
-The hint travels with the scope through subprocess auto-propagation, so a worker process spawned inside your scope and blocked on the same call sees the same guidance.
+The hint travels with the scope through subprocess auto-propagation, so a child process launched through `subprocess` inside your scope and blocked on the same call sees the same guidance. (Spawn-mode `multiprocessing` workers do not receive scopes; see [SUBPROCESS.md](SUBPROCESS.md#scopes-propagate-to-subprocesses-too).)
 
 #### A note on Unicode in hints (and labels)
 
