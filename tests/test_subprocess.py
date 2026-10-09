@@ -1097,8 +1097,10 @@ class TestLockedPayloadIntegrity:
 
     Covers both the explicit-env-dict path (env=`{...}` passed to subprocess)
     and the inherited-env path (env=None → child reads os.environ).  The latter
-    catches Python-level os.environ mutation and ctypes-level setenv/unsetenv
-    by checking os.environ at launch time regardless of how it was set.
+    catches Python-level os.environ mutation by checking os.environ at launch
+    time.  os.environ is a cache: os.putenv / os.unsetenv are covered by the
+    dirty flag (TestNativeEnvChangeTracking) and ctypes-level setenv/unsetenv
+    is not seen at all.
     """
 
     _GLOBAL_DICT: ClassVar[dict[str, object]] = {
@@ -1176,9 +1178,8 @@ class TestLockedPayloadIntegrity:
     def test_locked_inherited_env_with_substituted_environ_blocked(self, monkeypatch):
         """If os.environ has been mutated to a different value, env=None inheritance is blocked.
 
-        This catches both Python-level os.environ mutation AND ctypes-level
-        setenv (the check inspects os.environ at launch time, regardless of
-        how it was set).
+        This catches Python-level os.environ mutation.  A ctypes-level
+        setenv does not update os.environ and is not seen.
         """
         monkeypatch.setenv(_CHILD_POLICY_ENV, '{"allow": ["evil.test"]}')
         cfg = self._locked_cfg()
@@ -3101,3 +3102,288 @@ class TestTypeExactPayloadComparison:
             subprocess.run(  # nosec B603
                 [sys.executable, "-c", "pass"], env=env, capture_output=True, timeout=30
             )
+
+
+def _launch_cfg(*, locked: bool = False, external_subprocess_policy: str = "allow") -> _Config:
+    """A hand-built config (no ``activate()``); its canonical payload derives from the fields."""
+    return _Config(
+        policy=AllowPolicy(["*.example.com"]),
+        locked=locked,
+        external_subprocess_policy=external_subprocess_policy,
+    )
+
+
+def _popen_args(env: object, executable: str = sys.executable) -> tuple:
+    """``subprocess.Popen`` audit args for a launch of ``executable`` with ``env``."""
+    return (executable, [executable, "-c", "pass"], None, env)
+
+
+class TestLockedEnvIsReadAsAMapping:
+    """Locked-mode validation reads the explicit environment whatever its type.
+
+    The check used to look at an explicit environment only when it was a
+    ``dict`` and fell back to the parent's ``os.environ`` for anything else,
+    approving a payload the child would never receive: a sanitized
+    environment in a ``UserDict`` launched an unprotected child in the one
+    mode that promises to refuse it.
+    """
+
+    def _payload(self) -> str:
+        return _core._canonical_payload(_launch_cfg(locked=True))
+
+    @pytest.fixture(autouse=True)
+    def _parent_environ_carries_the_payload(self, monkeypatch):
+        """The parent's own environment is fine — it must not vouch for the child's."""
+        monkeypatch.setenv(_CHILD_POLICY_ENV, self._payload())
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_stripped_env_is_refused(self, kind):
+        env = _as_mapping(kind, {"PATH": "/usr/bin"})
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips _TETHERED_CHILD_POLICY"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_canonical_payload_is_accepted(self, kind):
+        env = _as_mapping(kind, {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._payload()})
+        _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_substituted_payload_is_refused(self, kind):
+        permissive = self._payload().replace("*.example.com", "*")
+        env = _as_mapping(kind, {_CHILD_POLICY_ENV: permissive})
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_corrupt_payload_is_refused(self, kind):
+        env = _as_mapping(kind, {_CHILD_POLICY_ENV: "{not valid json"})
+        with pytest.raises(tethered.SubprocessBlocked, match=r"not valid JSON"):
+            _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+
+    def test_os_environ_passed_explicitly_is_read_like_any_mapping(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(os.environ))
+        monkeypatch.delenv(_CHILD_POLICY_ENV)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
+            _handle_subprocess(cfg, "subprocess.Popen", _popen_args(os.environ))
+
+    def test_bytes_value_is_read_the_way_the_child_decodes_it(self):
+        """POSIX launch APIs accept ``bytes`` values."""
+        cfg = _launch_cfg(locked=True)
+        env = {_CHILD_POLICY_ENV: self._payload().encode()}
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(env))
+        with pytest.raises(tethered.SubprocessBlocked, match=r"not valid JSON"):
+            _handle_subprocess(cfg, "subprocess.Popen", _popen_args({_CHILD_POLICY_ENV: 123}))
+
+    def test_env_that_cannot_be_read_is_refused(self):
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env could not be read as a mapping"):
+            _handle_subprocess(
+                _launch_cfg(locked=True), "subprocess.Popen", _popen_args(object(), "/bin/sh")
+            )
+
+    @pytest.mark.parametrize(
+        ("event", "prefix"),
+        [("os.exec", ()), ("os.posix_spawn", ()), ("os.spawn", (0,))],
+    )
+    def test_other_launch_apis_are_validated_the_same_way(self, event, prefix):
+        env = _as_mapping("UserDict", {"PATH": "/usr/bin"})
+        args = (*prefix, sys.executable, [sys.executable, "-c", "pass"], env)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
+            _handle_subprocess(_launch_cfg(locked=True), event, args)
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_locked_parent_refuses_a_sanitized_env_of_any_type(self, kind):
+        """End to end, with the parent's own environment intact."""
+        tethered.activate(
+            allow=[], locked=True, lock_token=object(), external_subprocess_policy="block"
+        )
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"],
+                env=_as_mapping(kind, _minimal_child_env()),
+                capture_output=True,
+                timeout=30,
+            )
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_locked_parent_launches_with_the_payload_in_any_mapping(self, kind):
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        env = {**_minimal_child_env(), _CHILD_POLICY_ENV: os.environ[_CHILD_POLICY_ENV]}
+        state = _launch_probe(env=_as_mapping(kind, env))
+        assert state["active"] is True
+        assert state["locked"] is True
+
+
+class TestNativeEnvChangeTracking:
+    """``os.putenv`` / ``os.unsetenv`` on the policy variable are not invisible.
+
+    ``os.environ`` is a cache that does not see them, while a child that
+    inherits the environment does.  Their audit events set a dirty flag: the
+    next inheriting launch refuses in locked mode and re-asserts the payload
+    otherwise.
+    """
+
+    # ``os.putenv`` / ``os.unsetenv`` audit args carry ``bytes`` names on
+    # POSIX and ``str`` names on Windows; both layouts are tested everywhere.
+    _KEYS = (_CHILD_POLICY_ENV, _CHILD_POLICY_ENV.encode())
+
+    @pytest.mark.parametrize("key", _KEYS)
+    def test_unsetenv_sets_the_flag(self, key):
+        tethered.activate(allow=["*.example.com"])
+        _core._handle_env_change("os.unsetenv", (key,))
+        assert _core._env_dirty is True
+
+    @pytest.mark.parametrize("key", _KEYS)
+    def test_putenv_of_another_value_sets_the_flag(self, key):
+        tethered.activate(allow=["*.example.com"])
+        value = '{"global": null, "scopes": []}'
+        _core._handle_env_change("os.putenv", (key, value if isinstance(key, str) else b"x"))
+        assert _core._env_dirty is True
+
+    @pytest.mark.parametrize("key", _KEYS)
+    def test_putenv_of_the_canonical_payload_clears_the_flag(self, key, monkeypatch):
+        """Save / clear / restore of the environment ends clean."""
+        tethered.activate(allow=["*.example.com"])
+        payload = os.environ[_CHILD_POLICY_ENV]
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        _core._handle_env_change(
+            "os.putenv", (key, payload if isinstance(key, str) else payload.encode())
+        )
+        assert _core._env_dirty is False
+
+    def test_putenv_of_the_same_global_in_other_words_clears_the_flag(self, monkeypatch):
+        tethered.activate(allow=["*.example.com"])
+        reformatted = json.dumps(json.loads(os.environ[_CHILD_POLICY_ENV]), indent=1)
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        _core._handle_env_change("os.putenv", (_CHILD_POLICY_ENV, reformatted))
+        assert _core._env_dirty is False
+
+    def test_event_without_a_value_sets_the_flag(self):
+        tethered.activate(allow=["*.example.com"])
+        _core._handle_env_change("os.putenv", (_CHILD_POLICY_ENV,))
+        assert _core._env_dirty is True
+
+    def test_other_variables_are_ignored(self):
+        tethered.activate(allow=["*.example.com"])
+        _core._handle_env_change("os.unsetenv", ("PATH",))
+        _core._handle_env_change("os.putenv", (b"HOME", b"/root"))
+        _core._handle_env_change("os.unsetenv", (123,))
+        _core._handle_env_change("os.unsetenv", ())
+        assert _core._env_dirty is False
+
+    def test_ignored_while_tethered_is_inactive(self):
+        """No payload is expected; ``activate()`` writes one."""
+        _core._handle_env_change("os.unsetenv", (_CHILD_POLICY_ENV,))
+        assert _core._env_dirty is False
+
+    def test_audit_hook_dispatches_env_events(self):
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook("os.unsetenv", (_CHILD_POLICY_ENV.encode(),))
+        assert _core._env_dirty is True
+        _audit_hook("os.putenv", (_CHILD_POLICY_ENV, os.environ[_CHILD_POLICY_ENV]))
+        assert _core._env_dirty is False
+
+    def test_tethereds_own_writes_never_set_the_flag(self):
+        tethered.activate(allow=["*.example.com"])
+        assert _core._env_dirty is False
+        tethered.activate(allow=["*.other.com"])
+        assert _core._env_dirty is False
+        tethered.deactivate()
+        assert _core._env_dirty is False
+
+    def test_propagate_and_clear_reset_the_flag(self, monkeypatch):
+        cfg = _launch_cfg()
+        tethered.activate(allow=["*.example.com"])
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        _core._propagate_policy_to_env(cfg)
+        assert _core._env_dirty is False
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        _core._clear_policy_from_env()
+        assert _core._env_dirty is False
+        assert _CHILD_POLICY_ENV not in os.environ
+
+    def test_real_unsetenv_and_putenv_are_seen(self):
+        """The real audit events, raised by the real calls."""
+        tethered.activate(allow=["*.example.com"])
+        payload = os.environ[_CHILD_POLICY_ENV]
+        os.unsetenv(_CHILD_POLICY_ENV)
+        assert _core._env_dirty is True
+        assert os.environ[_CHILD_POLICY_ENV] == payload  # the cache did not notice
+        os.putenv(_CHILD_POLICY_ENV, payload)
+        assert _core._env_dirty is False
+        os.putenv(_CHILD_POLICY_ENV, '{"global": null, "scopes": []}')
+        assert _core._env_dirty is True
+
+    def test_real_environ_pop_and_restore_ends_clean(self):
+        tethered.activate(allow=["*.example.com"])
+        saved = os.environ.pop(_CHILD_POLICY_ENV)
+        assert _core._env_dirty is True
+        os.environ[_CHILD_POLICY_ENV] = saved
+        assert _core._env_dirty is False
+
+    def test_flag_left_set_by_a_test(self):
+        tethered.activate(allow=["*.example.com"])
+        os.unsetenv(_CHILD_POLICY_ENV)
+        assert _core._env_dirty is True
+
+    def test_flag_is_reset_between_tests(self):
+        """The conftest cleanup clears the flag (this runs after the test above)."""
+        assert _core._env_dirty is False
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            ("subprocess.Popen", _popen_args(None)),
+            ("os.exec", (sys.executable, [sys.executable], None)),
+            ("os.system", ("echo hi",)),
+        ],
+    )
+    def test_locked_refuses_an_inheriting_launch_while_dirty(self, event, args, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        _handle_subprocess(cfg, event, args)  # clean: allowed
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"os\.putenv / os\.unsetenv"):
+            _handle_subprocess(cfg, event, args)
+
+    def test_locked_explicit_env_does_not_depend_on_the_flag(self, monkeypatch):
+        """The child gets the mapping, not the process environment."""
+        cfg = _launch_cfg(locked=True)
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        env = {_CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(env))
+
+    def test_unlocked_reasserts_the_payload_and_clears_the_flag(self, monkeypatch):
+        cfg = _launch_cfg()
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        _handle_subprocess(cfg, "subprocess.Popen", _popen_args(None))
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        assert _core._env_dirty is False
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.parametrize("change", ["unsetenv", "putenv"])
+    def test_locked_parent_refuses_after_a_native_change(self, change):
+        """End to end: ``os.environ`` still shows the payload, the child would not get it."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        if change == "unsetenv":
+            os.unsetenv(_CHILD_POLICY_ENV)
+        else:
+            os.putenv(_CHILD_POLICY_ENV, '{"global": null, "scopes": []}')
+        assert _CHILD_POLICY_ENV in os.environ
+        with pytest.raises(tethered.SubprocessBlocked, match=r"os\.putenv / os\.unsetenv"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"], capture_output=True, timeout=30
+            )
+
+    def test_unlocked_child_is_protected_after_a_native_unsetenv(self):
+        """End to end: the payload is back in the native environment the child inherits."""
+        tethered.activate(allow=["*.example.com"])
+        os.unsetenv(_CHILD_POLICY_ENV)
+        state = _launch_probe()
+        assert state["active"] is True
+        assert state["allow"] == ["*.example.com"]
+        assert _core._env_dirty is False

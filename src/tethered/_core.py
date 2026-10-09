@@ -387,6 +387,11 @@ _SUBPROCESS_EVENTS = frozenset(
     )
 )
 
+# Native environment changes.  ``os.environ`` is a cache that does not see
+# ``os.putenv()`` / ``os.unsetenv()``; both raise these events, and so do
+# assignments and deletions through ``os.environ``.
+_ENV_EVENTS = frozenset(("os.putenv", "os.unsetenv"))
+
 _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 
 # Locked-mode FS-tamper detection.  Refuses Python-level deletion, rename,
@@ -580,6 +585,11 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         if cfg is None and not scope_stack:
             return
         _handle_subprocess(cfg, event, args, scope_stack)
+        return
+
+    # Native changes to the policy variable that ``os.environ`` may not show.
+    if event in _ENV_EVENTS:
+        _handle_env_change(event, args)
         return
 
     # Locked-mode-only tamper detection on FS access to tethered.pth.
@@ -1776,6 +1786,16 @@ def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
     return True
 
 
+def _env_text(value: Any) -> str | None:
+    """Decode an environment name or value the way the child sees it (``None`` if it cannot be)."""
+    if isinstance(value, str):
+        return value
+    try:
+        return os.fsdecode(value)
+    except Exception:
+        return None
+
+
 def _snapshot_env(env: Any) -> list[tuple[Any, Any]] | None:
     """Read a launch environment once and return its ``(name, value)`` pairs.
 
@@ -1821,6 +1841,87 @@ def _classify_payload(text: str | None, expected: str, payload: str) -> str:
     except (TypeError, ValueError, KeyError, RecursionError):
         return "corrupt"
     return "same-global" if same_global else "substituted"
+
+
+def _launch_env_state(pairs: list[tuple[Any, Any]], expected: str, payload: str) -> str:
+    """Classify the policy payload an explicit launch environment carries.
+
+    Returns ``"missing"`` when the policy key is absent, otherwise the
+    :func:`_classify_payload` result for its value.
+    """
+    values = [value for key, value in pairs if key == _CHILD_POLICY_ENV]
+    if not values:
+        return "missing"
+    return _classify_payload(_env_text(values[-1]), expected, payload)
+
+
+def _process_env_state(payload: str) -> str:
+    """Classify the policy payload a child inheriting the process environment gets.
+
+    ``os.environ`` is a cache: it shows changes made through itself but not
+    ``os.putenv()`` / ``os.unsetenv()``.  :func:`_handle_env_change` records
+    such a change to the policy variable in ``_env_dirty``; while it is set a
+    matching cache entry proves nothing, which is reported as ``"diverged"``.
+    Changes made below Python (``ctypes`` calling libc ``setenv`` /
+    ``unsetenv``) raise no audit event and are not seen at all.
+    """
+    value = os.environ.get(_CHILD_POLICY_ENV)
+    if value is None:
+        return "missing"
+    state = _classify_payload(value, payload, payload)
+    if _env_dirty and state in ("exact", "same-global"):
+        return "diverged"
+    return state
+
+
+def _handle_env_change(event: str, args: tuple[Any, ...]) -> None:
+    """Track ``os.putenv`` / ``os.unsetenv`` on the policy variable.
+
+    Sets ``_env_dirty`` when code other than tethered leaves the native
+    variable without the canonical payload, and clears it when the canonical
+    payload is put back (a save / clear / restore of the whole environment
+    ends clean).  Audit args: ``os.putenv`` ``(name, value)``, ``os.unsetenv``
+    ``(name,)`` — ``bytes`` on POSIX, ``str`` on Windows.  Takes no lock: it
+    runs inside ``os.environ`` assignments, including tethered's own.
+    """
+    global _env_dirty
+    if not args or _env_text(args[0]) != _CHILD_POLICY_ENV or _in_env_sync.get():
+        return
+    cfg = _config
+    if cfg is None:
+        return  # no payload is expected; activate() will write one
+    if event == "os.putenv" and len(args) >= 2:
+        payload = _canonical_payload(cfg)
+        state = _classify_payload(_env_text(args[1]), payload, payload)
+        _env_dirty = state not in ("exact", "same-global")
+    else:
+        _env_dirty = True
+
+
+def _refuse_launch(event: str, desc: str, source: str, state: str) -> None:
+    """Raise ``SubprocessBlocked`` for a locked-mode launch whose environment fails the check."""
+    label, detail = {
+        "missing": ("stripped policy env", f"{source} strips {_CHILD_POLICY_ENV}"),
+        "corrupt": (
+            "corrupted policy payload",
+            f"{source} carries a {_CHILD_POLICY_ENV} value that is "
+            "not valid JSON (corruption / tamper attempt)",
+        ),
+        "substituted": (
+            "substituted policy payload",
+            f"{source} carries a {_CHILD_POLICY_ENV} value whose "
+            "'global' field differs from the parent's canonical payload "
+            "(substitution attempt)",
+        ),
+        "diverged": (
+            "unverifiable policy env",
+            f"{_CHILD_POLICY_ENV} was changed through os.putenv / os.unsetenv, "
+            "so os.environ no longer shows what the child would inherit",
+        ),
+        "unreadable": ("unreadable env", f"{source} could not be read as a mapping"),
+    }[state]
+    logger.warning("tethered: blocked subprocess launch with %s: %s (%s)", label, desc, source)
+    raise SubprocessBlocked(event, f"{desc} — {detail}")
 
 
 def _launch_payload(cfg: _Config | None, scope_stack: tuple[_ScopeConfig, ...]) -> str:
@@ -1899,69 +2000,43 @@ def _handle_subprocess(
     # child will see has a 'global' field equal — type-exactly — to the one
     # in the parent's canonical payload (the immutable ``_serialized_payload``;
     # the mutable ``_global_payload_dict`` is not trusted).  Two source paths:
-    #   1. Explicit env=dict — check the dict's value.
-    #   2. Inherited env (None) — check os.environ.  Catches Python-level
-    #      mutation (os.environ.pop / __setitem__ / __delitem__) AND ctypes-
-    #      level mutation (libc setenv / unsetenv) since both ultimately
-    #      change what subprocess will inherit.
+    #   1. Explicit env — read once through the mapping interface, whatever
+    #      its type (dict, UserDict, MappingProxyType, os.environ ...), so
+    #      the check sees what the launch API will read.
+    #   2. Inherited env (None, or no env argument) — the child gets the
+    #      native process environment.  ``os.environ`` shows Python-level
+    #      mutation (os.environ.pop / __setitem__ / __delitem__), and
+    #      ``_env_dirty`` covers os.putenv() / os.unsetenv(), which bypass
+    #      it.  Changes made below Python (ctypes → libc setenv / unsetenv)
+    #      raise no audit event and are NOT caught.
     # Refuse on absence ("strip"), corruption ("not valid JSON"), or
     # differing 'global' field ("substitution").  Substituted scopes are
-    # allowed: scopes can only narrow within the byte-checked global
-    # ceiling, so they can't widen child enforcement past the parent.
-    # Locked mode requires activate(), so cfg is non-None here.
-    if cfg is not None and cfg.locked:
-        has_env, env_value = _extract_subprocess_env(event, args)
-        if has_env and isinstance(env_value, dict):
-            env_payload = env_value.get(_CHILD_POLICY_ENV)
-            source = "env"
-        else:
-            # env=None or event has no env arg → child inherits os.environ
-            env_payload = os.environ.get(_CHILD_POLICY_ENV)
-            source = "os.environ"
-
-        if env_payload is None:
-            desc = _describe_subprocess_launch(event, args)
-            logger.warning(
-                "tethered: blocked subprocess launch with stripped policy env: %s (%s)",
-                desc,
-                source,
-            )
-            raise SubprocessBlocked(
-                event,
-                f"{desc} — {source} strips {_CHILD_POLICY_ENV}",
-            )
-        # Compare with the canonical payload.  A value that is not JSON is
-        # classified as corrupt and treated as a tamper attempt; the
-        # comparison itself never raises, so no stray exception escapes the
-        # audit hook in place of ``SubprocessBlocked``.
+    # allowed: scopes can only narrow within the checked global ceiling, so
+    # they can't widen child enforcement past the parent.  The comparison
+    # never raises, so no stray exception escapes the audit hook in place of
+    # ``SubprocessBlocked``.  Locked mode requires activate(), so cfg is
+    # non-None here.
+    #
+    # Outside locked mode nothing is refused, but a native change that
+    # os.environ cannot show is undone: the payload is re-asserted before
+    # the child inherits the environment.
+    if cfg is not None:
+        _has_env, env_value = _extract_subprocess_env(event, args)
         payload = _canonical_payload(cfg)
-        state = _classify_payload(env_payload, payload, payload)
-        if state == "corrupt":
-            desc = _describe_subprocess_launch(event, args)
-            logger.warning(
-                "tethered: blocked subprocess launch with corrupted policy payload: %s (%s)",
-                desc,
-                source,
-            )
-            raise SubprocessBlocked(
-                event,
-                f"{desc} — {source} carries a {_CHILD_POLICY_ENV} value that is "
-                "not valid JSON (corruption / tamper attempt)",
-            )
-        if state == "substituted":
-            desc = _describe_subprocess_launch(event, args)
-            logger.warning(
-                "tethered: blocked subprocess launch with substituted policy payload: %s (%s)",
-                desc,
-                source,
-            )
-            raise SubprocessBlocked(
-                event,
-                f"{desc} — {source} carries a {_CHILD_POLICY_ENV} value whose "
-                "'global' field differs from the parent's canonical payload "
-                "(substitution attempt)",
-            )
-        # The payload's "scopes" are intentionally NOT integrity-checked.
+        if env_value is None:
+            if cfg.locked:
+                state = _process_env_state(payload)
+                if state not in ("exact", "same-global"):
+                    _refuse_launch(
+                        event, _describe_subprocess_launch(event, args), "os.environ", state
+                    )
+            elif _env_dirty:
+                _propagate_policy_to_env(cfg)
+        elif cfg.locked:
+            pairs = _snapshot_env(env_value)
+            state = "unreadable" if pairs is None else _launch_env_state(pairs, payload, payload)
+            if state not in ("exact", "same-global"):
+                _refuse_launch(event, _describe_subprocess_launch(event, args), "env", state)
 
     # Auto-inheriting Python child launches are covered by tethered.pth →
     # _autoactivate.  For those launches:
@@ -2772,6 +2847,19 @@ def _serialize_allow_list(policy: AllowPolicy) -> list[str]:
 # the OS fork() copy and don't need this env var.
 _CHILD_POLICY_ENV = "_TETHERED_CHILD_POLICY"
 
+# True while a native change to the policy variable that did not come from
+# tethered may have left the process environment different from what
+# ``os.environ`` shows (see ``_handle_env_change``).  Runtime state: the next
+# launch that inherits the environment refuses (locked mode) or re-asserts
+# the payload and clears the flag.
+_env_dirty: bool = False
+
+# Set while tethered itself writes the policy variable, so its own
+# ``os.putenv`` / ``os.unsetenv`` audit events never set ``_env_dirty``.
+_in_env_sync: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tethered_in_env_sync", default=False
+)
+
 
 def _build_global_payload_dict(
     policy: AllowPolicy,
@@ -2947,10 +3035,29 @@ def _capture_local_hostname() -> str:
 
 
 def _propagate_policy_to_env(cfg: _Config) -> None:
-    """Populate ``_TETHERED_CHILD_POLICY`` so child processes inherit the policy."""
-    os.environ[_CHILD_POLICY_ENV] = cfg._serialized_payload
+    """Populate ``_TETHERED_CHILD_POLICY`` so child processes inherit the policy.
+
+    Also how the subprocess hook re-asserts the payload outside locked mode.
+    The assignment updates ``os.environ`` and the native environment
+    together, so it ends any divergence ``_env_dirty`` recorded.  The flag
+    is cleared first: a foreign change racing with the write leaves it set.
+    Takes no lock and is safe to call from inside the audit hook.
+    """
+    global _env_dirty
+    token = _in_env_sync.set(True)
+    try:
+        _env_dirty = False
+        os.environ[_CHILD_POLICY_ENV] = _canonical_payload(cfg)
+    finally:
+        _in_env_sync.reset(token)
 
 
 def _clear_policy_from_env() -> None:
     """Remove ``_TETHERED_CHILD_POLICY`` so future children don't inherit a stale policy."""
-    os.environ.pop(_CHILD_POLICY_ENV, None)
+    global _env_dirty
+    token = _in_env_sync.set(True)
+    try:
+        _env_dirty = False
+        os.environ.pop(_CHILD_POLICY_ENV, None)
+    finally:
+        _in_env_sync.reset(token)

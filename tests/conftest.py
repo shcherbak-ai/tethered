@@ -103,7 +103,8 @@ def _cleanup():
 
     Ensures the C guardian is deactivated, the global config is cleared,
     the IP-to-hostname map is emptied, the scope stack and the active-scope
-    count are reset, and the propagation env var is removed.
+    count are reset, the propagation env var is removed, and the native-env
+    dirty flag is cleared.
     """
     yield
     # Deactivate C guardian first (using stored token_id)
@@ -116,6 +117,7 @@ def _cleanup():
     _scopes.set(())
     _core._active_scope_count = 0
     os.environ.pop(_CHILD_POLICY_ENV, None)
+    _core._env_dirty = False
 
 
 @pytest.fixture(scope="session", autouse=True)
