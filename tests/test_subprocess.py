@@ -286,6 +286,32 @@ class TestSubprocessPolicy:
         assert result.returncode == 0, result.stderr
         assert _has_site_bypass_flag(argv) is (result.stdout.strip() == "1")
 
+    def test_block_refuses_python_child_when_no_bootstrap_is_processed(self, monkeypatch, caplog):
+        """No ``tethered.pth`` that ``site`` runs: the child would start with no policy."""
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=[], external_subprocess_policy="block")
+            with pytest.raises(tethered.SubprocessBlocked, match=r"subprocess\.Popen"):
+                subprocess.run(
+                    [sys.executable, "-c", "pass"],
+                    capture_output=True,
+                    timeout=10,
+                )  # nosec B603 B607
+        assert any("blocked external subprocess launch" in r.message for r in caplog.records)
+
+    def test_warn_reports_python_child_when_no_bootstrap_is_processed(self, monkeypatch, caplog):
+        """Under the default policy the unprotected child still runs, but not silently."""
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        tethered.activate(allow=[])
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            result = subprocess.run(
+                [sys.executable, "-c", "print('ok')"],
+                capture_output=True,
+                timeout=10,
+            )  # nosec B603 B607
+        assert result.returncode == 0
+        assert any("external subprocess launch detected" in r.message for r in caplog.records)
+
     def test_run_python_no_longer_exists(self):
         """The old run_python() public API has been removed."""
         assert not hasattr(tethered, "run_python")
@@ -474,6 +500,19 @@ class TestHasSiteBypassFlag:
     def test_argv_with_combined_flags_IE_returns_false(self):
         """``-IE`` (no ``S``) keeps ``site.py`` enabled."""
         assert _has_site_bypass_flag(["python", "-IE", "-c", "pass"]) is False
+
+    def test_user_site_hook_makes_dash_s_and_dash_I_bypass_flags(self, tmp_path, monkeypatch):
+        """``-s`` / ``-I`` skip the user site-packages — a bypass only if the hook is there."""
+        import site
+
+        monkeypatch.setattr(site, "USER_SITE", str(tmp_path))
+        user_hook = _core._normalize_path(str(tmp_path / "tethered.pth"))
+        assert _has_site_bypass_flag(["python", "-I", "-c", "pass"], user_hook) is True
+        assert _has_site_bypass_flag(["python", "-s", "-c", "pass"], user_hook) is True
+        assert _has_site_bypass_flag(["python", "-E", "-c", "pass"], user_hook) is False
+        assert _has_site_bypass_flag(["python", "-c", "pass", "-s"], user_hook) is False
+        other_hook = _core._normalize_path(str(tmp_path / "elsewhere" / "tethered.pth"))
+        assert _has_site_bypass_flag(["python", "-I", "-c", "pass"], other_hook) is False
 
     def test_argv_with_dash_X_returns_false(self):
         """-X dev is not a site-bypass flag."""
@@ -914,6 +953,84 @@ class TestIsAutoInheritingPythonLaunch:
             plain = (sys.executable, ["python", "-S", "-c", "pass"], {})
             assert _is_auto_inheriting_python_launch("os.exec", plain) is False
 
+    # ── The bootstrap has to be one this interpreter processes ──
+
+    _PLAIN_LAUNCH = (sys.executable, [sys.executable, "-c", "pass"], None, None)
+
+    def test_no_processed_bootstrap_is_not_auto_inheriting(self, monkeypatch):
+        """Without a hook that ``site`` runs, a Python child is as external as any other."""
+        monkeypatch.setattr(_core, "_pth_path_cache", None)
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is False
+        cmdline = f'"{sys.executable}" -c "print(0)"'
+        args = (None, cmdline, None, None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+
+    def test_bootstrap_lookup_is_cached_when_no_config_is_active(self, monkeypatch):
+        """Scope-only use has no config to hold the path, so one lookup serves every launch."""
+        calls = []
+        real = _core._compute_pth_path
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        monkeypatch.setattr(_core, "_pth_path_cache", None)
+        monkeypatch.setattr(_core, "_compute_pth_path", counting)
+        for _ in range(3):
+            assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is True
+        assert len(calls) == 1
+        assert _core._pth_path_cache == real()
+        # A launch of some other program never needs the lookup at all.
+        monkeypatch.setattr(_core, "_pth_path_cache", None)
+        other = ("/bin/sh", ["sh", "-c", "true"], None, None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", other) is False
+        assert _core._pth_path_cache is None
+
+    def test_active_config_decides_over_the_cache(self, monkeypatch):
+        """With a policy active, the path activate() found is the one that counts."""
+        monkeypatch.setattr(_core, "_pth_path_cache", "/stale/site-packages/tethered.pth")
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        tethered.activate(allow=[])
+        assert _core._config._pth_path == ""
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is False
+
+        monkeypatch.setattr(_core, "_pth_path_cache", "")
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "/site-packages/tethered.pth")
+        tethered.activate(allow=[])
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is True
+
+    @pytest.mark.parametrize(
+        ("options", "in_user_site", "elsewhere"),
+        [
+            (["-c", "pass"], True, True),
+            (["-E", "-c", "pass"], True, True),
+            (["-I", "-c", "pass"], False, True),  # isolated mode implies -s
+            (["-s", "-c", "pass"], False, True),
+            (["-Es", "script.py"], False, True),
+            (["script.py", "-s", "-I"], True, True),  # the script's own arguments
+            (["-S", "-c", "pass"], False, False),
+        ],
+    )
+    def test_user_site_bootstrap_is_skipped_by_dash_s_and_dash_I(
+        self, tmp_path, monkeypatch, options, in_user_site, elsewhere
+    ):
+        """``pip install --user``: the hook is in the one directory ``-s`` / ``-I`` leave out."""
+        import site
+
+        monkeypatch.setattr(site, "USER_SITE", str(tmp_path / "user-site"))
+        user_hook = _core._normalize_path(str(tmp_path / "user-site" / "tethered.pth"))
+        other_hook = _core._normalize_path(str(tmp_path / "site-packages" / "tethered.pth"))
+        args = (sys.executable, [sys.executable, *options], None, None)
+
+        monkeypatch.setattr(_core, "_pth_path_cache", user_hook)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is in_user_site
+        monkeypatch.setattr(_core, "_pth_path_cache", other_hook)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is elsewhere
+        # No user site known at all (site never computed it): nothing can be in it.
+        monkeypatch.setattr(site, "USER_SITE", None)
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is elsewhere
+
 
 class TestLockedPayloadIntegrity:
     """Direct unit tests for locked-mode payload-integrity enforcement in _handle_subprocess.
@@ -1331,18 +1448,203 @@ class TestPathMatchesPthEdgeCases:
 
 
 class TestComputePthPath:
-    """Direct tests for _compute_pth_path."""
+    """Direct tests for _compute_pth_path.
 
-    def test_returns_empty_when_tethered_file_missing(self, monkeypatch):
-        """If ``tethered.__file__`` is unavailable (frozen interpreter, etc.), returns ''."""
-        monkeypatch.setattr(tethered, "__file__", None)
-        assert _compute_pth_path() == ""
+    The hook only counts where ``site`` executes ``.pth`` files: the
+    site-packages of the interpreter's prefixes and the enabled user site.
+    """
+
+    @staticmethod
+    def _site_packages(prefix: Path, *, hook: bool) -> Path:
+        """Create the site-packages directory ``site`` derives from ``prefix``."""
+        import site
+
+        directory = Path(site.getsitepackages([str(prefix)])[-1])
+        directory.mkdir(parents=True)
+        if hook:
+            (directory / "tethered.pth").write_text("# hook\n")
+        return directory
+
+    @staticmethod
+    def _lookup(monkeypatch, sys_prefix, *, site_prefixes=None, user_site=None, package_in=None):
+        """Run _compute_pth_path() as an interpreter with the given site layout would."""
+        import site
+
+        prefixes = [sys_prefix] if site_prefixes is None else site_prefixes
+        with monkeypatch.context() as m:
+            m.setattr(sys, "prefix", str(sys_prefix))
+            m.setattr(sys, "exec_prefix", str(sys_prefix))
+            m.setattr(site, "PREFIXES", [str(p) for p in prefixes])
+            m.setattr(site, "ENABLE_USER_SITE", user_site is not None)
+            m.setattr(site, "USER_SITE", None if user_site is None else str(user_site))
+            if package_in is not None:
+                m.setattr(tethered, "__file__", str(package_in / "tethered" / "__init__.py"))
+            return _compute_pth_path()
+
+    def test_finds_the_hook_in_site_packages(self):
+        """In this environment the hook that runs is the one in the venv's site-packages.
+
+        The suite runs from an editable install, where the package (and a
+        ``tethered.pth`` beside it) lives in ``src/``; ``src/`` is on
+        ``sys.path`` but is not a site directory.
+        """
+        import sysconfig
+
+        expected = _core._normalize_path(
+            os.path.join(sysconfig.get_path("purelib"), "tethered.pth")
+        )
+        assert _compute_pth_path() == expected
+        assert os.path.isfile(expected)
 
     def test_returns_normalized_absolute_path(self):
         """Normal case: returns an absolute, normalized path ending in tethered.pth."""
         result = _compute_pth_path()
         assert result.endswith("tethered.pth") or result.endswith("tethered.pth".lower())
         assert os.path.isabs(result)
+        # The form the locked-mode FS guard compares against.
+        assert _path_matches_pth(result, result)
+
+    def test_tethered_file_missing_still_searches_site_dirs(self, monkeypatch):
+        """Without ``tethered.__file__`` there is no adjacent hook to prefer, only the search."""
+        expected = _compute_pth_path()
+        monkeypatch.setattr(tethered, "__file__", None)
+        assert _compute_pth_path() == expected
+
+    def test_hook_beside_package_outside_site_dirs_is_not_accepted(self, tmp_path, monkeypatch):
+        """``pip install --target`` + ``PYTHONPATH``: on sys.path, yet its .pth files never run."""
+        target = tmp_path / "target"
+        (target / "tethered").mkdir(parents=True)
+        (target / "tethered.pth").write_text("# hook\n")
+        monkeypatch.syspath_prepend(str(target))
+        prefix = tmp_path / "prefix"
+        site_packages = self._site_packages(prefix, hook=False)
+
+        assert self._lookup(monkeypatch, prefix, package_in=target) == ""
+
+        # Once a site directory has the hook, that one is reported — never the target's.
+        (site_packages / "tethered.pth").write_text("# hook\n")
+        found = self._lookup(monkeypatch, prefix, package_in=target)
+        assert found == _core._normalize_path(str(site_packages / "tethered.pth"))
+
+    def test_hook_beside_package_in_a_site_dir_is_preferred(self, tmp_path, monkeypatch):
+        first = self._site_packages(tmp_path / "first", hook=True)
+        second = self._site_packages(tmp_path / "second", hook=True)
+        prefixes = [tmp_path / "first", tmp_path / "second"]
+
+        def lookup(package_in):
+            return self._lookup(
+                monkeypatch, prefixes[0], site_prefixes=prefixes, package_in=package_in
+            )
+
+        # Imported from the second site directory: its own hook is the one that matters.
+        assert lookup(second) == _core._normalize_path(str(second / "tethered.pth"))
+        # Imported from somewhere that is not a site directory: first hook in site's order.
+        assert lookup(tmp_path / "elsewhere") == _core._normalize_path(str(first / "tethered.pth"))
+
+    def test_user_site_hook_counts_only_when_user_site_is_enabled(self, tmp_path, monkeypatch):
+        prefix = tmp_path / "prefix"
+        self._site_packages(prefix, hook=False)
+        user_site = tmp_path / "user-site"
+        user_site.mkdir()
+        (user_site / "tethered.pth").write_text("# hook\n")
+
+        found = self._lookup(monkeypatch, prefix, user_site=user_site, package_in=user_site)
+        assert found == _core._normalize_path(str(user_site / "tethered.pth"))
+        # -s / PYTHONNOUSERSITE / a venv: the directory exists but site skips it.
+        assert self._lookup(monkeypatch, prefix, package_in=user_site) == ""
+
+    def test_sys_prefix_is_searched_even_when_site_prefixes_lags(self, tmp_path, monkeypatch):
+        """While a venv interpreter starts up, ``site.PREFIXES`` still names the base install."""
+        venv = self._site_packages(tmp_path / "venv", hook=True)
+        self._site_packages(tmp_path / "base", hook=False)
+        found = self._lookup(monkeypatch, tmp_path / "venv", site_prefixes=[tmp_path / "base"])
+        assert found == _core._normalize_path(str(venv / "tethered.pth"))
+
+    def test_returns_empty_when_site_is_disabled(self, monkeypatch):
+        """Under ``-S`` this interpreter processed no .pth file at all."""
+        import types
+
+        names = [n for n in dir(sys.flags) if not n.startswith("_") and n not in ("count", "index")]
+        flags = types.SimpleNamespace(**{n: getattr(sys.flags, n) for n in names})
+        flags.no_site = 1
+        with monkeypatch.context() as m:
+            m.setattr(sys, "flags", flags)
+            result = _compute_pth_path()
+        assert result == ""
+
+    def test_child_resolves_the_hook_during_its_own_startup(self):
+        """An auto-activated child calls activate() from inside site.py and must still find it."""
+        tethered.activate(allow=[])
+        result = subprocess.run(
+            [sys.executable, "-c", "import tethered._core as c; print(c._config._pth_path)"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        assert _core._config._pth_path
+        assert result.stdout.strip() == _core._config._pth_path
+        # No missing-hook warning from the child's activate().
+        assert "tethered.pth" not in result.stderr
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_locked_mode_guards_the_hook_that_site_runs(self):
+        """The locked-mode FS guard watches the processed hook, spelled by the caller's own path."""
+        import sysconfig
+
+        hook = os.path.join(sysconfig.get_path("purelib"), "tethered.pth")
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        with pytest.raises(tethered.SubprocessBlocked, match=r"refused write-open"):
+            open(hook, "a").close()
+        with pytest.raises(tethered.SubprocessBlocked, match=r"refused deletion"):
+            os.remove(hook)
+        assert os.path.isfile(hook)
+
+    def test_target_install_on_pythonpath_has_no_bootstrap(self, tmp_path):
+        """End to end, in an interpreter that has tethered only via ``--target`` + ``PYTHONPATH``.
+
+        The hook sits next to the package, yet ``site`` never runs it: the
+        lookup is empty, ``activate()`` says so, and a ``sys.executable``
+        child is an external launch instead of a silently unprotected one.
+        """
+        import shutil
+
+        venv = tmp_path / "venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )  # nosec B603 B607
+        python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        package = Path(tethered.__file__).parent
+        target = tmp_path / "target"
+        shutil.copytree(package, target / "tethered", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(package.parent / "tethered.pth", target / "tethered.pth")
+        script = (
+            "import logging, subprocess, sys\n"
+            "logging.basicConfig()\n"
+            "import tethered, tethered._core as c\n"
+            "tethered.activate(allow=[], external_subprocess_policy='block')\n"
+            "print(tethered.__file__)\n"
+            "print('pth', repr(c._config._pth_path))\n"
+            "try:\n"
+            "    subprocess.run([sys.executable, '-c', 'pass'])\n"
+            "    print('child ran')\n"
+            "except tethered.SubprocessBlocked:\n"
+            "    print('child blocked')\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(target)}
+        env.pop(_CHILD_POLICY_ENV, None)
+        result = subprocess.run(
+            [str(python), "-c", script], env=env, capture_output=True, text=True, timeout=60
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        imported_from, *verdict = result.stdout.splitlines()
+        assert os.path.samefile(os.path.dirname(imported_from), target / "tethered")
+        assert verdict == ["pth ''", "child blocked"]
+        # activate() reported the missing hook instead of staying silent.
+        assert "tethered.pth" in result.stderr
 
 
 class TestPthAvailabilityWarning:

@@ -973,6 +973,11 @@ def _extract_subprocess_env(event: str, args: tuple[Any, ...]) -> tuple[bool, An
 # policy and is subject to external_subprocess_policy.
 _SITE_BYPASS_FLAG_CHARS = "S"
 
+# ``-s`` and ``-I`` keep site.py but skip the per-user site-packages, so they
+# bypass the bootstrap only when that is where tethered.pth is installed
+# (``pip install --user``).
+_USER_SITE_BYPASS_FLAG_CHARS = "sI"
+
 # CPython's interpreter options (``SHORT_OPTS`` and ``longopts`` in
 # ``Python/getopt.c``; the same for 3.10-3.14 except that ``-P`` and the
 # ``--help-*`` forms are new in 3.11).  A flag stands alone or in a cluster
@@ -1052,18 +1057,23 @@ def _interpreter_flags(argv: Any) -> str | None:
     return flags
 
 
-def _has_site_bypass_flag(argv: Any) -> bool:
-    """Return True unless ``argv`` provably leaves ``site.py`` enabled.
+def _has_site_bypass_flag(argv: Any, pth_path: str = "") -> bool:
+    """Return True unless ``argv`` provably leaves the ``tethered.pth`` bootstrap enabled.
 
     True when the interpreter options in ``argv`` (program name first)
     include ``-S`` — alone or in a cluster such as ``-IS`` — or cannot be
     parsed at all.  ``-I`` and ``-E`` keep ``site.py`` enabled and so are
-    NOT bypass flags.  :func:`_interpreter_flags` decides what counts as an
-    interpreter option: ``-S`` after the script path, or as the value of
-    another option, is not one.
+    NOT bypass flags, with one exception: when ``pth_path`` (the bootstrap,
+    from :func:`_bootstrap_pth_path`) is in the per-user site-packages,
+    ``-s`` and ``-I`` skip that directory and the bootstrap with it.
+    :func:`_interpreter_flags` decides what counts as an interpreter option:
+    ``-S`` after the script path, or as the value of another option, is not
+    one.
     """
     flags = _interpreter_flags(argv)
-    return flags is None or any(c in flags for c in _SITE_BYPASS_FLAG_CHARS)
+    if flags is None or any(c in flags for c in _SITE_BYPASS_FLAG_CHARS):
+        return True
+    return any(c in flags for c in _USER_SITE_BYPASS_FLAG_CHARS) and _is_user_site_pth(pth_path)
 
 
 def _normalize_exe_path(value: Any) -> str | None:
@@ -1075,6 +1085,46 @@ def _normalize_exe_path(value: Any) -> str | None:
     except (TypeError, ValueError):
         return None
     return os.path.normcase(os.path.normpath(s))
+
+
+def _normalize_path(path: str) -> str:
+    """Return ``path`` in the form ``tethered.pth`` paths are stored and compared in."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+# Bootstrap lookup for launches made with no active config (scope-only use):
+# None until first needed, then "" or the hook's path.  While a config is
+# active, the path that activate() found is used instead.
+_pth_path_cache: str | None = None
+
+
+def _bootstrap_pth_path() -> str:
+    """Return the ``tethered.pth`` that Python children of this process will run, or ``""``.
+
+    While a policy is active this is what ``activate()`` found and stored in
+    ``_Config._pth_path`` — the value its missing-hook warning was about,
+    and one the locked-mode guardian protects.  With only scopes active
+    there is no config, so :func:`_compute_pth_path` runs once and the
+    result is kept in ``_pth_path_cache``.
+    """
+    global _pth_path_cache
+    cfg = _config
+    if cfg is not None:
+        return cfg._pth_path
+    cached = _pth_path_cache
+    if cached is None:
+        cached = _pth_path_cache = _compute_pth_path()
+    return cached
+
+
+def _is_user_site_pth(pth_path: str) -> bool:
+    """Return True if ``pth_path`` is the hook in the per-user site-packages directory."""
+    if not pth_path:
+        return False
+    import site
+
+    user_site = site.USER_SITE
+    return bool(user_site) and pth_path == _normalize_path(os.path.join(user_site, "tethered.pth"))
 
 
 def _iter_windows_argv(program: str, args: str) -> Iterator[str]:
@@ -1186,12 +1236,17 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
 
     A launch auto-inherits when:
 
-    1. The executable is exactly ``sys.executable`` (same Python interpreter,
-       has tethered installed in its site-packages).
-    2. Its interpreter options don't include ``-S`` (which disables
-       ``site.py`` and so skips ``tethered.pth``) and can be parsed.  ``-I``
-       and ``-E`` keep ``site.py`` enabled and are NOT treated as bypass
-       flags.
+    1. The executable is exactly ``sys.executable`` (the same interpreter,
+       so the same site directories).
+    2. That interpreter processes a ``tethered.pth`` bootstrap
+       (:func:`_bootstrap_pth_path`).  An editable install, or a ``pip
+       install --target`` directory on ``PYTHONPATH``, has none: no Python
+       child auto-activates there, so none is treated as auto-inheriting.
+    3. Its interpreter options can be parsed and don't disable that
+       bootstrap: no ``-S`` (which skips ``site.py``), and no ``-s`` / ``-I``
+       when the bootstrap is in the per-user site-packages.  Otherwise
+       ``-I`` and ``-E`` keep ``site.py`` enabled and are NOT treated as
+       bypass flags.
 
     Handles both POSIX and Windows audit-event layouts.  On POSIX,
     ``subprocess.Popen`` fires with ``(executable, argv_list, cwd, env)``
@@ -1249,7 +1304,11 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
     if exe_norm != _normalize_exe_path(sys.executable):
         return False
 
-    return not _has_site_bypass_flag(argv)
+    pth_path = _bootstrap_pth_path()
+    if not pth_path:
+        return False
+
+    return not _has_site_bypass_flag(argv, pth_path)
 
 
 # Maximum frames to walk back from the audit hook to find ``_execute_child``.
@@ -2327,29 +2386,50 @@ def _build_child_policy_payload(cfg: _Config) -> dict[str, Any]:
 
 
 def _compute_pth_path() -> str:
-    """Compute the absolute, normalized path of the ``tethered.pth`` auto-activation hook.
+    """Return the normalized path of the ``tethered.pth`` hook this interpreter processes.
 
-    Locates ``tethered.pth`` as a sibling of the ``tethered`` package directory —
-    ``setup.py``'s ``build_py_with_pth`` lands the ``.pth`` directly next to the
-    package on install, so the parent of ``tethered.__file__``'s directory is
-    the site-packages that bootstraps THIS tethered installation.  This is
-    strictly more correct than ``sysconfig.get_path("purelib")`` for ``--user``
-    installs and other schemes where the active site-packages diverges from
-    the default purelib.
+    ``site.py`` executes ``.pth`` files only in site directories: the
+    site-packages of the interpreter's prefixes and, when enabled, the
+    per-user site-packages.  A ``tethered.pth`` anywhere else is never run —
+    beside the package of an editable checkout, or in a ``pip install
+    --target`` directory that is merely on ``PYTHONPATH`` — so it is not a
+    bootstrap, however close to the imported package it sits.
 
-    Returns ``""`` if ``tethered.__file__`` is unavailable (frozen / embedded
-    interpreter, namespace-package edge cases).  The locked-mode FS hook is
-    a no-op when the path is empty.
+    The hook next to the imported package is preferred when that directory
+    is a site directory (``setup.py``'s ``build_py_with_pth`` installs it
+    there, which also covers ``--user`` installs); otherwise the site
+    directories are searched in the order ``site`` processes them.
+
+    Returns ``""`` when no site directory holds the hook, or when this
+    interpreter runs without ``site`` (``-S``).  Python children then do not
+    auto-activate, and the locked-mode FS hook has nothing to guard.
     """
+    if sys.flags.no_site:
+        return ""
+    import site
+
     import tethered
 
+    # sys.prefix comes first because, while a venv interpreter starts up,
+    # site.PREFIXES still names the base installation at the moment the
+    # venv's own site-packages is processed — which is when tethered.pth
+    # auto-activates a child and that child's activate() lands here.
+    site_dirs = site.getsitepackages([sys.prefix, sys.exec_prefix, *site.PREFIXES])
+    if site.ENABLE_USER_SITE and site.USER_SITE:
+        site_dirs.append(site.USER_SITE)
+    candidates = [_normalize_path(os.path.join(d, "tethered.pth")) for d in site_dirs]
+
     pkg_init = getattr(tethered, "__file__", None)
-    if pkg_init is None:
-        return ""
-    site_packages = os.path.dirname(os.path.dirname(pkg_init))
-    return os.path.normcase(
-        os.path.normpath(os.path.abspath(os.path.join(site_packages, "tethered.pth")))
-    )
+    if pkg_init is not None:
+        adjacent = _normalize_path(
+            os.path.join(os.path.dirname(os.path.dirname(pkg_init)), "tethered.pth")
+        )
+        if adjacent in candidates:
+            candidates.insert(0, adjacent)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ""
 
 
 def _capture_local_hostname() -> str:
