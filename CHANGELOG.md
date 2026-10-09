@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A warning for address-shaped wildcard rules (`10.*`, `192.0.2.*`). Such a rule is a text pattern, so it also allows every hostname that fits it, such as `10.attacker.example`. Matching is unchanged; the warning is logged once per rule per process and points to CIDR notation (`10.0.0.0/8`).
+- A one-time warning on Windows when a policy or scope is active and a socket is created under asyncio's default `ProactorEventLoop`. That loop connects through calls that raise no audit event, so raw-IP destinations, port rules and scope connect checks are not enforced on it; run the loop as `asyncio.SelectorEventLoop`. The gap is not new; it is now reported at run time and documented in [`SECURITY.md`](SECURITY.md).
+
+### Changed
+
+The first five entries can break a configuration that worked on 0.5.3.
+
+- **Malformed allow rules raise `ValueError`** at `activate()` / `scope()`. Before, they were accepted and either never matched or allowed more than was written. Affected: a non-numeric, empty, negative or out-of-range port (`host:abc`, `host:`, `host:-1`); text or a bad port after the `]` of a bracketed IP address (`[2001:db8::1]:abc` used to allow the address on every port); an invalid network prefix; a rule with no host (`:443`); a hostname containing `:`, which includes wildcards over IPv6 text such as `fe80::*` (use CIDR); a dot after the port (`host:443.`) or after a bracketed IP (`[::1].`); and a `*` pattern whose only other content is a character set (`*[!/]`), which matched every destination.
+- **More launches are treated as external**, so they are warned about or, under `external_subprocess_policy="block"`, refused. These are: any Python launch when no `tethered.pth` is in a directory `site.py` processes (an editable install, or `pip install --target` + `PYTHONPATH`); on POSIX, a launch whose `argv[0]` is not `sys.executable` (`["python", ...]` with `executable=sys.executable`); a launch whose interpreter options cannot be parsed; `-s` / `-I` launches when tethered is installed in the per-user site-packages; and a Python launch through `os.exec*` / `os.spawn*` / `os.posix_spawn` with an explicit environment that lacks the policy variable. `multiprocessing` workers started after `multiprocessing.set_executable()` named another interpreter, and direct `_winapi.CreateProcess` calls, are now subject to the policy as well (Windows; `multiprocessing` on POSIX from Python 3.14).
+- **A child process refuses to start when it cannot establish a locked or fail-closed policy.** When the inherited policy has `locked` or `fail_closed` set and the child's bootstrap cannot establish it (an invalid payload, a rule the child rejects, the C extension missing), the interpreter exits at startup with status 1. Before, it logged a warning and ran without the policy, or fell back to unlocked enforcement. For the same reason, creating a subinterpreter now fails while a locked policy is active. Without either flag nothing changes: a warning is logged and the child continues.
+- **Lock tokens: more values are rejected, and a tampered policy stays locked.** `lock_token` now also rejects `complex`, `tuple` and `frozenset` values and the singletons `Ellipsis` and `NotImplemented` (`TypeError`), in addition to `str`, `int`, `float`, `bytes` and `bool`. A locked policy that has failed its integrity check can be neither replaced nor deactivated, even with the correct token: `activate()` and `deactivate()` raise `TetheredLocked` until the original objects are restored or the process is restarted.
+- **`activate()` raises `ValueError` and changes nothing when the policy is too large to publish to child processes.** Windows limits an environment variable to 32,767 characters, which is roughly 1,500 short rules. Before, the call raised with the new policy already enforcing and nothing published to children.
+- `activate()` and `deactivate()` are all-or-nothing and serialized across threads: when either raises, the previous policy, the lock and the policy published to child processes are exactly as they were.
+- In locked mode, a failed integrity check now refuses process launches with `SubprocessBlocked` (it raised `EgressBlocked` for them before), and also refuses the guarded `tethered.pth` operations and `os.putenv` / `os.unsetenv` of the policy variable.
+- The `activate()` warning about a missing `tethered.pth` now says what it means: no directory this interpreter's `site.py` processes holds the file, so Python children will not inherit the policy and `sys.executable` launches are treated as external.
+- Performance: `with tethered.scope(...)` enter + exit costs about 1 µs (was about 0.5 µs). `activate(locked=True)` takes longer (still under a millisecond) because it generates a larger integrity snapshot; verifying the snapshot on each event is faster than before.
+
+### Fixed
+
+- `EgressBlocked` and `SubprocessBlocked` can be pickled and copied with all their attributes. A blocked call in a `ProcessPoolExecutor` or `multiprocessing.Pool` worker now reaches the parent as `EgressBlocked`; before, the pool broke (`BrokenProcessPool`) or the result never arrived.
+- A rule that begins with a character set (`[ab].example.com:443`) is a hostname pattern. Before, every rule starting with `[` was read as a bracketed IP address, which dropped the port and the rest of the pattern.
+- A trailing FQDN dot in front of a port (`api.example.com.:443`, `*.example.com.:443`) is ignored, as it already was without a port. Such rules never matched before.
+- `scope()` used on its own under asyncio no longer blocks the hosts it allows. `loop.getaddrinfo` runs in an executor thread that does not carry the scope, so the lookup was not recorded and the connection was judged as a bare IP.
+- Two allowed hostnames that share an address (CDNs, load balancers) no longer block each other. tethered remembers up to 8 hostnames per address instead of the last one, and a connection is allowed if any of them, or the raw IP, is allowed. Addresses are matched in canonical form, so a dual-stack connect to `::ffff:a.b.c.d` finds the name recorded for `a.b.c.d`.
+- `socket.gethostbyname()` followed by a connect to the returned address now works for an allowed host, as the same sequence through `getaddrinfo` did.
+- A hostname-only scope combined with an IP-only scope no longer blocks a connection that each of them allows.
+- `with tethered.scope():` inside a generator no longer removes the caller's scope or leaves its own behind when scopes exit out of order. A scope exited in a context that never entered it logs a warning instead of raising `ValueError`.
+- tethered no longer resolves a hostname that a scope has just refused: the connect-time fallback search only considers names whose lookup every enforcing layer let through. It also skips that search when the address is already allowed by IP (loopback, an IP or CIDR rule), where it could cost up to 30 DNS lookups per connect.
+- Interpreter options of a Python launch are read the way CPython reads them. A script argument `-S`, a joined `-cCODE` and `-Wignore::SyntaxWarning` are no longer mistaken for the `-S` flag and treated as external.
+- Inside a scope, a child launched with an explicit `env=` that is not a `dict` (`UserDict`, `MappingProxyType`) receives a copy of that mapping. Before, it received the parent's environment instead.
+- On Windows, log messages and `SubprocessBlocked.description` for an external launch name the program instead of `subprocess.Popen(None)`.
+- `_normalize_host` re-strips whitespace hidden behind a trailing dot (`"host\r."`).
+
+### Security
+
+- Socket addresses are checked in every form CPython accepts. `bytes` / `bytearray` hosts and ports given through `__index__` (`numpy.int64` and the like) used to skip the policy entirely, including under `fail_closed` and `locked`. An address on an IP-family socket that tethered cannot read is now refused.
+- A log-only layer no longer switches off an enforcing one. An outer `scope(log_only=True)` used to disable an inner enforcing scope, and a log-only global denial used to skip the scope checks for the lookup.
+- A Python child launched with an explicit `env=` that lacks `_TETHERED_CHILD_POLICY`, or after the variable was cleaned out of `os.environ`, now receives the policy: tethered establishes the payload in the launch environment. Before, such a child ran with no policy and neither `"warn"` nor `"block"` noticed. Locked mode refuses these launches instead, as before.
+- `-S` is detected when it is quoted inside a Windows command line, when `executable=` is passed on Windows, and after `-X -c`; these forms used to get through `external_subprocess_policy="block"`.
+- An editable or `--target` install no longer counts as having the bootstrap. Before, the mere existence of a `tethered.pth` next to the package made tethered trust `sys.executable` children that never ran it.
+- `multiprocessing` / `ProcessPoolExecutor` launches are seen by tethered on Windows and, from Python 3.14, on POSIX: `external_subprocess_policy`, the locked-mode payload check and the repair of a cleaned environment now apply to them. Workers started inside a virtual environment by third-party copies of the Windows spawner (joblib's loky, billiard) are recognized as children of `sys.executable`. On POSIX with Python 3.10–3.13 these launches raise no audit event and remain out of reach.
+- Locked mode, launch environments: the payload check reads an explicit environment of any mapping type (a `UserDict` without the variable used to pass), compares type-exactly (`"log_only": 0` used to pass and leave the child with no policy), refuses more than one spelling of the variable name (a case-variant duplicate won on Windows), and detects changes made through `os.putenv()` / `os.unsetenv()`. The earlier claim that libc `setenv` / `unsetenv` called through `ctypes` is caught was wrong and has been withdrawn.
+- Locked mode, integrity: the snapshot now covers every module-level name (runtime flags and counters aside), class attribute and function of `tethered._core` and `tethered._policy` instead of sixteen hand-picked handlers, so rebinding a helper no longer disables enforcement silently. It is also verified on the guarded `tethered.pth` and policy-variable events, not only on socket and launch events. Allow rules are immutable tuples of strings and integers and can no longer be edited in place.
+- Locked mode, token: the lock token is held only by the C extension and can no longer be read back from tethered's module state.
+- Locked mode: `os.truncate()` of `tethered.pth` is refused. The earlier statement that CPython raises no audit event for it was wrong.
+- Locked mode: tethered's own DNS lookups call the resolver captured when the policy was locked, and a connection attempted from inside such a lookup is refused. A replaced `_socket.getaddrinfo` could previously connect from there.
+- [`SECURITY.md`](SECURITY.md) now states what locked mode checks and what it does not stop. It no longer says that the remaining bypasses require `ctypes`: Python code written against tethered can still defeat locked mode, for example by replacing the standard-library functions the policy calls, by writing into the IP-to-hostname map, or by running code in a subinterpreter. Newly documented limitations: the Windows `ProactorEventLoop`, hostnames resolved by `connect()` before the hook sees them, `socket.getnameinfo`, and connections that are already open. The claim that the design is safe on free-threaded Python has been withdrawn; the C extension does not declare free-threading support.
+
 ## [0.5.3] — 2026-08-19
 
 ### Fixed
@@ -116,6 +168,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[Unreleased]: https://github.com/shcherbak-ai/tethered/compare/v0.5.3...HEAD
 [0.5.3]: https://github.com/shcherbak-ai/tethered/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/shcherbak-ai/tethered/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/shcherbak-ai/tethered/compare/v0.5.0...v0.5.1
