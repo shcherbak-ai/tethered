@@ -8,6 +8,7 @@ import copy
 import functools
 import gc
 import logging
+import os
 import pickle
 import socket
 import sys
@@ -1167,6 +1168,84 @@ class TestSnapshotStaging:
             assert tampered()
         finally:
             guardian.deactivate(secret)
+
+
+PTH_LINE = "import tethered._autoactivate\n"
+
+
+@pytest.fixture
+def scratch_pth(tmp_path, monkeypatch):
+    """Point tethered at a scratch ``site-packages`` holding a ``tethered.pth``.
+
+    ``_compute_pth_path()`` derives the path from ``tethered.__file__``, so
+    policies activated while this fixture is in effect guard the scratch
+    file and no test can damage the real one.
+    """
+    site_packages = tmp_path / "site-packages"
+    (site_packages / "tethered").mkdir(parents=True)
+    pth = site_packages / "tethered.pth"
+    pth.write_text(PTH_LINE)
+    monkeypatch.setattr(tethered, "__file__", str(site_packages / "tethered" / "__init__.py"))
+    return pth
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestPthTruncateGuard:
+    """``os.truncate`` raises an audit event, and locked mode refuses it for ``tethered.pth``."""
+
+    def test_event_is_guarded(self):
+        assert "os.truncate" in _core._PTH_FS_EVENTS
+
+    @pytest.mark.parametrize("as_bytes", [False, True], ids=["str", "bytes"])
+    def test_truncating_the_pth_is_refused(self, scratch_pth, as_bytes):
+        _activate_locked()
+        assert _core._config._pth_path == os.path.normcase(str(scratch_pth))
+        target = os.fsencode(scratch_pth) if as_bytes else str(scratch_pth)
+        with pytest.raises(tethered.SubprocessBlocked, match="refused truncation") as excinfo:
+            os.truncate(target, 0)
+        assert excinfo.value.event == "os.truncate"
+        assert scratch_pth.read_text() == PTH_LINE
+
+    def test_truncating_to_any_length_is_refused(self, scratch_pth):
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused truncation"):
+            os.truncate(scratch_pth, 5)
+        assert scratch_pth.read_text() == PTH_LINE
+
+    def test_no_writable_descriptor_can_be_obtained_for_ftruncate(self, scratch_pth):
+        """``os.ftruncate`` carries only a descriptor; the write-open before it is refused."""
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            os.open(scratch_pth, os.O_RDWR)
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            open(scratch_pth, "r+")  # noqa: SIM115
+        fd = os.open(scratch_pth, os.O_RDONLY)
+        try:
+            with pytest.raises(OSError):
+                os.ftruncate(fd, 0)
+        finally:
+            os.close(fd)
+        assert scratch_pth.read_text() == PTH_LINE
+
+    def test_other_files_can_be_truncated(self, scratch_pth):
+        _activate_locked()
+        other = scratch_pth.with_name("other.pth")
+        other.write_text("data")
+        os.truncate(other, 0)
+        assert other.read_text() == ""
+
+    def test_not_refused_outside_locked_mode(self, scratch_pth):
+        tethered.activate(allow=["*.example.com"])
+        os.truncate(scratch_pth, 0)
+        assert scratch_pth.read_text() == ""
+
+    def test_handler_ignores_descriptors_and_missing_arguments(self, scratch_pth):
+        _activate_locked()
+        cfg = _core._config
+        _core._handle_pth_fs_op(cfg, "os.truncate", (7, 0))
+        _core._handle_pth_fs_op(cfg, "os.truncate", ())
+        with pytest.raises(tethered.SubprocessBlocked):
+            _core._handle_pth_fs_op(cfg, "os.truncate", (str(scratch_pth), 0))
 
 
 @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")

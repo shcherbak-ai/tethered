@@ -449,12 +449,16 @@ _ENV_EVENTS = frozenset(("os.putenv", "os.unsetenv"))
 _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 
 # Locked-mode FS-tamper detection.  Refuses Python-level deletion, rename,
-# overwrite, or chmod of tethered.pth (the auto-propagation hook).  No-op
-# when locked mode is off.  ``os.unlink`` is intentionally absent — CPython
-# aliases it to ``os.remove`` and fires the ``os.remove`` audit event, never
-# ``os.unlink``.  The ``os.chmod`` entry catches a permission-strip attack:
-# ``os.chmod(path, 0)`` makes the file unreadable, so site.py silently skips
-# it on POSIX → no auto-activation in the next interpreter.
+# overwrite, truncation, or chmod of tethered.pth (the auto-propagation
+# hook).  No-op when locked mode is off.  ``os.unlink`` is intentionally
+# absent — CPython aliases it to ``os.remove`` and fires the ``os.remove``
+# audit event, never ``os.unlink``.  The ``os.chmod`` entry catches a
+# permission-strip attack: ``os.chmod(path, 0)`` makes the file unreadable,
+# so site.py silently skips it on POSIX → no auto-activation in the next
+# interpreter.  ``os.truncate(path, 0)`` empties the file without opening
+# it through an audited ``open``; CPython raises an ``os.truncate`` event
+# for it (and for ``os.ftruncate``, which passes a file descriptor that
+# cannot be matched against a path).
 #
 # ``os.link`` and ``os.symlink`` are intentionally absent: both syscalls
 # fail with ``EEXIST`` when the destination already exists, and the
@@ -463,7 +467,7 @@ _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 # attacker must first delete or rename it — both of which ARE in this set
 # and get refused.  Adding ``os.link`` / ``os.symlink`` would catch nothing
 # extra in the locked-mode threat model.
-_PTH_FS_EVENTS = frozenset(("os.remove", "os.rename", "open", "os.chmod"))
+_PTH_FS_EVENTS = frozenset(("os.remove", "os.rename", "open", "os.chmod", "os.truncate"))
 
 
 def _is_ip(host: str) -> bool:
@@ -2380,7 +2384,7 @@ def _path_matches_pth(target: Any, cached: str) -> bool:
 
 
 def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
-    """Refuse Python-level deletion, rename, overwrite, or chmod of ``tethered.pth`` in locked mode.
+    """Refuse Python-level tampering with ``tethered.pth`` in locked mode.
 
     Catches:
 
@@ -2391,17 +2395,22 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
       etc. all flow through this);
     - ``os.chmod`` (a permission-strip attack: ``os.chmod(path, 0)`` makes
       the file unreadable, so site.py silently skips it on POSIX → next
-      interpreter has no auto-activation).
+      interpreter has no auto-activation);
+    - ``os.truncate`` given a path (emptying the file disables
+      auto-activation just as deleting it does).
 
     The cached path is computed at ``activate()`` time; if it's empty
     (``tethered.__file__`` unavailable, e.g. frozen interpreter), the
     hook is a no-op.
 
-    No effect outside locked mode.  ``ctypes`` calling libc ``unlink`` /
-    ``rename`` / ``open`` / ``chmod`` directly bypasses the audit event,
-    as does ``os.truncate`` (no audit event) and external tools spawned via
-    ``subprocess`` (mitigated by ``external_subprocess_policy="block"``).  See the
-    threat-model section of the README.
+    No effect outside locked mode.  Not caught: ``os.ftruncate`` (and
+    ``os.truncate`` given a file descriptor) — the event carries the
+    descriptor, not a path, though obtaining a writable descriptor through
+    ``open`` / ``os.open`` is refused above; ``ctypes`` calling libc
+    ``unlink`` / ``rename`` / ``open`` / ``chmod`` / ``truncate`` directly,
+    which raises no audit event; and external tools spawned via
+    ``subprocess`` (mitigated by ``external_subprocess_policy="block"``).
+    See ``SECURITY.md``.
     """
     if not cfg.locked or not cfg._pth_path:
         return
@@ -2428,6 +2437,13 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
         if _path_matches_pth(target, cfg._pth_path):
             logger.warning("tethered: blocked chmod of %s", cfg._pth_path)
             raise SubprocessBlocked(event, f"refused chmod of {cfg._pth_path} in locked mode")
+    elif event == "os.truncate":
+        # args: (path_or_fd, length).  An int is a file descriptor, which
+        # _path_matches_pth() does not match.
+        target = args[0] if args else None
+        if _path_matches_pth(target, cfg._pth_path):
+            logger.warning("tethered: blocked truncation of %s", cfg._pth_path)
+            raise SubprocessBlocked(event, f"refused truncation of {cfg._pth_path} in locked mode")
 
 
 def _install_hook() -> None:
