@@ -80,11 +80,15 @@ scripts/
 tests/
     conftest.py           # Test-suite egress guard + .pth installer for editable installs
     test_policy.py        # Unit tests for AllowPolicy (no network)
+    test_policy_properties.py  # Hypothesis property tests for rule parsing and matching
     test_core.py          # Integration tests with real sockets (sync, async, scopes)
+    test_exceptions.py    # Pickling/copying of the exceptions, including through worker pools
+    test_lifecycle.py     # activate()/deactivate() transitions, concurrency, oversized policies
     test_subprocess.py    # Subprocess audit, scope propagation, locked-mode integrity, perf
     test_autoactivate.py  # Child-side bootstrap parsing + scope inheritance
     test_guardian.py      # C extension tamper detection
 tests_examples/
+    conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
 examples/
     01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
@@ -139,10 +143,11 @@ On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` wi
 ## Testing conventions
 
 - **Policy tests** (`test_policy.py`): Pure logic, no audit hooks, no network. Bulk of pattern-matching coverage lives here.
-- **Integration tests** (`test_core.py`): Use real sockets. Sync + async + scope intersection semantics. The `_cleanup` autouse fixture resets internal state, deactivates the C guardian, and clears `_TETHERED_CHILD_POLICY` between tests.
+- **Integration tests** (`test_core.py`): Use real sockets. Sync + async + scope intersection semantics. The `_cleanup` autouse fixture resets internal state, unlocks the C guardian (with the token a session fixture records from `tethered.activate`), and clears `_TETHERED_CHILD_POLICY` between tests. The conftest egress guard can raise `EgressBlocked` on tethered's behalf in a thread where no tethered state is visible, so a test that expects a block from a scope should assert `scope_label`.
 - **Subprocess tests** (`test_subprocess.py`): `external_subprocess_policy` enforcement, locked-mode payload-integrity check, scope-to-subprocess propagation (round-trip, multi-thread, locked + scope), frame-locals helper unit tests, Windows command-line parser tests, locked-mode `tethered.pth` FS-tamper hook, and microbenchmarks bounding the audit-hook helpers' per-call cost.
 - **Autoactivate tests** (`test_autoactivate.py`): Direct unit tests for `_autoactivate_from_env()` plus end-to-end integration tests that spawn real Python subprocesses to verify the `.pth` bootstrap chain and scope inheritance.
-- **Guardian tests** (`test_guardian.py`): C extension tamper detection — replaces `_config`, monkey-patches `is_allowed`, mutates frozen-dataclass slots via `object.__setattr__`, replaces helper functions; all should fail-closed.
+- **Guardian tests** (`test_guardian.py`): C extension tamper detection — replaces `_config`, monkey-patches `is_allowed`, mutates frozen-dataclass slots via `object.__setattr__`, replaces helper functions; all should fail-closed. One test fails when a new module-level name in `_core.py` or `_policy.py` is neither covered by the integrity snapshot nor on its allowlist of runtime state: name constants in UPPER_CASE, keep runtime flags and counters as lower-case scalars and add them to that allowlist, and never rebind other module-level objects at runtime.
+- **Exception tests** (`test_exceptions.py`) and **lifecycle tests** (`test_lifecycle.py`): pickling and copying of `EgressBlocked` / `SubprocessBlocked` (including real spawn-mode pools), and `activate()` / `deactivate()` transitions under interleaving and failure.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
-- Blocked connection tests verify `EgressBlocked` is raised before any packet leaves the machine.
+- Blocked connection tests verify `EgressBlocked` is raised before the connection is opened.
