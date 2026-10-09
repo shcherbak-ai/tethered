@@ -212,8 +212,8 @@ _guardian_token_id: int = 0  # stored for test fixture cleanup
 _ip_to_hostname: collections.OrderedDict[str, str] = collections.OrderedDict()
 _ip_map_lock = threading.Lock()
 
-# Recently-allowed hostnames (passed the global policy check in
-# ``_handle_getaddrinfo``).  Used by ``_fallback_resolve`` to repair the
+# Recently-allowed hostnames (lookups that the global policy and every
+# enforcing scope let through).  Used by ``_fallback_resolve`` to repair the
 # IP -> hostname map on a connect-time miss caused by DNS divergence —
 # tethered's audit-time getaddrinfo and CPython's original getaddrinfo
 # are independent queries; under load-balanced services with short TTLs
@@ -583,6 +583,17 @@ def _deny_unreadable(
         _enforce_scope_block(sc, host, None, what, scope_stack=scope_stack)
 
 
+def _remember_allowed_hostname(hostname: str) -> None:
+    """Record ``hostname`` as a candidate for :func:`_fallback_resolve` (bounded LRU)."""
+    with _ip_map_lock:
+        if hostname in _allowed_hostnames:
+            _allowed_hostnames.move_to_end(hostname)
+        else:
+            if len(_allowed_hostnames) >= _ALLOWED_HOSTNAMES_MAX_SIZE:
+                _allowed_hostnames.popitem(last=False)
+            _allowed_hostnames[hostname] = None
+
+
 def _handle_dns_lookup(
     cfg: _Config | None,
     scope_stack: tuple[_ScopeConfig, ...],
@@ -781,21 +792,7 @@ def _handle_getaddrinfo(
             # Log-only global denial: carry on to the scope checks — an
             # enforcing scope must still be able to refuse the lookup.
 
-    # Record the hostname for the connect-time fallback-resolve path.
-    # Done AFTER the global policy check passes (so we don't invite arbitrary
-    # hostnames into the candidate set) and BEFORE the scope check (so
-    # log-only scopes still benefit, mirroring how _ip_to_hostname is
-    # populated below).
-    if global_allowed:
-        with _ip_map_lock:
-            if host_lower in _allowed_hostnames:
-                _allowed_hostnames.move_to_end(host_lower)
-            else:
-                if len(_allowed_hostnames) >= _ALLOWED_HOSTNAMES_MAX_SIZE:
-                    _allowed_hostnames.popitem(last=False)
-                _allowed_hostnames[host_lower] = None
-
-    # ── Scope checks (before IP map population) ──
+    # ── Scope checks (before candidate recording and IP map population) ──
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
     for blocking_scope in _check_scopes(scope_stack, host_lower, None, _normalized=True):
@@ -817,6 +814,14 @@ def _handle_getaddrinfo(
         # Denied by a log-only global policy: the lookup proceeds, but the name
         # is not recorded — neither as a fallback candidate nor in the IP map.
         return
+
+    # Record the hostname for the connect-time fallback-resolve path.  Done
+    # only here, after the global policy and every enforcing scope have let
+    # the lookup through: a name one of them refused must never become a
+    # candidate, or tethered itself would look it up later from
+    # _fallback_resolve.  A name that only log-only scopes object to is
+    # recorded, mirroring how _ip_to_hostname is populated below.
+    _remember_allowed_hostname(host_lower)
 
     # Resolve and store IP -> hostname mapping for allowed hosts.
     # When the C guardian is active, _c_guardian.resolve() manages a C-internal

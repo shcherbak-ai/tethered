@@ -919,6 +919,23 @@ def udp_port():
         server.close()
 
 
+@pytest.fixture
+def no_dns(monkeypatch):
+    """Replace tethered's own resolver call; returns the list of calls it received.
+
+    Keeps synthetic-event tests offline even when a name is allowed through and
+    tethered goes on to resolve it for the IP map.
+    """
+    calls: list[tuple] = []
+
+    def fake_getaddrinfo(*args):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(_csocket, "getaddrinfo", fake_getaddrinfo)
+    return calls
+
+
 @contextlib.contextmanager
 def _deny_all(mode: str):
     """Deny everything, loopback included, through one enforcement layer."""
@@ -1744,6 +1761,59 @@ class TestAllowedHostnamesRecording:
         assert "api.example.com" in _core._allowed_hostnames
         tethered.deactivate()
         assert "api.example.com" not in _core._allowed_hostnames
+
+    # ── A name is a candidate only once every enforcing layer has allowed it ──
+
+    def test_scope_blocked_hostname_is_not_recorded(self, no_dns):
+        """Scope alone: a refused lookup must not be re-issued by tethered later."""
+        with tethered.scope(allow=["api.mylib.invalid:443"], allow_localhost=False, label="lib"):
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.getaddrinfo", ("secret-payload.attacker.invalid", 443, 0, 0, 0))
+            assert exc_info.value.scope_label == "lib"
+            assert not _core._allowed_hostnames
+
+            # A later connect to an unmapped address runs _fallback_resolve.
+            # It must find no candidate, so tethered issues no lookup at all.
+            with pytest.raises(tethered.EgressBlocked):
+                _audit_hook("socket.connect", (None, ("203.0.113.9", 443)))
+        assert no_dns == []
+
+    def test_scope_blocked_hostname_is_not_recorded_with_global_policy(self, no_dns):
+        """Global policy allows the name, the scope refuses it: still not a candidate."""
+        tethered.activate(allow=["*.invalid"], allow_localhost=False)
+        with tethered.scope(allow=["api.mylib.invalid:443"], allow_localhost=False, label="lib"):
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.getaddrinfo", ("secret-payload.attacker.invalid", 443, 0, 0, 0))
+            assert exc_info.value.scope_label == "lib"
+            assert not _core._allowed_hostnames
+
+            with pytest.raises(tethered.EgressBlocked):
+                _audit_hook("socket.connect", (None, ("203.0.113.9", 443)))
+        assert no_dns == []
+
+    def test_inner_enforcing_scope_block_is_not_recorded(self, no_dns):
+        """Recording waits for the whole stack, not just the first scope."""
+        with (
+            tethered.scope(allow=["*.invalid"], allow_localhost=False),
+            tethered.scope(allow=["api.mylib.invalid"], allow_localhost=False, label="inner"),
+        ):
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.getaddrinfo", ("other.invalid", 443, 0, 0, 0))
+            assert exc_info.value.scope_label == "inner"
+        assert not _core._allowed_hostnames
+        assert no_dns == []
+
+    def test_scope_allowed_hostname_is_recorded(self, no_dns):
+        with tethered.scope(allow=["api.mylib.invalid:443"], allow_localhost=False):
+            _audit_hook("socket.getaddrinfo", ("api.mylib.invalid", 443, 0, 0, 0))
+        assert list(_core._allowed_hostnames) == ["api.mylib.invalid"]
+
+    def test_log_only_scope_denial_is_still_recorded(self, no_dns):
+        """A log-only scope lets the lookup through, so the name stays a candidate."""
+        with tethered.scope(allow=["api.mylib.invalid:443"], allow_localhost=False, log_only=True):
+            _audit_hook("socket.getaddrinfo", ("other.invalid", 443, 0, 0, 0))
+        assert list(_core._allowed_hostnames) == ["other.invalid"]
+        assert [call[0] for call in no_dns] == ["other.invalid"]
 
 
 class TestFallbackResolve:
@@ -2942,23 +3012,6 @@ class TestScopeLogOnly:
 
         # Scope should have logged both intercept points
         assert any(h == "dns.google" for h, _ in blocked)
-
-
-@pytest.fixture
-def no_dns(monkeypatch):
-    """Replace tethered's own resolver call; returns the list of calls it received.
-
-    Keeps synthetic-event tests offline even when a name is allowed through and
-    tethered goes on to resolve it for the IP map.
-    """
-    calls: list[tuple] = []
-
-    def fake_getaddrinfo(*args):
-        calls.append(args)
-        return []
-
-    monkeypatch.setattr(_csocket, "getaddrinfo", fake_getaddrinfo)
-    return calls
 
 
 # One event of every kind tethered enforces, each for a destination that a
