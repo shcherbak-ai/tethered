@@ -83,7 +83,8 @@ tests/
     test_policy_properties.py  # Hypothesis property tests for rule parsing and matching
     test_core.py          # Integration tests with real sockets (sync, async, scopes)
     test_exceptions.py    # Pickling/copying of the exceptions, including through worker pools
-    test_lifecycle.py     # activate()/deactivate() transitions, concurrency, oversized policies
+    test_lifecycle.py     # activate()/deactivate() transitions, concurrency, oversized policies, hook installation
+    test_subinterpreters.py  # Real subinterpreters under locked, log-only and unlocked policies
     test_subprocess.py    # Subprocess audit, scope propagation, locked-mode integrity, perf
     test_autoactivate.py  # Child-side bootstrap parsing + scope inheritance
     test_guardian.py      # C extension tamper detection
