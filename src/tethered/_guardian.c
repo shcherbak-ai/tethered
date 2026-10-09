@@ -31,11 +31,13 @@
  * Other interpreters: the audit hook is process-wide, the state above is
  * not — it consists of objects of the interpreter that locked the policy.
  * An interpreter with its own GIL (3.12+) runs the hook concurrently with
- * that one, so for an event raised anywhere else the hook reads two atomics
- * (guardian_active, guardian_interp) and nothing more of the state.  While
- * a policy is locked, such an interpreter is refused every operation
- * tethered guards: it cannot be verified and holds no policy the guardian
- * can vouch for (see guardian_interp and other_interpreter_event).
+ * that one, so for an event raised anywhere else the hook reads atomics
+ * (guardian_active, guardian_interp, guardian_log_only) and nothing more of
+ * the state.  While a policy is locked, such an interpreter is refused
+ * every operation tethered guards: it cannot be verified and holds no
+ * policy the guardian can vouch for (see guardian_interp and
+ * other_interpreter_event).  The one exception is a log-only policy, which
+ * refuses no connection or lookup anywhere (see guardian_log_only).
  *
  * Also owns trusted reentrancy state for DNS resolution.  The Python-side
  * _in_hook ContextVar is a convenience flag; in locked mode, the C guardian
@@ -215,6 +217,45 @@ locked_elsewhere(void)
 {
     return ATOMIC_LOAD(guardian_active) &&
            PyInterpreterState_Get() != ATOMIC_PTR_LOAD(guardian_interp);
+}
+
+/*
+ * Is the locked policy log-only — one that reports, and refuses no
+ * connection or lookup?
+ *
+ * Copied from the config each time a lock is committed, for the one egress
+ * decision the guardian makes without the config: another interpreter's
+ * socket events (see other_interpreter_event).  A policy that blocks
+ * nothing in the interpreter that holds it has nothing to block elsewhere.
+ * It softens nothing else: not launches, the bootstrap files or the policy
+ * variable, which log_only leaves refused for the owner too, and not a
+ * failed integrity check, which refuses the owner everything whatever the
+ * policy says.
+ *
+ * An atomic, because threads of other interpreters read it.  Stored before
+ * guardian_active is set and left alone by deactivate(): it is only read
+ * after guardian_active has been seen set, and clearing it would refuse an
+ * event that races with the unlocking of a log-only policy.  A copy and
+ * not a look at the live config: writing to the config's slot later is
+ * tampering, which the snapshot catches for the owner and which changes
+ * nothing here.
+ */
+static ATOMIC_INT guardian_log_only = 0;
+
+/* Does `config` say log_only, plainly (the bool True)?  Anything else,
+ * including a config that cannot be asked, counts as enforcing.  Leaves no
+ * exception. */
+static int
+config_is_log_only(PyObject *config)
+{
+    PyObject *flag = PyObject_GetAttrString(config, "log_only");
+    if (flag == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    int log_only = (flag == Py_True);
+    Py_DECREF(flag);
+    return log_only;
 }
 
 /*
@@ -918,6 +959,10 @@ refuse_other_interpreter(const char *event, int kind, PyObject *args)
  * to the policy variable — and leave everything else alone, so that such an
  * interpreter keeps working for computation.  The guardian matches no
  * policy, so "refuse" is all it can say: not even loopback is reachable.
+ *
+ * Unless the policy is log-only.  Then the owner is refused no connection
+ * or lookup either, and this interpreter's pass too, to whatever hook of
+ * its own it has.  The other kinds of event stay refused.
  */
 static int
 other_interpreter_event(const char *event, PyObject *args)
@@ -929,6 +974,8 @@ other_interpreter_event(const char *event, PyObject *args)
         /* Not socket.__new__, socket.bind, socket.getnameinfo, ...: the
          * Python hook enforces nothing on those either. */
         if (!is_connect_event(event) && !is_lookup_event(event))
+            return 0;
+        if (ATOMIC_LOAD(guardian_log_only))
             return 0;
         break;
     case EVENT_LAUNCH:
@@ -1502,6 +1549,8 @@ py_activate(PyObject *self, PyObject *args)
     if (ensure_hook_installed() < 0)
         return NULL;
 
+    int log_only = config_is_log_only(config);
+
     Holdings next = EMPTY_HOLDINGS;
     SnapshotEntry *staging = NULL;
     SnapshotEntry *retired = NULL;
@@ -1578,6 +1627,7 @@ py_activate(PyObject *self, PyObject *args)
     swap_holdings(&next);
     /* (On a re-activation this stores the value it already has.) */
     ATOMIC_PTR_STORE(guardian_interp, PyInterpreterState_Get());
+    ATOMIC_STORE(guardian_log_only, log_only);
     ATOMIC_STORE(tamper_alerted, 0);
     ATOMIC_STORE(guardian_active, 1);
 
@@ -1720,6 +1770,9 @@ py_verify(PyObject *self, PyObject *Py_UNUSED(ignored))
  * running, the guardian hook lets this thread's socket.getaddrinfo events
  * through and refuses any connection or datagram.  Only the two Python
  * functions that tethered resolves from may call it (frame __code__ check).
+ *
+ * That is for the interpreter that holds the lock.  A caller from another
+ * one is refused, or under a log-only policy served by its own resolver.
  */
 static PyObject *
 py_resolve(PyObject *self, PyObject *args)
@@ -1732,11 +1785,30 @@ py_resolve(PyObject *self, PyObject *args)
                           &host, &port, &family, &socktype, &proto, &flags))
         return NULL;
 
-    /* The lock is another interpreter's: this one gets no lookups, and the
-     * resolver and the callers checked below are not its objects. */
+    /*
+     * The lock is another interpreter's, so the resolver and the callers
+     * checked below are not this interpreter's objects and are not touched.
+     * Under an enforcing policy this interpreter gets no lookups.  Under a
+     * log-only one it gets them like its other socket events, and from its
+     * own _socket.getaddrinfo: that is how its copy of tethered learns
+     * which name an address came from, without which its log-only policy
+     * would report every connection made by hostname.  No resolution window
+     * is opened — nothing is refused here that a window would exempt.
+     */
     if (locked_elsewhere()) {
-        (void)refuse_other_interpreter("socket.getaddrinfo", EVENT_SOCKET, args);
-        return NULL;
+        if (!ATOMIC_LOAD(guardian_log_only)) {
+            (void)refuse_other_interpreter(
+                "socket.getaddrinfo", EVENT_SOCKET, args);
+            return NULL;
+        }
+        PyObject *socket_module = PyImport_ImportModule("_socket");
+        if (socket_module == NULL)
+            return NULL;
+        PyObject *found = PyObject_CallMethod(
+            socket_module, "getaddrinfo", "OOiiii",
+            host, port, family, socktype, proto, flags);
+        Py_DECREF(socket_module);
+        return found;
     }
 
     /* Caller verification: only the cached authorized callers
@@ -1825,7 +1897,8 @@ static struct PyModuleDef guardian_module = {
     "guarded launch, filesystem and environment operations (fail-closed).\n"
     "Owns trusted reentrancy state for DNS resolution.\n\n"
     "The lock is process-wide: while it is held, every interpreter other\n"
-    "than the one that took it is refused those same operations.",
+    "than the one that took it is refused those same operations - except\n"
+    "that a log-only policy refuses no connection or lookup there either.",
     -1,
     guardian_methods
 };

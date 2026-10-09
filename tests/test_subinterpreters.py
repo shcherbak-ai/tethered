@@ -145,14 +145,11 @@ def subinterpreter(tmp_path: Path) -> Iterator[Callable[..., _Subinterpreter]]:
         interp.close()
 
 
-def _lock() -> object:
-    token = object()
-    tethered.activate(
-        allow=["allowed.test"],
-        locked=True,
-        lock_token=token,
-        external_subprocess_policy="allow",
-    )
+def _lock(token: object | None = None, **policy: object) -> object:
+    """Lock a policy in this interpreter, or replace the locked one given its token."""
+    token = object() if token is None else token
+    fields = {"allow": ["allowed.test"], "external_subprocess_policy": "allow", **policy}
+    tethered.activate(**fields, locked=True, lock_token=token)
     return token
 
 
@@ -205,6 +202,20 @@ def connect():
         s.connect(("127.0.0.1", port))
 
 attempt("connect", connect)
+"""
+
+
+# Collects what tethered logs at WARNING or above in that interpreter.
+COLLECT_WARNINGS = """
+import logging
+
+warnings = []
+
+class _Collect(logging.Handler):
+    def emit(self, record):
+        warnings.append(record.getMessage())
+
+logging.getLogger("tethered").addHandler(_Collect(level=logging.WARNING))
 """
 
 
@@ -844,6 +855,263 @@ class TestUnlockedPolicy:
         assert _connection_arrived(listener)
 
 
+class TestLockedLogOnlyPolicy:
+    """``log_only`` monitors without blocking — in every interpreter.
+
+    The owning interpreter is refused no connection or lookup by such a
+    policy, so the guardian refuses none to the others either.  What is not
+    an egress decision stays refused there: ``log_only`` does not soften
+    process launches, the bootstrap files or the policy variable for the
+    owner.
+    """
+
+    @pytest.fixture
+    def log_only_lock(self) -> object:
+        return _lock(log_only=True)
+
+    def test_socket_events_pass(self, log_only_lock, listener, subinterpreter):
+        port = listener.getsockname()[1]
+        events = {
+            "connect": sorted(_core._CONNECT_EVENTS),
+            "lookup": sorted(_core._DNS_EVENTS | {"socket.getaddrinfo"}),
+        }
+        result = subinterpreter().run(
+            COLLECT_WARNINGS,
+            CONNECT,
+            """
+            def sendto():
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.sendto(b"x", ("127.0.0.1", port))
+
+            def create_connection():
+                socket.create_connection(("127.0.0.1", port), 10).close()
+
+            attempt("sendto", sendto)
+            attempt("create_connection", create_connection)
+            attempt("getaddrinfo", socket.getaddrinfo, "localhost", port)
+            attempt("gethostbyname", socket.gethostbyname, "localhost")
+            out["quiet so far"] = list(warnings)
+            for event in events["connect"]:
+                attempt(event, sys.audit, event, None, ("203.0.113.9", 443))
+            for event in events["lookup"]:
+                attempt(event, sys.audit, event, "host.test", 80, 0, 0, 0)
+            core = sys.modules["tethered._core"]
+            out["config"] = [core._config.locked, core._config.log_only]
+            out["warnings"] = warnings
+            """,
+            port=port,
+            events=events,
+        )
+        # Its own copy of the policy is log-only too, and does the reporting.
+        assert result.pop("config") == [False, True]
+        assert result.pop("quiet so far") == []
+        warnings = result.pop("warnings")
+        assert "tethered: blocked connect to 203.0.113.9:443" in warnings
+        assert "tethered: blocked getaddrinfo for host.test" in warnings
+        assert len(warnings) == len(events["connect"]) + len(events["lookup"])
+        assert len(result) == 5 + len(warnings)
+        assert set(result.values()) == {"ok"}
+        assert _connection_arrived(listener)
+        assert _connection_arrived(listener)
+
+    def test_launches_the_bootstrap_and_the_variable_stay_refused(
+        self, scratch_site, log_only_lock, subinterpreter
+    ):
+        events = {
+            "launch": sorted(_core._SUBPROCESS_EVENTS | {"os.startfile/2"}),
+            "fs": sorted(_core._PTH_FS_EVENTS),
+            "env": sorted(_core._ENV_EVENTS),
+        }
+        result = subinterpreter().run(
+            """
+            import pathlib
+
+            pth = pathlib.Path(site_packages) / "tethered.pth"
+            attempt("system", os.system, "exit 0")
+            attempt("remove", os.remove, pth)
+            attempt("write", pth.write_text, "gone")
+            attempt("pop", os.environ.pop, "_TETHERED_CHILD_POLICY")
+            attempt("set", os.putenv, "_TETHERED_CHILD_POLICY", "{}")
+            for event in events["launch"]:
+                attempt(event, sys.audit, event, "prog", ["prog"], None, None)
+            for event in events["fs"]:
+                attempt(event, sys.audit, event, "site-packages/tethered.pth", "w", 0)
+            for event in events["env"]:
+                attempt(event, sys.audit, event, "_TETHERED_CHILD_POLICY", "x")
+            """,
+            site_packages=str(scratch_site),
+            events=events,
+        )
+        reasons = {
+            "system": NO_LAUNCHES,
+            "remove": NO_BOOTSTRAP_CHANGES,
+            "write": NO_BOOTSTRAP_CHANGES,
+            "pop": NO_VARIABLE_CHANGES,
+            "set": NO_VARIABLE_CHANGES,
+            **dict.fromkeys(events["launch"], NO_LAUNCHES),
+            **dict.fromkeys(events["fs"], NO_BOOTSTRAP_CHANGES),
+            **dict.fromkeys(events["env"], NO_VARIABLE_CHANGES),
+        }
+        assert result.keys() == reasons.keys()
+        for name, reason in reasons.items():
+            _assert_refused(result[name], SUBPROCESS_BLOCKED, reason)
+        assert (scratch_site / "tethered.pth").read_text() == "# stand-in\n"
+        assert os.environ[_CHILD_POLICY_ENV] == _core._config._serialized_payload
+
+    def test_without_tethered_loaded(self, log_only_lock, listener, subinterpreter, monkeypatch):
+        """No copy of the policy there: nothing reports, and still nothing is launched."""
+        monkeypatch.delenv(_CHILD_POLICY_ENV)
+        port = listener.getsockname()[1]
+        result = subinterpreter().run(
+            CONNECT,
+            """
+            attempt("elsewhere", sys.audit, "socket.connect", None, ("203.0.113.9", 443))
+            attempt("lookup", sys.audit, "socket.getaddrinfo", "host.test", 80, 0, 0, 0)
+            attempt("launch", os.system, "exit 0")
+            attempt("putenv", os.putenv, "_TETHERED_CHILD_POLICY", "{}")
+            out["tethered loaded"] = sorted(m for m in sys.modules if m.startswith("tethered"))
+            """,
+            port=port,
+        )
+        assert result.pop("tethered loaded") == []
+        assert result.pop("connect") == result.pop("elsewhere") == result.pop("lookup") == "ok"
+        assert _connection_arrived(listener)
+        _assert_refused(result.pop("launch"), RUNTIME_ERROR, NO_LAUNCHES)
+        _assert_refused(result.pop("putenv"), RUNTIME_ERROR, NO_VARIABLE_CHANGES)
+        assert result == {}
+
+    def test_replacing_the_locked_policy_switches_in_both_directions(
+        self, listener, subinterpreter
+    ):
+        """What other interpreters may do follows the policy that is locked now."""
+        port = listener.getsockname()[1]
+        token = _lock(log_only=True)
+        interp = subinterpreter()
+
+        def connect() -> object:
+            return interp.run(CONNECT, port=port)["connect"]
+
+        assert connect() == "ok"
+        assert _connection_arrived(listener)
+
+        _lock(token)  # the same lock, now enforcing
+        _assert_refused(connect(), EGRESS_BLOCKED, NO_NETWORK)
+        assert not _connection_arrived(listener)
+
+        _lock(token, log_only=True)
+        assert connect() == "ok"
+        assert _connection_arrived(listener)
+
+        tethered.deactivate(lock_token=token)
+        assert connect() == "ok"
+        assert _connection_arrived(listener)
+
+        _lock()  # another lock, enforcing from the start
+        _assert_refused(connect(), EGRESS_BLOCKED, NO_NETWORK)
+        assert not _connection_arrived(listener)
+
+    @pytest.mark.parametrize("shared_gil", [False, True], ids=["default", "shared-gil"])
+    def test_names_are_still_mapped_to_addresses(self, shared_gil, listener, subinterpreter):
+        """Otherwise its log-only policy would report every connection made by hostname.
+
+        Loopback is allowed here only by name.  An interpreter that shares the
+        GIL resolves through the guardian, which serves a caller that does not
+        hold the lock from that interpreter's own resolver.
+        """
+        _lock(allow=["localhost"], allow_localhost=False, log_only=True)
+        port = listener.getsockname()[1]
+        result = subinterpreter(shared_gil=shared_gil).run(
+            COLLECT_WARNINGS,
+            """
+            import socket
+            import tethered._core as core
+
+            def by_name():
+                socket.getaddrinfo("localhost", port, socket.AF_INET)
+                with socket.socket() as s:
+                    s.settimeout(10)
+                    s.connect(("127.0.0.1", port))
+
+            attempt("by name", by_name)
+            out["names"] = list(core._ip_to_hostname.get("127.0.0.1", ()))
+            out["by name warnings"] = list(warnings)
+            attempt("elsewhere", sys.audit, "socket.connect", None, ("203.0.113.9", 443))
+            out["warnings"] = warnings
+
+            guardian = core._c_guardian
+            out["through the guardian"] = guardian is not None and guardian.is_active()
+            if out["through the guardian"]:
+                found = guardian.resolve("localhost", port, socket.AF_INET, 0, 0, 0)
+                out["resolve"] = sorted({entry[4][0] for entry in found})
+                # (an address family that does not exist: fails without any lookup)
+                attempt("resolve failure", guardian.resolve, "127.0.0.1", port, 12345, 0, 0, 0)
+            """,
+            port=port,
+        )
+        assert result["by name"] == "ok"
+        assert _connection_arrived(listener)
+        assert result["names"] == ["localhost"]
+        assert result["by name warnings"] == []
+        assert result["elsewhere"] == "ok"
+        assert result["warnings"] == ["tethered: blocked connect to 203.0.113.9:443"]
+        assert result["through the guardian"] is (shared_gil or not OWN_GIL)
+        if result["through the guardian"]:
+            assert result["resolve"] == ["127.0.0.1"]
+            # A failed lookup is the resolver's own error, not a refusal.
+            assert result["resolve failure"]["type"] == "socket.gaierror"
+
+    def test_the_owner_is_still_refused_everything_once_tampered_with(
+        self, log_only_lock, listener, subinterpreter, monkeypatch, capfd
+    ):
+        """A failed integrity check refuses the owner whatever ``log_only`` says."""
+        port = listener.getsockname()[1]
+        sys.audit("socket.connect", None, ELSEWHERE_ADDRESS)  # reported, not refused
+        with monkeypatch.context() as patch:
+            patch.setattr(_core, "_handle_connect", lambda *args: None)
+            with pytest.raises(tethered.EgressBlocked):
+                sys.audit("socket.connect", None, ("127.0.0.1", port))
+            with pytest.raises(tethered.SubprocessBlocked, match="integrity"):
+                sys.audit("os.system", "prog")
+            # Nothing is verified on behalf of another interpreter: what it
+            # may do was settled when the lock was taken.
+            assert subinterpreter().run(CONNECT, port=port)["connect"] == "ok"
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+        sys.audit("socket.connect", None, ELSEWHERE_ADDRESS)
+
+    @pytest.mark.parametrize(
+        ("config", "passes"),
+        [
+            ({"log_only": True}, True),
+            ({"log_only": False}, False),
+            ({"log_only": 1}, False),
+            ({"log_only": "yes"}, False),
+            ({}, False),
+        ],
+        ids=["True", "False", "1", "str", "missing"],
+    )
+    def test_only_a_plain_true_counts_as_log_only(self, config, passes, subinterpreter):
+        """The guardian on its own, handed a stand-in for the config."""
+        import types
+
+        token = object()
+        stand_in = types.SimpleNamespace(locked=False, **config)
+        _core._c_guardian.activate(vars(_core), stand_in, token, [])
+        try:
+            result = subinterpreter().run(
+                """
+                attempt("connect", sys.audit, "socket.connect", None, ("203.0.113.9", 443))
+                attempt("launch", sys.audit, "os.system", "prog")
+                """
+            )
+        finally:
+            _core._c_guardian.deactivate(token)
+        if passes:
+            assert result["connect"] == "ok"
+        else:
+            _assert_refused(result["connect"], RUNTIME_ERROR, NO_NETWORK)
+        _assert_refused(result["launch"], RUNTIME_ERROR, NO_LAUNCHES)
+
+
 @pytest.mark.skipif(
     sys.version_info < (3, 14), reason="InterpreterPoolExecutor arrived in Python 3.14"
 )
@@ -861,6 +1129,14 @@ class TestInterpreterPool:
             assert ELSEWHERE in str(excinfo.value)
             # The pool survives a refused task.
             assert pool.submit(len, "still working").result(timeout=120) == 13
+
+    def test_a_pool_reaches_the_network_under_a_locked_log_only_policy(self):
+        from concurrent.futures import InterpreterPoolExecutor
+
+        _lock(log_only=True)
+        with InterpreterPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(pow, 2, 10).result(timeout=120) == 1024
+            assert pool.submit(socket.getaddrinfo, "localhost", 80).result(timeout=120)
 
     def test_a_pool_under_an_unlocked_policy(self):
         from concurrent.futures import InterpreterPoolExecutor
