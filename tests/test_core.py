@@ -2116,6 +2116,70 @@ class TestAllowedHostnamesRecording:
         assert [call[0] for call in no_dns] == ["other.invalid"]
 
 
+class TestFallbackSkippedWhenRawIPAllowed:
+    """A connect to an unmapped address that every layer already allows by IP
+    does not re-resolve the candidate hostnames: no name could change the
+    outcome, and the search costs a DNS lookup per candidate.
+    """
+
+    @staticmethod
+    def _seed_candidate():
+        with _ip_map_lock:
+            _core._allowed_hostnames["api.example.com"] = None
+
+    @staticmethod
+    def _record_resolves(monkeypatch) -> list[str]:
+        calls: list[str] = []
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            calls.append(host)
+            return []
+
+        monkeypatch.setattr(_core._csocket, "getaddrinfo", fake_getaddrinfo)
+        return calls
+
+    def test_cidr_allowed_ip_skips_fallback(self, monkeypatch):
+        tethered.activate(allow=["api.example.com", "198.51.100.0/24"])
+        self._seed_candidate()
+        calls = self._record_resolves(monkeypatch)
+        _audit_hook("socket.connect", (None, ("198.51.100.7", 443)))
+        assert calls == []
+
+    def test_loopback_skips_fallback(self, monkeypatch):
+        tethered.activate(allow=["api.example.com"])
+        self._seed_candidate()
+        calls = self._record_resolves(monkeypatch)
+        _audit_hook("socket.connect", (None, ("127.0.0.1", 6379)))
+        assert calls == []
+
+    def test_ip_not_allowed_still_falls_back(self, monkeypatch):
+        tethered.activate(allow=["api.example.com"])
+        self._seed_candidate()
+        calls = self._record_resolves(monkeypatch)
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.connect", (None, ("203.0.113.9", 443)))
+        assert calls == ["api.example.com"]
+
+    def test_scope_that_denies_the_ip_still_falls_back(self, monkeypatch):
+        tethered.activate(allow=["api.example.com", "198.51.100.0/24"])
+        self._seed_candidate()
+        calls = self._record_resolves(monkeypatch)
+        with (
+            tethered.scope(allow=["api.example.com"], label="names-only"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, ("198.51.100.7", 443)))
+        assert exc_info.value.scope_label == "names-only"
+        assert calls == ["api.example.com"]
+
+    def test_policy_error_is_not_treated_as_allowed(self, monkeypatch):
+        tethered.activate(allow=["198.51.100.0/24"])
+        cfg = _core._config
+        assert _core._allowed_by_every_layer(cfg, (), "198.51.100.7", 443) is True
+        monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
+        assert _core._allowed_by_every_layer(cfg, (), "198.51.100.7", 443) is False
+
+
 class TestFallbackResolve:
     """Direct unit tests for ``_fallback_resolve`` (DNS-divergence repair).
 

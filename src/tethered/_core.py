@@ -1137,6 +1137,26 @@ def _fallback_resolve(target_ip: str, port: int | None) -> str | None:
         _in_hook.reset(_token)
 
 
+def _allowed_by_every_layer(
+    cfg: _Config | None,
+    scope_stack: tuple[_ScopeConfig, ...],
+    host: str,
+    port: int | None,
+) -> bool:
+    """Return True when the global policy and every scope allow ``host`` as given.
+
+    ``host`` must already be normalized.  A policy error counts as "not known
+    to be allowed", which leaves the decision, and the reporting of the error,
+    to the caller's normal path.
+    """
+    try:
+        if cfg is not None and not cfg.policy.is_allowed(host, port, _normalized=True):
+            return False
+        return all(sc.policy.is_allowed(host, port, _normalized=True) for sc in scope_stack)
+    except Exception:
+        return False
+
+
 def _handle_connect(
     cfg: _Config | None,
     scope_stack: tuple[_ScopeConfig, ...],
@@ -1178,13 +1198,17 @@ def _handle_connect(
             # LRU: move to end on access so recently-used entries survive eviction
             if names:
                 _ip_to_hostname.move_to_end(ip_key)
-        if not names:
+        if not names and not _allowed_by_every_layer(cfg, scope_stack, check_host, port):
             # IP map miss — could be DNS divergence (load-balanced service,
             # short TTL, gevent threadpool latency) where the IP CPython
             # returned to the application differs from what tethered's
             # audit-time getaddrinfo saw.  Re-resolve recently-allowed
             # hostnames to find one that maps to this IP.  Hot path
             # (mapped IP) is unaffected; cost only on the miss.
+            #
+            # Skipped when every layer already allows the raw IP (loopback,
+            # an IP or CIDR rule): no hostname can change that outcome, and
+            # the search costs up to _FALLBACK_RESOLVE_MAX_CANDIDATES lookups.
             fallback = _fallback_resolve(ip_key, port)
             if fallback is not None:
                 names = (fallback,)
