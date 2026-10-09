@@ -9,9 +9,11 @@ environment variable read by child processes.
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import random
 import socket
+import subprocess
 import sys
 import threading
 
@@ -784,3 +786,274 @@ class TestTokenRules:
         tethered.deactivate()
         assert _core._config is None
         assert POLICY_VAR not in os.environ
+
+
+# ── The audit hook is really installed ─────────────────────────────
+# sys.addaudithook() raises a "sys.addaudithook" event first.  A hook that is
+# already installed can answer it with a RuntimeError, and the new hook is
+# then dropped while the call returns normally.
+
+REFUSED = "another audit hook in this process refused it, so nothing would be enforced"
+
+
+class _HookList:
+    """Stands in for the interpreter's list of audit hooks, as ``_install_hook()`` sees it.
+
+    The real list cannot be used: a hook can never be removed, so one that
+    refuses new hooks would stay for the rest of the session, and tethered's
+    own hook is usually in it already.  Only the probe event is diverted to
+    the stand-in; every other event still reaches the real hooks.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, refuse: bool = False) -> None:
+        self.refuse = refuse
+        self.hooks: list = []
+        self.attempts = 0
+        self._real_audit = sys.audit
+        monkeypatch.setattr(sys, "addaudithook", self.add)
+        monkeypatch.setattr(sys, "audit", self.audit)
+        monkeypatch.setattr(_core, "_hook_installed", False)
+
+    def add(self, hook) -> None:
+        self.attempts += 1
+        if not self.refuse:  # a refused hook is dropped without an error
+            self.hooks.append(hook)
+
+    def audit(self, event: str, *args: object) -> None:
+        if event != _core._HOOK_PROBE_EVENT:
+            self._real_audit(event, *args)
+            return
+        for hook in self.hooks:
+            hook(event, args)
+
+
+def _probe() -> list[bool]:
+    """One entry for every copy of tethered's hook the interpreter really holds."""
+    answers: list[bool] = []
+    sys.audit(_core._HOOK_PROBE_EVENT, answers)
+    return answers
+
+
+# What a child process reports after trying to put a deny-all policy in place
+# under a hook that refuses new hooks.  Such a hook is only ever installed in
+# a child: here it would break every later test that adds a hook.
+_REFUSING_PROCESS = """
+import json, os, socket, sys
+
+
+def refuse_new_hooks(event, args):
+    if event == "sys.addaudithook":
+        raise RuntimeError("no more audit hooks")
+
+
+sys.addaudithook(refuse_new_hooks)
+
+import tethered
+import tethered._core as _core
+
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+
+deny_all = {"allow": [], "allow_localhost": False}
+report = {"raised": None, "body_ran": False}
+try:
+    if sys.argv[1] == "activate":
+        tethered.activate(**deny_all)
+    elif sys.argv[1] == "locked activate":
+        tethered.activate(**deny_all, locked=True, lock_token=object())
+    else:
+        with tethered.scope(**deny_all):
+            report["body_ran"] = True
+except RuntimeError as exc:
+    report["raised"] = str(exc)
+
+with socket.socket() as client:
+    try:
+        client.connect(server.getsockname())
+        report["connect"] = "connected"
+    except tethered.EgressBlocked:
+        report["connect"] = "blocked"
+
+guardian = _core._c_guardian
+report.update(
+    hook_installed=_core._hook_installed,
+    config=_core._config is not None,
+    published=_core._CHILD_POLICY_ENV in os.environ,
+    locked=guardian is not None and guardian.is_active(),
+    scopes=len(_core._scopes.get()),
+    active_scope_count=_core._active_scope_count,
+)
+print(json.dumps(report))
+"""
+
+
+class TestHookInstallation:
+    """``_install_hook()`` confirms that the hook is live, and its callers fail if it is not."""
+
+    def test_the_installed_hook_answers_the_probe_once(self):
+        _core._install_hook()
+        assert _core._hook_installed is True
+        assert _probe() == [True]
+
+    def test_a_lost_flag_does_not_add_the_hook_again(self, monkeypatch):
+        """The hook is live but the flag says otherwise: nothing is added."""
+        _core._install_hook()
+        added: list = []
+        monkeypatch.setattr(sys, "addaudithook", added.append)
+        monkeypatch.setattr(_core, "_hook_installed", False)
+
+        _core._install_hook()
+
+        assert added == []
+        assert _core._hook_installed is True
+        assert _probe() == [True]
+
+    def test_first_installation(self, monkeypatch):
+        hooks = _HookList(monkeypatch)
+        _core._install_hook()
+        _core._install_hook()
+        assert hooks.hooks == [_core._audit_hook]
+        assert hooks.attempts == 1
+        assert _core._hook_installed is True
+
+    def test_refused_installation_raises(self, monkeypatch):
+        hooks = _HookList(monkeypatch, refuse=True)
+        with pytest.raises(RuntimeError, match=REFUSED):
+            _core._install_hook()
+        assert hooks.attempts == 1
+        assert _core._hook_installed is False
+
+    def test_a_later_call_tries_again(self, monkeypatch):
+        hooks = _HookList(monkeypatch, refuse=True)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match=REFUSED):
+                _core._install_hook()
+        hooks.refuse = False
+
+        _core._install_hook()
+        _core._install_hook()
+
+        assert hooks.hooks == [_core._audit_hook]
+        assert hooks.attempts == 3
+        assert _core._hook_installed is True
+
+    def test_an_interrupted_installation_is_not_repeated(self, monkeypatch):
+        """The hook went in, but the call ended before it could record that."""
+        hooks = _HookList(monkeypatch)
+
+        def add_then_interrupt(hook) -> None:
+            hooks.add(hook)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(sys, "addaudithook", add_then_interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            _core._install_hook()
+        assert _core._hook_installed is False
+        monkeypatch.setattr(sys, "addaudithook", hooks.add)
+
+        _core._install_hook()
+
+        assert hooks.hooks == [_core._audit_hook]
+        assert hooks.attempts == 1
+        assert _core._hook_installed is True
+
+    @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+    def test_activate_changes_nothing(self, locked, monkeypatch, capfd):
+        secret = object()
+        inherited = '{"global": null, "scopes": []}'
+        os.environ[POLICY_VAR] = inherited  # not written by tethered; must survive
+        hooks = _HookList(monkeypatch, refuse=True)
+        before = _observe(secret)
+
+        with pytest.raises(RuntimeError, match=REFUSED):
+            tethered.activate(allow=["new.test"], locked=locked, lock_token=secret)
+
+        assert _observe(secret) == before
+        assert _core._config is None
+        assert guardian.is_active() is False
+        assert os.environ[POLICY_VAR] == inherited
+        assert _core._hook_installed is False
+
+        # Once the hook is accepted, the same call goes through.
+        hooks.refuse = False
+        tethered.activate(allow=["new.test"], locked=locked, lock_token=secret)
+        _assert_coherent(secret)
+        assert hooks.hooks == [_core._audit_hook]
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_scope_entry_leaves_no_scope_behind(self, monkeypatch):
+        hooks = _HookList(monkeypatch, refuse=True)
+        guarded = tethered.scope(allow=[])
+        ran: list[str] = []
+
+        with pytest.raises(RuntimeError, match=REFUSED), guarded:
+            ran.append("unprotected")
+
+        assert ran == []
+        assert _core._scopes.get() == ()
+        assert _core._active_scope_count == 0
+
+        # The instance was never entered, so it can be once the hook is accepted.
+        hooks.refuse = False
+        with guarded:
+            assert _core._scopes.get() == (guarded._scope_cfg,)
+            assert _core._active_scope_count == 1
+        assert _core._scopes.get() == ()
+        assert _core._active_scope_count == 0
+
+    def test_decorated_function_does_not_run_unprotected(self, monkeypatch):
+        _HookList(monkeypatch, refuse=True)
+        ran: list[str] = []
+
+        @tethered.scope(allow=[])
+        def work() -> None:
+            ran.append("unprotected")
+
+        with pytest.raises(RuntimeError, match=REFUSED):
+            work()
+
+        assert ran == []
+        assert _core._scopes.get() == ()
+        assert _core._active_scope_count == 0
+
+    @pytest.mark.asyncio
+    async def test_decorated_coroutine_does_not_run_unprotected(self, monkeypatch):
+        _HookList(monkeypatch, refuse=True)
+        ran: list[str] = []
+
+        @tethered.scope(allow=[])
+        async def work() -> None:
+            ran.append("unprotected")
+
+        with pytest.raises(RuntimeError, match=REFUSED):
+            await work()
+
+        assert ran == []
+        assert _core._scopes.get() == ()
+        assert _core._active_scope_count == 0
+
+    @pytest.mark.parametrize("how", ["activate", "locked activate", "scope"])
+    def test_in_a_process_whose_hook_refuses_new_hooks(self, how):
+        """The real thing: nothing can be enforced there, and the caller is told so."""
+        result = subprocess.run(
+            [sys.executable, "-c", _REFUSING_PROCESS, how],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        raised = report.pop("raised")
+        assert raised is not None, report
+        assert REFUSED in raised
+        assert report == {
+            "body_ran": False,
+            "connect": "connected",  # the deny-all policy is not there to refuse it
+            "hook_installed": False,
+            "config": False,
+            "published": False,
+            "locked": False,
+            "scopes": 0,
+            "active_scope_count": 0,
+        }

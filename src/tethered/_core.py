@@ -401,6 +401,21 @@ def _normalize_hint(value: object) -> str:
 # Hook installed flag
 _hook_installed: bool = False
 
+# Private audit event with which _install_hook() asks whether _audit_hook is
+# really in the interpreter's hook list: sys.addaudithook() drops a hook that
+# an existing hook refuses, and returns normally all the same.  The event
+# carries a list, and the hook answers by appending to it.
+_HOOK_PROBE_EVENT = "tethered.hook_probe"
+
+_HOOK_REFUSED_MSG = (
+    "tethered: its audit hook could not be installed — another audit hook in this "
+    "process refused it, so nothing would be enforced. (A hook that raises "
+    "RuntimeError for the 'sys.addaudithook' event makes sys.addaudithook() drop the "
+    "new hook without reporting an error.) Install tethered's hook first, by calling "
+    "tethered.activate() or entering a scope before that hook is added, or have that "
+    "hook let tethered's through."
+)
+
 # Events that trigger connection enforcement.  These are raised by the socket
 # object's own methods.  asyncio's ProactorEventLoop (the Windows default)
 # connects and sends through _overlapped instead, which raises none of them —
@@ -465,6 +480,11 @@ _POPEN_NESTED_EVENTS = frozenset(
 # ``os.putenv()`` / ``os.unsetenv()``; both raise these events, and so do
 # assignments and deletions through ``os.environ``.
 _ENV_EVENTS = frozenset(("os.putenv", "os.unsetenv"))
+
+# What _audit_hook tests for in place of _ENV_EVENTS: the hook probe shares
+# that one membership test, so recognising it costs every other audit event
+# in the process nothing.
+_ENV_AND_PROBE_EVENTS = _ENV_EVENTS | {_HOOK_PROBE_EVENT}
 
 _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 
@@ -688,9 +708,13 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         _handle_subprocess(cfg, event, args, scope_stack)
         return
 
-    # Native changes to the policy variable that ``os.environ`` may not show.
-    if event in _ENV_EVENTS:
-        _handle_env_change(event, args)
+    # Native changes to the policy variable that ``os.environ`` may not show,
+    # and _install_hook() asking whether this hook is live.
+    if event in _ENV_AND_PROBE_EVENTS:
+        if event == _HOOK_PROBE_EVENT:
+            args[0].append(True)
+        else:
+            _handle_env_change(event, args)
         return
 
     # Locked-mode-only tamper detection on FS access to tethered.pth.
@@ -2548,12 +2572,31 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
 
 
 def _install_hook() -> None:
-    """Install the audit hook exactly once."""
+    """Install the audit hook exactly once, and confirm that it is live.
+
+    ``sys.addaudithook()`` first raises a ``sys.addaudithook`` audit event.
+    If a hook that is already installed answers it with a ``RuntimeError``,
+    the new hook is dropped and the call returns normally all the same, so
+    its return says nothing.  The hook is therefore asked to answer a probe
+    event: after it is added, which is the only way to learn that it was
+    accepted, and before, so that a hook which is already live (the flag
+    was lost, e.g. to an interrupt between the two steps) is never added a
+    second time.
+
+    Raises ``RuntimeError`` when the hook is not live.  ``_hook_installed``
+    then stays ``False`` and a later call tries again.
+    """
     global _hook_installed
     with _state_lock:
         if _hook_installed:
             return
-        sys.addaudithook(_audit_hook)
+        answers: list[bool] = []
+        sys.audit(_HOOK_PROBE_EVENT, answers)
+        if not answers:
+            sys.addaudithook(_audit_hook)
+            sys.audit(_HOOK_PROBE_EVENT, answers)
+            if not answers:
+                raise RuntimeError(_HOOK_REFUSED_MSG)
         _hook_installed = True
 
 
@@ -3053,7 +3096,12 @@ def activate(
 
     Raises:
         RuntimeError: If ``locked=True`` but the C guardian extension is
-            not available.
+            not available.  Also if tethered's audit hook cannot be
+            installed because another audit hook in this process refused
+            it (a hook that raises ``RuntimeError`` for the
+            ``sys.addaudithook`` event makes Python drop a new hook without
+            reporting an error): nothing would be enforced, so nothing is
+            activated.
         TypeError: If ``lock_token`` is a singleton or an instance of an
             immutable built-in type.
         ValueError: If ``locked=True`` is used without ``lock_token``,
