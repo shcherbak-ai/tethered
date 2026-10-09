@@ -2861,7 +2861,7 @@ def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, int]]:
     return entries
 
 
-def _is_idempotent_reactivation(requested_payload: dict[str, Any]) -> bool:
+def _is_idempotent_reactivation(requested_payload: str) -> bool:
     """Return True when a locked ``activate()`` re-requests the exact active policy.
 
     Auto-activated children (``tethered.pth``) re-run application startup
@@ -2876,12 +2876,23 @@ def _is_idempotent_reactivation(requested_payload: dict[str, Any]) -> bool:
     call are deliberately ignored (adopting a caller-supplied token would
     let untrusted code unlock the policy).
 
+    ``requested_payload`` is the canonical serialized payload of the
+    requested policy (what ``_build_env_payload(global, ())`` returns).  It
+    is compared with the active config's ``_serialized_payload`` — an
+    immutable ``str`` — not with the mutable ``_global_payload_dict``,
+    whose contents can be edited in place without changing any pinned
+    identity.  Comparing JSON text is also exact about types: ``0`` is not
+    ``false``.
+
     Caller must hold ``_state_lock``.
     """
     current = _config
     if current is None or not current.locked:
         return False
-    if current._global_payload_dict != requested_payload:
+    active_payload = current._serialized_payload
+    if type(active_payload) is not str or type(requested_payload) is not str:
+        return False
+    if active_payload != requested_payload:
         return False
     logger.info(
         "tethered: activate() no-op — the requested policy is identical to "
@@ -3026,7 +3037,7 @@ def activate(
             and _c_guardian.is_active()
             and not _c_guardian.check_token(lock_token)
         ):
-            if _is_idempotent_reactivation(global_payload_dict):
+            if _is_idempotent_reactivation(serialized_payload):
                 return
             raise TetheredLocked(activate_locked_msg)
         with _ip_map_lock:

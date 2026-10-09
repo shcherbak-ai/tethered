@@ -8,6 +8,7 @@ import contextlib
 import copy
 import functools
 import gc
+import json
 import logging
 import os
 import pickle
@@ -179,6 +180,43 @@ class TestLockedMode:
             on_blocked=lambda host, port: None,
         )
         assert _core._config.on_blocked is None
+
+    def test_reactivate_noop_ignores_the_mutable_payload_dict(self):
+        """Editing ``_global_payload_dict`` in place cannot make a wider request look identical.
+
+        The dict keeps its identity when its contents change, so the
+        integrity snapshot does not notice; the comparison therefore uses the
+        immutable serialized payload.
+        """
+        tethered.activate(allow=["a.example.com"], locked=True, lock_token=object())
+        cfg = _core._config
+        cfg._global_payload_dict["allow"].append("evil.test")
+        with pytest.raises(tethered.TetheredLocked, match=r"activate\(\) blocked"):
+            tethered.activate(
+                allow=["a.example.com", "evil.test"], locked=True, lock_token=object()
+            )
+        assert _core._config is cfg
+        # ... and the genuinely identical request is still recognised.
+        tethered.activate(allow=["a.example.com"], locked=True, lock_token=object())
+        assert _core._config is cfg
+
+    def test_reactivate_noop_comparison_is_type_exact(self):
+        tethered.activate(allow=["a.example.com"], locked=True, lock_token=object())
+        payload = _core._config._serialized_payload
+        assert "false" in payload
+        assert _core._is_idempotent_reactivation(payload) is True
+        # JSON text tells 0 from false; a dict comparison does not.
+        assert json.loads(payload) == json.loads(payload.replace("false", "0"))
+        assert _core._is_idempotent_reactivation(payload.replace("false", "0")) is False
+        assert _core._is_idempotent_reactivation(json.loads(payload)) is False
+
+        class EqualToAnything(str):
+            def __eq__(self, other):
+                return True
+
+            __hash__ = str.__hash__
+
+        assert _core._is_idempotent_reactivation(EqualToAnything("x")) is False
 
     def test_reactivate_locked_different_flag_still_raises(self):
         """Same rules but a differing flag (log_only) is not idempotent — still blocked."""
