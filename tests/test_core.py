@@ -919,21 +919,52 @@ def udp_port():
         server.close()
 
 
+class _FakeDns:
+    """Stand-in for tethered's own resolver call.
+
+    Answers from ``table`` (hostname -> list of IP strings; unknown names
+    resolve to nothing) and records every call in ``calls``.
+    """
+
+    def __init__(self) -> None:
+        self.table: dict[str, list[str]] = {}
+        self.calls: list[tuple] = []
+
+    def getaddrinfo(self, host, *args):
+        self.calls.append((host, *args))
+        return [
+            (socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+            for ip in self.table.get(host, [])
+        ]
+
+
 @pytest.fixture
-def no_dns(monkeypatch):
-    """Replace tethered's own resolver call; returns the list of calls it received.
+def fake_dns(monkeypatch):
+    """Replace tethered's own resolver call with a :class:`_FakeDns`.
 
     Keeps synthetic-event tests offline even when a name is allowed through and
-    tethered goes on to resolve it for the IP map.
+    tethered goes on to resolve it, and lets a test decide what a name maps to
+    without touching the IP map's internal layout.
     """
-    calls: list[tuple] = []
+    fake = _FakeDns()
+    monkeypatch.setattr(_csocket, "getaddrinfo", fake.getaddrinfo)
+    return fake
 
-    def fake_getaddrinfo(*args):
-        calls.append(args)
-        return []
 
-    monkeypatch.setattr(_csocket, "getaddrinfo", fake_getaddrinfo)
-    return calls
+@pytest.fixture
+def no_dns(fake_dns):
+    """Like ``fake_dns`` with an empty table; returns the list of resolver calls."""
+    return fake_dns.calls
+
+
+def _learn(name: str) -> None:
+    """Have tethered resolve ``name`` (through ``fake_dns``) and record the mapping.
+
+    Runs inside a scope that allows only that name, the way a caller that has
+    not yet entered an IP-only scope would look it up.
+    """
+    with tethered.scope(allow=[name], allow_localhost=False):
+        _audit_hook("socket.getaddrinfo", (name, None, 0, 0, 0))
 
 
 @contextlib.contextmanager
@@ -3239,6 +3270,111 @@ class TestLogOnlyDoesNotStopEnforcement:
         assert no_dns == []
 
 
+class TestScopeHostnameOrIp:
+    """Each scope may allow a connect by hostname or by IP; then all must allow.
+
+    The rule is ``all(scope allows name OR scope allows ip)``, not
+    ``all(scopes allow name) OR all(scopes allow ip)``.
+    """
+
+    def test_hostname_only_outer_ip_only_inner_real_socket(self, tcp_listener):
+        with tethered.scope(allow=["localhost"], allow_localhost=False, label="by-name"):
+            socket.getaddrinfo("localhost", tcp_listener, socket.AF_INET)
+            with (
+                tethered.scope(allow=["127.0.0.1"], allow_localhost=False, label="by-ip"),
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+            ):
+                client.settimeout(5)
+                client.connect(("127.0.0.1", tcp_listener))
+
+    def test_ip_only_outer_hostname_only_inner_real_socket(self, tcp_listener):
+        # The lookup happens before the IP-only scope is entered: inside it the
+        # lookup itself would be refused, which is the designed behaviour.
+        with tethered.scope(allow=["localhost"], allow_localhost=False):
+            socket.getaddrinfo("localhost", tcp_listener, socket.AF_INET)
+        with (
+            tethered.scope(allow=["127.0.0.1"], allow_localhost=False, label="by-ip"),
+            tethered.scope(allow=["localhost"], allow_localhost=False, label="by-name"),
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+        ):
+            client.settimeout(5)
+            client.connect(("127.0.0.1", tcp_listener))
+
+    @pytest.mark.parametrize("order", ["name-ip-range", "range-ip-name"])
+    def test_mixed_representations_across_scopes(self, fake_dns, order):
+        fake_dns.table["db.internal"] = ["10.0.0.1"]
+        _learn("db.internal")
+        rules = [["db.internal"], ["10.0.0.1"], ["10.0.0.0/8"]]
+        if order == "range-ip-name":
+            rules.reverse()
+        with contextlib.ExitStack() as stack:
+            for allow in rules:
+                stack.enter_context(tethered.scope(allow=allow, allow_localhost=False))
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+
+    def test_a_scope_allowing_neither_still_blocks(self, fake_dns):
+        fake_dns.table["db.internal"] = ["10.0.0.1"]
+        _learn("db.internal")
+        with (
+            tethered.scope(allow=["db.internal"], allow_localhost=False, label="by-name"),
+            tethered.scope(allow=["10.0.0.1"], allow_localhost=False, label="by-ip"),
+            tethered.scope(allow=["other.internal"], allow_localhost=False, label="neither"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+        assert exc_info.value.scope_label == "neither"
+        assert exc_info.value.resolved_from == "db.internal"
+
+    def test_port_rules_apply_to_each_alternative(self, fake_dns):
+        fake_dns.table["db.internal"] = ["10.0.0.1"]
+        _learn("db.internal")
+        with (
+            tethered.scope(allow=["db.internal:5432"], allow_localhost=False, label="by-name"),
+            tethered.scope(allow=["10.0.0.1:5432"], allow_localhost=False, label="by-ip"),
+        ):
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.connect", (None, ("10.0.0.1", 80)))
+        assert exc_info.value.scope_label == "by-name"
+
+    def test_without_a_mapping_the_hostname_scope_blocks(self, no_dns):
+        with (
+            tethered.scope(allow=["db.internal"], allow_localhost=False, label="by-name"),
+            tethered.scope(allow=["10.0.0.1"], allow_localhost=False, label="by-ip"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+        assert exc_info.value.scope_label == "by-name"
+        assert exc_info.value.resolved_from is None
+
+    def test_monitoring_scope_between_mixed_scopes(self, fake_dns):
+        fake_dns.table["db.internal"] = ["10.0.0.1"]
+        _learn("db.internal")
+        seen: list[tuple[str, int | None]] = []
+        with (
+            tethered.scope(allow=["db.internal"], allow_localhost=False),
+            tethered.scope(
+                allow=["other.internal"],
+                allow_localhost=False,
+                log_only=True,
+                on_blocked=lambda h, p: seen.append((h, p)),
+            ),
+            tethered.scope(allow=["10.0.0.1"], allow_localhost=False),
+        ):
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+        assert seen == [("db.internal", 5432)]
+
+    def test_global_policy_and_scopes_each_pick_their_own_alternative(self, fake_dns):
+        fake_dns.table["db.internal"] = ["10.0.0.1"]
+        tethered.activate(allow=["db.internal", "10.0.0.0/8"], allow_localhost=False)
+        _audit_hook("socket.getaddrinfo", ("db.internal", 5432, 0, 0, 0))
+        with (
+            tethered.scope(allow=["10.0.0.1"], allow_localhost=False),
+            tethered.scope(allow=["db.internal"], allow_localhost=False),
+        ):
+            _audit_hook("socket.connect", (None, ("10.0.0.1", 5432)))
+
+
 class TestScopeFailClosed:
     """Test scope() fail_closed behavior."""
 
@@ -3684,14 +3820,14 @@ class TestScopeDirect:
         """_check_scopes returns the denying scope when host not allowed."""
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, label="test-scope")
-        result = _check_scopes((sc,), "evil.test", 80, _normalized=True)
+        result = _check_scopes((sc,), ("evil.test",), 80)
         assert result == [sc]
 
     def test_check_scopes_allows(self):
         """_check_scopes returns nothing when host is allowed."""
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, label="test-scope")
-        result = _check_scopes((sc,), "api.example.com", 80, _normalized=True)
+        result = _check_scopes((sc,), ("api.example.com",), 80)
         assert result == []
 
     def test_check_scopes_fail_closed(self, monkeypatch):
@@ -3699,7 +3835,7 @@ class TestScopeDirect:
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, fail_closed=True, label="test-scope")
         monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
-        result = _check_scopes((sc,), "test.example.com", 80, _normalized=True)
+        result = _check_scopes((sc,), ("test.example.com",), 80)
         assert result == [sc]
 
     def test_check_scopes_fail_open(self, monkeypatch):
@@ -3707,7 +3843,7 @@ class TestScopeDirect:
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, fail_closed=False, label="test-scope")
         monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
-        result = _check_scopes((sc,), "test.example.com", 80, _normalized=True)
+        result = _check_scopes((sc,), ("test.example.com",), 80)
         assert result == []
 
     def test_check_scopes_returns_every_denying_scope_in_stack_order(self):
@@ -3715,7 +3851,7 @@ class TestScopeDirect:
         monitor = _ScopeConfig(policy=AllowPolicy([]), log_only=True, label="monitor")
         allows = _ScopeConfig(policy=AllowPolicy(["192.0.2.0/24"]), label="allows")
         enforcer = _ScopeConfig(policy=AllowPolicy([]), label="enforcer")
-        result = _check_scopes((monitor, allows, enforcer), "192.0.2.1", 443, _normalized=True)
+        result = _check_scopes((monitor, allows, enforcer), ("192.0.2.1",), 443)
         assert result == [monitor, enforcer]
 
     def test_enforce_scope_block_raises(self):

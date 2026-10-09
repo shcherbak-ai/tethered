@@ -472,14 +472,27 @@ def _hint_from_stack(scope_stack: tuple[_ScopeConfig, ...]) -> str | None:
     return None
 
 
+def _allows_any(policy: AllowPolicy, hosts: tuple[str, ...], port: int | None) -> bool:
+    """Return True if ``policy`` allows any of ``hosts`` (already normalized) on ``port``."""
+    for host in hosts:  # noqa: SIM110 — hot path; any(<genexpr>) costs a generator per call
+        if policy.is_allowed(host, port, _normalized=True):
+            return True
+    return False
+
+
 def _check_scopes(
     scope_stack: tuple[_ScopeConfig, ...],
-    host: str,
+    hosts: tuple[str, ...],
     port: int | None,
-    *,
-    _normalized: bool = False,
 ) -> list[_ScopeConfig]:
-    """Check host:port against all active scopes.
+    """Check one destination against all active scopes.
+
+    ``hosts`` holds the alternative, already-normalized names of a single
+    destination: for a connect, the hostname its address resolved from and
+    the raw IP.  The alternatives are combined inside each scope — a scope
+    allows the destination if it allows any one of them — and then every
+    scope must allow.  A hostname-only scope and an IP-only scope can
+    therefore both be satisfied by the same connect.
 
     Returns every _ScopeConfig that denies it, outermost first; empty if all
     allow.  All scopes are evaluated — a log-only scope that denies must not
@@ -489,7 +502,7 @@ def _check_scopes(
     denying: list[_ScopeConfig] = []
     for sc in scope_stack:
         try:
-            if not sc.policy.is_allowed(host, port, _normalized=_normalized):
+            if not _allows_any(sc.policy, hosts, port):
                 denying.append(sc)
         except Exception:
             if sc.fail_closed:
@@ -498,7 +511,7 @@ def _check_scopes(
             logger.warning(
                 "tethered: error checking %s for %s:%s, failing open",
                 sc.label,
-                host,
+                "/".join(hosts),
                 port,
                 exc_info=True,
             )
@@ -696,7 +709,7 @@ def _handle_dns_lookup(
     # ── Scope checks ──
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
-    for blocking_scope in _check_scopes(scope_stack, host_lower, None, _normalized=True):
+    for blocking_scope in _check_scopes(scope_stack, (host_lower,), None):
         _enforce_scope_block(
             blocking_scope,
             host_lower,
@@ -806,7 +819,7 @@ def _handle_getaddrinfo(
     # ── Scope checks (before candidate recording and IP map population) ──
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
-    for blocking_scope in _check_scopes(scope_stack, host_lower, None, _normalized=True):
+    for blocking_scope in _check_scopes(scope_stack, (host_lower,), None):
         _enforce_scope_block(
             blocking_scope,
             host_lower,
@@ -1070,18 +1083,14 @@ def _handle_connect(
                 )
 
     # ── Scope checks ──
-    # Check resolved hostname first; if blocked, try raw IP as fallback
-    # (mirrors global policy: allow if EITHER hostname or IP matches)
-    denying = _check_scopes(scope_stack, check_host, port, _normalized=True)
-    if (
-        denying
-        and resolved_from is not None
-        and not _check_scopes(scope_stack, host, port, _normalized=True)
-    ):
-        denying = []
+    # Each scope is asked about the resolved hostname and the raw IP together:
+    # a scope allows the connection if it allows EITHER (the same either/or
+    # the global policy applies above), and every scope must allow.
+    #
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
-    for blocking_scope in denying:
+    hosts = (check_host,) if resolved_from is None else (check_host, host)
+    for blocking_scope in _check_scopes(scope_stack, hosts, port):
         _enforce_scope_block(
             blocking_scope,
             check_host,
