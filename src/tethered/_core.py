@@ -10,7 +10,9 @@ import inspect
 import ipaddress
 import json
 import logging
+import operator
 import os
+import reprlib
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -343,21 +345,74 @@ def _is_ip(host: str) -> bool:
         return False
 
 
+def _host_text(host: Any) -> str | None:
+    """Return a socket host argument as ``str``, or ``None`` if tethered cannot read it.
+
+    CPython's socket layer accepts ``str``, ``bytes`` and ``bytearray`` hosts and
+    hands byte strings to the resolver unchanged, so they are read as ASCII.  A
+    byte string that is not ASCII, and any other type, cannot be matched against
+    an allow rule; the caller must treat that as "not allowed", never as
+    "nothing to check".
+    """
+    if isinstance(host, str):
+        return host
+    if isinstance(host, (bytes, bytearray)):
+        try:
+            return host.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
 def _extract_host_port(address: Any) -> tuple[str, int | None] | None:
     """Extract (host, port) from a socket address.
 
-    Returns None for address types we don't handle (AF_UNIX paths, etc.).
+    Returns None when ``address`` is not a ``(host, port, ...)`` tuple tethered
+    can read: an AF_UNIX path, another family's address shape, or an IP-family
+    address whose host or port is unusable.  ``_handle_connect`` tells these
+    apart with :func:`_is_ip_family` — the last case is refused, not allowed.
 
     Handles:
         AF_INET:  (host, port)
         AF_INET6: (host, port, flowinfo, scope_id)
+
+    The host may be ``str``, ``bytes`` or ``bytearray`` and the port any object
+    implementing ``__index__`` (``numpy.int64`` and the like) — every form
+    CPython itself accepts.
     """
     if isinstance(address, tuple) and len(address) >= 2:
         host = address[0]
-        port = address[1]
-        if isinstance(host, str) and isinstance(port, int):
-            return (host, port)
+        if not isinstance(host, str):
+            host = _host_text(host)
+            if host is None:
+                return None
+        try:
+            return (host, operator.index(address[1]))
+        except Exception:  # TypeError, or whatever a custom __index__ raises
+            return None
     return None
+
+
+# Address families whose socket addresses are ``(host, port, ...)`` IP tuples.
+# CPython parses AF_RDS and (FreeBSD) AF_DIVERT addresses exactly like AF_INET.
+_IP_FAMILIES = frozenset(
+    getattr(_csocket, name)
+    for name in ("AF_INET", "AF_INET6", "AF_RDS", "AF_DIVERT")
+    if hasattr(_csocket, name)
+)
+
+
+def _is_ip_family(sock: Any, address: Any) -> bool:
+    """Return True if a connect/send event targets an IP-family socket.
+
+    Decided by the socket object carried in the audit event.  Synthetic events
+    (``sys.audit`` called without a socket) carry ``None``; those are judged by
+    the address shape — a tuple of two or more items is an IP-family address.
+    """
+    family = getattr(sock, "family", None)
+    if family is None:
+        return isinstance(address, tuple) and len(address) >= 2
+    return family in _IP_FAMILIES
 
 
 def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
@@ -479,6 +534,45 @@ def _enforce_scope_block(
         )
 
 
+def _deny_unreadable(
+    cfg: _Config | None,
+    scope_stack: tuple[_ScopeConfig, ...],
+    event: str,
+    value: Any,
+) -> None:
+    """Refuse a socket event whose host or address tethered cannot read.
+
+    ``value`` is an IP-family socket address or a DNS host argument in a form
+    that cannot be matched against any allow rule (a non-ASCII byte string, an
+    unusable port, an unexpected type).  No rule can allow it, so every active
+    layer denies it through its normal block path: log, ``on_blocked``, and
+    raise unless that layer is log-only.
+    """
+    host = f"<unreadable {reprlib.repr(value)}>"
+    what = event.split(".")[-1]
+
+    if cfg is not None:
+        logger.warning(
+            "tethered: blocked %s for %s (cannot be checked against the allow list)", what, host
+        )
+
+        if cfg.on_blocked is not None:
+            try:
+                cfg.on_blocked(host, None)
+            except Exception:
+                logger.debug(
+                    "tethered: on_blocked callback raised for %s",
+                    host,
+                    exc_info=True,
+                )
+
+        if not cfg.log_only:
+            raise EgressBlocked(host, None, scope_hint=_hint_from_stack(scope_stack))
+
+    for sc in scope_stack:
+        _enforce_scope_block(sc, host, None, what, scope_stack=scope_stack)
+
+
 def _handle_dns_lookup(
     cfg: _Config | None,
     scope_stack: tuple[_ScopeConfig, ...],
@@ -492,9 +586,19 @@ def _handle_dns_lookup(
 
     Audit event args for gethostbyname: (host,)
     Audit event args for gethostbyaddr: (host,)
+
+    The host may be ``str``, ``bytes`` or ``bytearray``.  ``None`` and empty
+    hosts name the local machine and are not checked.
     """
     host = args[0]
-    if not isinstance(host, str) or not host:
+    if not isinstance(host, str):
+        if host is None:
+            return
+        host = _host_text(host)
+        if host is None:
+            _deny_unreadable(cfg, scope_stack, event, args[0])
+            return
+    if not host:
         return
 
     host_lower = _normalize_host(host)
@@ -586,9 +690,19 @@ def _handle_getaddrinfo(
     1. Block DNS resolution for disallowed hostnames (prevents DNS exfiltration).
     2. Resolve allowed hostnames and store IP -> hostname mappings for later
        use in _handle_connect.
+
+    The host may be ``str`` or ``bytes``.  ``None`` and empty hosts name the
+    local machine and are not checked.
     """
     host = args[0]
-    if not isinstance(host, str) or not host:
+    if not isinstance(host, str):
+        if host is None:
+            return
+        host = _host_text(host)
+        if host is None:
+            _deny_unreadable(cfg, scope_stack, "socket.getaddrinfo", args[0])
+            return
+    if not host:
         return
 
     if _is_ip(host):
@@ -817,7 +931,12 @@ def _handle_connect(
     address = args[1]
     parsed = _extract_host_port(address)
     if parsed is None:
-        # AF_UNIX or unparseable -- allow
+        # Not an address tethered can read.  For AF_UNIX and other non-IP
+        # families that is expected and there is nothing to check.  On an
+        # IP-family socket it is refused: an address CPython can connect to
+        # but tethered cannot match must not slip past the policy.
+        if _is_ip_family(args[0], address):
+            _deny_unreadable(cfg, scope_stack, event, address)
         return
 
     host, port = parsed

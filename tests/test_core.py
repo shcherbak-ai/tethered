@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import socket
 import threading
+import types
 
 import pytest
 
@@ -860,6 +862,375 @@ class TestExtractHostPort:
     def test_wrong_types(self):
         assert _extract_host_port((123, 80)) is None
         assert _extract_host_port(("host", "80")) is None
+
+    def test_bytes_and_bytearray_hosts(self):
+        assert _extract_host_port((b"192.0.2.1", 80)) == ("192.0.2.1", 80)
+        assert _extract_host_port((bytearray(b"192.0.2.1"), 80)) == ("192.0.2.1", 80)
+        assert _extract_host_port((b"::1", 443, 0, 0)) == ("::1", 443)
+
+    def test_index_port(self):
+        result = _extract_host_port(("192.0.2.1", _IndexPort(8080)))
+        assert result == ("192.0.2.1", 8080)
+        assert type(result[1]) is int
+
+    def test_unreadable_host_or_port(self):
+        assert _extract_host_port((b"\xff\xfe", 80)) is None  # not ASCII
+        assert _extract_host_port(("192.0.2.1", _RaisingPort())) is None
+        assert _extract_host_port(("192.0.2.1", 80.0)) is None
+        assert _extract_host_port(("192.0.2.1",)) is None
+
+
+class _IndexPort:
+    """Stands in for ``numpy.int64`` and other integers that are not ``int``."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __index__(self) -> int:
+        return self.value
+
+
+class _RaisingPort:
+    def __index__(self) -> int:
+        raise ValueError("no port")
+
+
+@pytest.fixture
+def tcp_listener():
+    """A loopback TCP listener that never accepts; yields its port."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(16)
+    try:
+        yield server.getsockname()[1]
+    finally:
+        server.close()
+
+
+@pytest.fixture
+def udp_port():
+    """A bound loopback UDP socket; yields its port."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    try:
+        yield server.getsockname()[1]
+    finally:
+        server.close()
+
+
+@contextlib.contextmanager
+def _deny_all(mode: str):
+    """Deny everything, loopback included, through one enforcement layer."""
+    if mode == "scope":
+        with tethered.scope(allow=[], allow_localhost=False, label="deny-all"):
+            yield
+        return
+    if mode == "locked":
+        token = object()
+        tethered.activate(
+            allow=[], allow_localhost=False, fail_closed=True, locked=True, lock_token=token
+        )
+        try:
+            yield
+        finally:
+            tethered.deactivate(lock_token=token)
+        return
+    tethered.activate(allow=[], allow_localhost=False, fail_closed=True)
+    yield
+
+
+_DENY_MODES = ["global", "locked", "scope"]
+
+# Every (host, port) form CPython's socket layer accepts for an AF_INET address.
+_ADDRESS_SHAPES = [
+    pytest.param(lambda port: ("127.0.0.1", port), id="str-int"),
+    pytest.param(lambda port: (b"127.0.0.1", port), id="bytes-int"),
+    pytest.param(lambda port: (bytearray(b"127.0.0.1"), port), id="bytearray-int"),
+    pytest.param(lambda port: ("127.0.0.1", _IndexPort(port)), id="str-index"),
+    pytest.param(lambda port: (b"127.0.0.1", _IndexPort(port)), id="bytes-index"),
+]
+
+
+class TestAddressShapes:
+    """Every address form CPython accepts is checked, not only ``(str, int)``.
+
+    A deny-all policy must block ``bytes``/``bytearray`` hosts and ``__index__``
+    ports exactly as it blocks the plain form.  The scope-only cases assert
+    ``scope_label`` so a block from the conftest guard cannot satisfy them.
+    """
+
+    @staticmethod
+    def _assert_blocked(exc: tethered.EgressBlocked, mode: str, port: int) -> None:
+        assert exc.host == "127.0.0.1"
+        assert exc.port == port
+        assert exc.scope_label == ("deny-all" if mode == "scope" else None)
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize("make_address", _ADDRESS_SHAPES)
+    def test_connect_blocked(self, tcp_listener, mode, make_address):
+        with (
+            _deny_all(mode),
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            client.connect(make_address(tcp_listener))
+        self._assert_blocked(exc_info.value, mode, tcp_listener)
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize("make_address", _ADDRESS_SHAPES)
+    def test_connect_ex_blocked(self, tcp_listener, mode, make_address):
+        with (
+            _deny_all(mode),
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            client.connect_ex(make_address(tcp_listener))
+        self._assert_blocked(exc_info.value, mode, tcp_listener)
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize("make_address", _ADDRESS_SHAPES)
+    def test_udp_sendto_blocked(self, udp_port, mode, make_address):
+        with (
+            _deny_all(mode),
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client,
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            client.sendto(b"x", make_address(udp_port))
+        self._assert_blocked(exc_info.value, mode, udp_port)
+
+    @pytest.mark.parametrize("make_address", _ADDRESS_SHAPES)
+    def test_connect_allowed_when_a_rule_matches(self, tcp_listener, make_address):
+        """Normalization reads the real destination: a matching rule still allows it."""
+        tethered.activate(allow=[f"127.0.0.1:{tcp_listener}"], allow_localhost=False)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(make_address(tcp_listener))
+
+    def test_index_port_is_matched_against_port_rules(self, tcp_listener):
+        """A port given through ``__index__`` is the port the rule is checked against."""
+        tethered.activate(allow=[f"127.0.0.1:{tcp_listener + 1}"], allow_localhost=False)
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            client.connect(("127.0.0.1", _IndexPort(tcp_listener)))
+        assert exc_info.value.port == tcp_listener
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_ipv6_bytes_host_blocked(self, mode):
+        try:
+            server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        except OSError:
+            pytest.skip("IPv6 not supported on this system")
+        try:
+            try:
+                server.bind(("::1", 0))
+            except OSError:
+                pytest.skip("IPv6 loopback not available")
+            server.listen(1)
+            port = server.getsockname()[1]
+            with (
+                _deny_all(mode),
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as client,
+                pytest.raises(tethered.EgressBlocked) as exc_info,
+            ):
+                client.connect((b"::1", _IndexPort(port), 0, 0))
+        finally:
+            server.close()
+        assert exc_info.value.host == "::1"
+        assert exc_info.value.port == port
+        assert exc_info.value.scope_label == ("deny-all" if mode == "scope" else None)
+
+    # ── DNS calls with byte-string hosts ──
+    # ``.invalid`` never resolves, and the block is raised before any query is
+    # sent, so these stay offline.
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize(
+        ("lookup", "host", "expected"),
+        [
+            pytest.param(
+                lambda h: socket.getaddrinfo(h, 80),
+                b"blocked.invalid",
+                "blocked.invalid",
+                id="getaddrinfo-bytes",
+            ),
+            pytest.param(
+                socket.gethostbyname,
+                b"blocked.invalid",
+                "blocked.invalid",
+                id="gethostbyname-bytes",
+            ),
+            pytest.param(
+                socket.gethostbyname,
+                bytearray(b"blocked.invalid"),
+                "blocked.invalid",
+                id="gethostbyname-bytearray",
+            ),
+            pytest.param(
+                socket.gethostbyname_ex,
+                b"blocked.invalid",
+                "blocked.invalid",
+                id="gethostbyname_ex-bytes",
+            ),
+            pytest.param(socket.gethostbyaddr, b"192.0.2.7", "192.0.2.7", id="gethostbyaddr-bytes"),
+            pytest.param(
+                socket.gethostbyaddr,
+                bytearray(b"192.0.2.7"),
+                "192.0.2.7",
+                id="gethostbyaddr-bytearray",
+            ),
+        ],
+    )
+    def test_dns_byte_string_host_blocked(self, mode, lookup, host, expected):
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked) as exc_info:
+            lookup(host)
+        assert exc_info.value.host == expected
+        assert exc_info.value.scope_label == ("deny-all" if mode == "scope" else None)
+
+    def test_getaddrinfo_bytes_host_establishes_identity(self, tcp_listener):
+        """An allowed byte-string lookup is recorded like the ``str`` form."""
+        tethered.activate(allow=["localhost"], allow_localhost=False)
+        socket.getaddrinfo(b"localhost", tcp_listener, socket.AF_INET)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(("127.0.0.1", tcp_listener))
+
+    def test_none_and_empty_dns_hosts_are_local(self):
+        tethered.activate(allow=[], allow_localhost=False)
+        _audit_hook("socket.getaddrinfo", (None, 80, 0, 0, 0))
+        _audit_hook("socket.getaddrinfo", (b"", 80, 0, 0, 0))
+        _audit_hook("socket.gethostbyname", (None,))
+        _audit_hook("socket.gethostbyname", (bytearray(),))
+
+    # ── Addresses tethered cannot read ──
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            pytest.param((b"\xff\xfe", 80), id="non-ascii-bytes-host"),
+            pytest.param((123, 80), id="int-host"),
+            pytest.param(("192.0.2.1", "80"), id="str-port"),
+            pytest.param(("192.0.2.1", _RaisingPort()), id="raising-port"),
+        ],
+    )
+    @pytest.mark.parametrize("event", ["socket.connect", "socket.sendto", "socket.sendmsg"])
+    def test_unreadable_ip_address_is_blocked(self, event, address):
+        tethered.activate(allow=["192.0.2.0/24"])
+        with pytest.raises(tethered.EgressBlocked) as exc_info:
+            _audit_hook(event, (None, address))
+        assert exc_info.value.host.startswith("<unreadable ")
+        assert exc_info.value.port is None
+
+    def test_unreadable_address_on_a_real_ip_socket_is_blocked(self):
+        tethered.activate(allow=["192.0.2.0/24"])
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock,
+            pytest.raises(tethered.EgressBlocked),
+        ):
+            _audit_hook("socket.connect", (sock, (b"\xff\xfe", 80)))
+
+    def test_unreadable_address_on_a_non_ip_socket_is_not_checked(self):
+        """Other address families keep their own address shapes and are skipped."""
+        tethered.activate(allow=[], allow_localhost=False)
+        unix_like = types.SimpleNamespace(family=getattr(socket, "AF_UNIX", 1))
+        _audit_hook("socket.connect", (unix_like, (123, 456)))
+        _audit_hook("socket.connect", (unix_like, b"/tmp/socket"))
+        _audit_hook("socket.connect", (None, "/tmp/socket"))
+
+    @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
+    def test_real_unix_socket_is_not_checked(self):
+        """Refused by the OS (nothing listens there), not by tethered."""
+        tethered.activate(allow=[], allow_localhost=False)
+        with (
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client,
+            pytest.raises(OSError),
+        ):
+            # A short fixed path: AF_UNIX paths are limited to about 100 bytes,
+            # and a longer one is rejected before the audit event is raised.
+            client.connect("/tmp/tethered-no-listener.sock")
+
+    def test_is_ip_family(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            assert _core._is_ip_family(sock, "anything") is True
+        assert _core._is_ip_family(types.SimpleNamespace(family=-1), ("h", 1)) is False
+        # No socket (synthetic event): decided by the address shape.
+        assert _core._is_ip_family(None, ("h", 1)) is True
+        assert _core._is_ip_family(None, ("h",)) is False
+        assert _core._is_ip_family(None, "/tmp/socket") is False
+
+    def test_unreadable_address_log_only_reports_and_allows(self):
+        blocked: list[tuple[str, int | None]] = []
+        tethered.activate(allow=[], log_only=True, on_blocked=lambda h, p: blocked.append((h, p)))
+        _audit_hook("socket.connect", (None, (b"\xff\xfe", 80)))
+        assert len(blocked) == 1
+        assert blocked[0][0].startswith("<unreadable ")
+        assert blocked[0][1] is None
+
+    def test_unreadable_address_on_blocked_exception_is_swallowed(self):
+        def bad_callback(host, port):
+            raise RuntimeError("callback bug")
+
+        tethered.activate(allow=[], on_blocked=bad_callback)
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook("socket.connect", (None, (b"\xff\xfe", 80)))
+
+    def test_unreadable_address_blocked_by_scope_alone(self, caplog):
+        seen: list[str] = []
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            tethered.scope(
+                allow=["192.0.2.0/24"],
+                log_only=True,
+                on_blocked=lambda h, p: seen.append("monitor"),
+            ),
+            tethered.scope(allow=["192.0.2.0/24"], label="enforcing"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, (b"\xff\xfe", 80)))
+        assert seen == ["monitor"]
+        assert exc_info.value.scope_label == "enforcing"
+        assert r"enforcing blocked connect for <unreadable (b'\xff\xfe', 80)>" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            pytest.param("socket.getaddrinfo", (b"\xff.example", 80, 0, 0, 0), id="getaddrinfo"),
+            pytest.param("socket.getaddrinfo", (123, 80, 0, 0, 0), id="getaddrinfo-int"),
+            pytest.param("socket.gethostbyname", (b"\xff.example",), id="gethostbyname"),
+            pytest.param("socket.gethostbyaddr", (bytearray(b"\xff"),), id="gethostbyaddr"),
+        ],
+    )
+    def test_unreadable_dns_host_is_blocked(self, event, args):
+        tethered.activate(allow=["*.example"])
+        with pytest.raises(tethered.EgressBlocked) as exc_info:
+            _audit_hook(event, args)
+        assert exc_info.value.host.startswith("<unreadable ")
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            pytest.param("socket.getaddrinfo", (b"\xff.example", 80, 0, 0, 0), id="getaddrinfo"),
+            pytest.param("socket.gethostbyname", (b"\xff.example",), id="gethostbyname"),
+            pytest.param("socket.gethostbyaddr", (bytearray(b"\xff"),), id="gethostbyaddr"),
+        ],
+    )
+    def test_unreadable_dns_host_log_only_reports_and_allows(self, event, args):
+        blocked: list[tuple[str, int | None]] = []
+        tethered.activate(allow=[], log_only=True, on_blocked=lambda h, p: blocked.append((h, p)))
+        _audit_hook(event, args)
+        assert len(blocked) == 1
+        assert blocked[0][0].startswith("<unreadable ")
+        assert blocked[0][1] is None
+
+    def test_host_text(self):
+        assert _core._host_text("Example.COM") == "Example.COM"
+        assert _core._host_text(b"example.com") == "example.com"
+        assert _core._host_text(bytearray(b"192.0.2.1")) == "192.0.2.1"
+        assert _core._host_text(b"") == ""
+        assert _core._host_text(b"\xc3\xa9.example") is None  # UTF-8, not ASCII
+        assert _core._host_text(None) is None
+        assert _core._host_text(123) is None
 
 
 class TestAuditHookDirect:
