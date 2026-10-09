@@ -15,6 +15,7 @@ import os
 import reprlib
 import sys
 import threading
+import types
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -2699,68 +2700,142 @@ class scope:
         return sync_wrapper
 
 
-def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, bool]]:
-    """Build a snapshot of critical object identities for the C guardian.
+# ── Locked-mode integrity snapshot ────────────────────────────────
+# Kinds of pin understood by the C guardian.  Must match the PIN_*
+# constants in _guardian.c.
+_PIN_ATTR = 0  # getattr(owner, name) is the object recorded at activation
+_PIN_ITEM = 1  # the namespace (module globals / class body) binds name to it
+_PIN_ABSENT = 2  # the namespace does not define name
+_PIN_CODE = 3  # owner is a function that still has the recorded __code__
+_PIN_TYPE = 4  # type(owner) is the recorded class
 
-    Each entry is ``(owner, attr_name, check_code)`` where ``check_code``
-    indicates whether the ``__code__`` attribute should also be verified.
+# A module global of one of these exact types, bound to a lower-case name,
+# is runtime state that tethered itself rebinds (a flag, a counter) and is
+# therefore not pinned.  Every other module-level name is: functions,
+# classes, imported modules, locks, ContextVars, containers, loggers and
+# UPPER_CASE constants.
+_UNPINNED_SCALAR_TYPES = frozenset((type(None), bool, int, float, str))
 
-    Snapshots ALL slots on ``_Config`` and ``AllowPolicy`` rather than a
-    hand-picked list, so new fields are automatically protected.
+# Special methods that intercept every attribute read on an instance.  None
+# of tethered's classes defines them, and in locked mode none may appear:
+# an injected ``__getattribute__`` would redirect ``policy.is_allowed``
+# without rebinding anything that is pinned by identity.
+_ATTRIBUTE_HOOKS = ("__getattribute__", "__getattr__")
+
+
+def _is_unpinned_global(name: str, value: object) -> bool:
+    """Return True for a module global the integrity snapshot leaves alone.
+
+    ``_config`` is the object under protection and is tracked by the guardian
+    itself.  Lower-case names bound to ``None``/``bool``/``int``/``float``/
+    ``str`` are runtime scalar state; pinning their identity would turn
+    tethered's own updates into tamper alerts.
     """
-    entries: list[tuple[object, str, bool]] = []
-    this = sys.modules[__name__]
-    policy = cfg.policy
-    policy_cls = type(policy)
+    return name == "_config" or (name == name.lower() and type(value) in _UNPINNED_SCALAR_TYPES)
 
-    # All _Config fields (detects object.__setattr__ on frozen dataclass)
-    for attr in _Config.__slots__:
-        entries.append((cfg, attr, False))
 
-    # All AllowPolicy internals (detects in-place mutation of rule sets)
-    for attr in AllowPolicy.__slots__:
-        entries.append((policy, attr, False))
+def _functions_behind(value: object) -> list[types.FunctionType]:
+    """Return the plain Python functions that run when ``value`` is used.
 
-    # Policy matching methods (function + bytecode)
-    for method in ("is_allowed", "_check_hostname", "_check_ip"):
-        entries.append((policy_cls, method, True))
+    That is ``value`` itself when it is a function, and otherwise whatever a
+    descriptor or wrapper exposes: the ``__func__`` of a ``staticmethod``,
+    ``classmethod`` or bound method, the accessors of a ``property``, the
+    ``__wrapped__`` target of a ``functools.wraps``-style wrapper.
+    """
+    found: list[types.FunctionType] = []
+    seen: set[int] = set()
+    pending: list[object] = [value]
+    while pending:
+        obj = pending.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, types.FunctionType):
+            found.append(obj)
+        if isinstance(obj, property):
+            pending += (obj.fget, obj.fset, obj.fdel)
+        else:
+            pending += (getattr(obj, "__func__", None), getattr(obj, "__wrapped__", None))
+    return found
 
-    # Core enforcement handlers (function + bytecode)
-    for func in (
-        "_audit_hook",
-        "_handle_getaddrinfo",
-        "_handle_connect",
-        "_fallback_resolve",
-        "_handle_dns_lookup",
-        "_check_scopes",
-        "_enforce_scope_block",
-        "_handle_subprocess",
-        "_handle_pth_fs_op",
-        # Scope subprocess propagation helpers — protect them so an
-        # attacker can't replace _inject_scope_env with a no-op (which
-        # would defeat scope inheritance silently in locked mode).
-        "_find_execute_child_frame",
-        "_inject_scope_env",
-        "_build_per_launch_env",
-        "_serialize_scope",
-        "_build_env_payload",
-        "_is_auto_inheriting_python_launch",
-        "_parse_windows_cmdline",
-    ):
-        entries.append((this, func, True))
 
-    # Exception class identity
-    entries.append((this, "EgressBlocked", False))
-    entries.append((this, "SubprocessBlocked", False))
+def _referenced_names(code: types.CodeType) -> set[str]:
+    """Return the global and attribute names used by ``code`` and the code nested in it."""
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _referenced_names(const)
+    return names
 
-    # Event filter sets (prevents silent removal of enforcement categories)
-    for attr in (
-        "_CONNECT_EVENTS",
-        "_DNS_EVENTS",
-        "_SUBPROCESS_EVENTS",
-        "_PTH_FS_EVENTS",
-    ):
-        entries.append((this, attr, False))
+
+def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, int]]:
+    """Build the list of facts the C guardian pins while ``cfg`` is locked.
+
+    Each entry is ``(owner, name, kind)`` with ``kind`` one of the ``_PIN_*``
+    constants.  The guardian records the current value of every entry at
+    activation and re-checks all of them on each guarded audit event.
+
+    The list is generated from the namespaces themselves, not hand-picked,
+    so new code is covered without anyone remembering to register it:
+
+    - every module-level name of this module and of ``tethered._policy``,
+      except the runtime state described in :func:`_is_unpinned_global`;
+    - every class-level attribute of every class defined in those modules
+      (methods, slot descriptors, generated dataclass methods), plus the
+      absence of the :data:`_ATTRIBUTE_HOOKS`;
+    - the ``__code__`` of every Python function found on the way;
+    - the absence, from those two module namespaces, of every builtin name
+      their code uses — a module global called ``isinstance`` would shadow
+      the builtin for that module only;
+    - the exact class and every slot of the active ``_Config`` and of its
+      ``AllowPolicy``.
+
+    Not covered, by design: the contents of mutable containers (the
+    IP-to-hostname map is written on every lookup), function defaults and
+    closures, and everything outside these two modules — the builtins
+    themselves and the standard-library functions the policy calls
+    (``fnmatch.fnmatchcase``, ``ipaddress.ip_address``, ``json.loads``).
+    """
+    entries: list[tuple[object, str, int]] = []
+    # The two namespaces are taken from the code that runs in them, not
+    # looked up by name in ``sys.modules``.
+    namespaces = (globals(), AllowPolicy.is_allowed.__globals__)
+    module_names = {namespace["__name__"] for namespace in namespaces}
+    classes: dict[int, type] = {}
+    functions: dict[int, types.FunctionType] = {}
+
+    for namespace in namespaces:
+        for name, value in namespace.items():
+            if _is_unpinned_global(name, value):
+                continue
+            entries.append((namespace, name, _PIN_ITEM))
+            functions.update((id(func), func) for func in _functions_behind(value))
+            if isinstance(value, type) and value.__module__ in module_names:
+                classes[id(value)] = value
+
+    # Class bodies are pinned before any instance attribute below: the
+    # guardian checks entries in order, so by the time it reads a slot it
+    # has already confirmed the descriptor that serves it.
+    for cls in classes.values():
+        body = vars(cls)
+        for name, value in body.items():
+            entries.append((cls, name, _PIN_ITEM))
+            functions.update((id(func), func) for func in _functions_behind(value))
+        entries += ((cls, hook, _PIN_ABSENT) for hook in _ATTRIBUTE_HOOKS if hook not in body)
+
+    for func in functions.values():
+        entries.append((func, "__code__", _PIN_CODE))
+
+    for namespace in namespaces:
+        used: set[str] = set()
+        for func in functions.values():
+            if func.__globals__ is namespace:
+                used |= _referenced_names(func.__code__) & func.__builtins__.keys()
+        entries += ((namespace, name, _PIN_ABSENT) for name in sorted(used - namespace.keys()))
+
+    for obj, cls in ((cfg, _Config), (cfg.policy, AllowPolicy)):
+        entries.append((obj, "__class__", _PIN_TYPE))
+        entries += ((obj, slot, _PIN_ATTR) for slot in cls.__slots__)
 
     return entries
 

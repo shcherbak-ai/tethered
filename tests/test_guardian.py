@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import _socket
+import builtins
+import copy
+import functools
 import gc
 import logging
+import pickle
 import socket
 import sys
 import threading
+import types
 import unittest.mock
 import weakref
 
@@ -15,6 +20,7 @@ import pytest
 
 import tethered
 import tethered._core as _core
+import tethered._policy as _policy
 from tethered._core import _audit_hook, _ip_map_lock, _ip_to_hostname
 from tethered._policy import AllowPolicy
 
@@ -572,6 +578,595 @@ class TestCGuardian:
 
         assert not t.is_alive(), "socket_storm thread hung"
         assert not errors, f"socket_storm raised: {errors}"
+
+
+# ── Generated integrity snapshot (R27) ─────────────────────────────
+
+_MODULES = (_core, _policy)
+
+# Module globals that are deliberately NOT identity-pinned in locked mode.
+# Every other name in ``tethered._core`` / ``tethered._policy`` must be in the
+# snapshot.  A new module-level name that trips
+# ``test_every_module_global_is_pinned_or_allowlisted`` needs a decision:
+#
+# - it is state tethered rebinds at runtime (a flag, a counter): keep it a
+#   lower-case ``None``/``bool``/``int``/``float``/``str`` and list it here
+#   with the reason;
+# - it is anything else: it is pinned automatically — unless it is a
+#   lower-case scalar *constant*, in which case give it an UPPER_CASE name.
+_MODULE_METADATA = {
+    "__name__": "import-system metadata (str); not consulted by enforcement",
+    "__doc__": "import-system metadata (str); not consulted by enforcement",
+    "__package__": "import-system metadata (str); not consulted by enforcement",
+    "__file__": "import-system metadata (str); not consulted by enforcement",
+    "__cached__": "import-system metadata (str); not consulted by enforcement",
+}
+_UNPINNED_GLOBALS = {
+    "tethered._core": {
+        "_config": "the active config; the guardian tracks its identity separately",
+        "_hook_installed": "flips False -> True when the audit hook is installed",
+        **_MODULE_METADATA,
+    },
+    "tethered._policy": dict(_MODULE_METADATA),
+}
+
+
+def _pinned_globals() -> list[tuple[types.ModuleType, str]]:
+    return [
+        (module, name)
+        for module in _MODULES
+        for name, value in vars(module).items()
+        if not _core._is_unpinned_global(name, value)
+    ]
+
+
+def _global_id(param: tuple[types.ModuleType, str]) -> str:
+    module, name = param
+    return f"{module.__name__.rpartition('.')[2]}.{name}"
+
+
+def _own_classes() -> list[type]:
+    names = {module.__name__ for module in _MODULES}
+    found: dict[int, type] = {}
+    for module in _MODULES:
+        for value in vars(module).values():
+            if isinstance(value, type) and value.__module__ in names:
+                found[id(value)] = value
+    return list(found.values())
+
+
+# Class-namespace keys that ``type`` manages through its own setters, so an
+# assignment from Python does not simply rebind the key: ``__dict__`` is not
+# writable, assigning ``__module__`` also drops ``__firstlineno__`` (3.13+),
+# and on 3.14 assigning ``__annotations__`` writes a separate cache key.
+# They are pinned like every other key; the rebinding test just cannot
+# exercise them with a plain ``setattr``.
+_TYPE_MANAGED_ATTRIBUTES = frozenset(
+    (
+        "__dict__",
+        "__module__",
+        "__annotations__",
+        "__annotate__",
+        "__annotate_func__",
+        "__annotations_cache__",
+    )
+)
+
+
+def _activate_locked(**kwargs: object) -> None:
+    kwargs.setdefault("allow", ["*.example.com"])
+    tethered.activate(locked=True, lock_token=object(), **kwargs)
+
+
+def _assert_intact(capfd: pytest.CaptureFixture[str]) -> None:
+    """A guarded event the policy allows still passes, with no tamper alert.
+
+    ``localhost`` resolves from the hosts file, so the probe stays offline.
+    """
+    socket.getaddrinfo("localhost", 80)
+    assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+
+def _assert_tamper_response(
+    capfd: pytest.CaptureFixture[str],
+    exc: type[BaseException] = tethered.EgressBlocked,
+) -> None:
+    """Even a destination the policy allows is refused, and the alert is written."""
+    capfd.readouterr()
+    with pytest.raises(exc):
+        socket.getaddrinfo("localhost", 80)
+    assert "TAMPER DETECTED" in capfd.readouterr().err
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestSnapshotCoverage:
+    """The snapshot is generated from the modules, so nothing is left out by omission."""
+
+    @staticmethod
+    def _entries() -> list[tuple[object, str, int]]:
+        tethered.activate(allow=["*.example.com"])
+        return _core._build_integrity_snapshot(_core._config)
+
+    @pytest.mark.parametrize("module", _MODULES, ids=lambda m: m.__name__)
+    def test_every_module_global_is_pinned_or_allowlisted(self, module):
+        namespace = vars(module)
+        pinned = {
+            name
+            for owner, name, kind in self._entries()
+            if owner is namespace and kind == _core._PIN_ITEM
+        }
+        allowlist = _UNPINNED_GLOBALS[module.__name__]
+        unpinned = set(namespace) - pinned
+        undecided = sorted(unpinned - set(allowlist))
+        assert not undecided, (
+            f"{module.__name__} has module-level names that are neither pinned by the "
+            f"locked-mode integrity snapshot nor allow-listed as runtime state: {undecided}. "
+            "See the comment above _UNPINNED_GLOBALS in this file."
+        )
+        # The allowlist must not go stale either: a listed name that exists
+        # is really unpinned.
+        assert not sorted(set(allowlist) & pinned)
+
+    def test_config_is_never_pinned_as_a_module_global(self):
+        """``_config`` is swapped on every activation; the guardian checks it directly."""
+        assert all(
+            not (owner is vars(_core) and name == "_config") for owner, name, _ in self._entries()
+        )
+
+    def test_every_function_of_both_modules_has_a_code_pin(self):
+        code_pinned = {id(owner) for owner, _, kind in self._entries() if kind == _core._PIN_CODE}
+        missing = []
+        for module in _MODULES:
+            for name, value in vars(module).items():
+                if isinstance(value, types.FunctionType) and id(value) not in code_pinned:
+                    missing.append(f"{module.__name__}.{name}")
+        for cls in _own_classes():
+            for name, value in vars(cls).items():
+                func = getattr(value, "__func__", value)
+                if isinstance(func, types.FunctionType) and id(func) not in code_pinned:
+                    missing.append(f"{cls.__qualname__}.{name}")
+        assert not missing
+
+    def test_every_class_attribute_is_pinned(self):
+        entries = self._entries()
+        classes = _own_classes()
+        # The classes the brief names, plus everything else defined in the modules.
+        assert {
+            _policy.AllowPolicy,
+            _policy._HostRule,
+            _policy._NetworkRule,
+            _core.EgressBlocked,
+            _core.SubprocessBlocked,
+            _core.TetheredLocked,
+            _core._Config,
+        } <= set(classes)
+        for cls in classes:
+            pinned = {
+                name for owner, name, kind in entries if owner is cls and kind == _core._PIN_ITEM
+            }
+            assert pinned == set(vars(cls)), cls
+            absent = {
+                name for owner, name, kind in entries if owner is cls and kind == _core._PIN_ABSENT
+            }
+            assert absent == {"__getattribute__", "__getattr__"} - set(vars(cls)), cls
+
+    def test_builtins_used_by_the_modules_are_pinned_absent(self):
+        entries = self._entries()
+        for module, expected in ((_core, {"isinstance", "len", "str"}), (_policy, {"isinstance"})):
+            absent = {
+                name
+                for owner, name, kind in entries
+                if owner is vars(module) and kind == _core._PIN_ABSENT
+            }
+            assert expected <= absent
+            assert not absent & set(vars(module))
+            assert absent <= set(vars(builtins))
+
+    def test_active_config_and_policy_are_pinned(self):
+        entries = self._entries()
+        cfg = _core._config
+        for obj, cls in ((cfg, _core._Config), (cfg.policy, _policy.AllowPolicy)):
+            assert (obj, "__class__", _core._PIN_TYPE) in entries
+            for slot in cls.__slots__:
+                assert (obj, slot, _core._PIN_ATTR) in entries
+
+    def test_class_bodies_are_pinned_before_instance_attributes(self):
+        """The guardian checks in order; a slot is read only after its descriptor is confirmed."""
+        entries = self._entries()
+        first_attr = next(i for i, e in enumerate(entries) if e[2] == _core._PIN_ATTR)
+        last_class_pin = max(i for i, e in enumerate(entries) if isinstance(e[0], type))
+        assert last_class_pin < first_attr
+
+    def test_snapshot_leaves_headroom_in_the_guardian(self):
+        """MAX_SNAPSHOT in _guardian.c is 2048; fail well before activation would."""
+        assert len(self._entries()) < 1536
+
+    def test_is_unpinned_global(self):
+        assert _core._is_unpinned_global("_config", object())
+        for value in (None, True, 3, 2.5, "text"):
+            assert _core._is_unpinned_global("_some_flag", value)
+            assert not _core._is_unpinned_global("_SOME_CONSTANT", value)
+        for value in ((), frozenset(), [], {}, object(), len, int):
+            assert not _core._is_unpinned_global("_some_object", value)
+
+        class IntSubclass(int):
+            pass
+
+        assert not _core._is_unpinned_global("_counter", IntSubclass(1))
+
+    def test_functions_behind(self):
+        def plain():
+            """A function."""
+
+        def getter(self):
+            """A property getter."""
+
+        def setter(self, value):
+            """A property setter."""
+
+        @functools.wraps(plain)
+        def wrapper():
+            """A wrapper."""
+
+        class Holder:
+            def method(self):
+                """A method."""
+
+        behind = _core._functions_behind
+        assert behind(plain) == [plain]
+        assert behind(staticmethod(plain)) == [plain]
+        assert behind(classmethod(plain)) == [plain]
+        assert behind(Holder().method) == [Holder.method]
+        assert set(behind(property(getter, setter))) == {getter, setter}
+        assert set(behind(wrapper)) == {wrapper, plain}
+        for value in (None, 1, "text", object(), len, Holder, _core):
+            assert behind(value) == []
+
+    def test_referenced_names_includes_nested_code(self):
+        def outer():
+            def inner():
+                return sorted(())
+
+            return len(inner())
+
+        assert {"len", "sorted"} <= _core._referenced_names(outer.__code__)
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestSnapshotTamperDetection:
+    """Rebinding anything the snapshot pins fails closed on the next guarded event."""
+
+    def test_untampered_policy_raises_no_alert(self, capfd):
+        _activate_locked()
+        _assert_intact(capfd)
+
+    @pytest.mark.parametrize("target", _pinned_globals(), ids=_global_id)
+    def test_rebinding_any_pinned_module_global_is_detected(self, target, monkeypatch, capfd):
+        module, name = target
+        _activate_locked()
+        # Undo inside the test: fixture teardown fires audit events of its own,
+        # and tethered's hook must be whole again by then.
+        with monkeypatch.context() as patch:
+            patch.setattr(module, name, object())
+            _assert_tamper_response(capfd)
+        _assert_intact(capfd)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            (module, name)
+            for module, name in _pinned_globals()
+            if isinstance(vars(module)[name], types.FunctionType)
+            and vars(module)[name].__module__ == module.__name__
+        ],
+        ids=_global_id,
+    )
+    def test_swapping_the_code_of_any_function_is_detected(self, target, capfd):
+        module, name = target
+        func = vars(module)[name]
+        original = func.__code__
+        _activate_locked()
+        try:
+            # Same function object, same binding — only the bytecode changes.
+            func.__code__ = _noop_like(func).__code__
+            _assert_tamper_response(capfd)
+        finally:
+            func.__code__ = original
+
+    @pytest.mark.parametrize(
+        "cls, name",
+        [
+            (cls, name)
+            for cls in _own_classes()
+            for name in vars(cls)
+            if name not in _TYPE_MANAGED_ATTRIBUTES
+        ],
+        ids=lambda value: value.__qualname__ if isinstance(value, type) else value,
+    )
+    def test_rebinding_any_class_attribute_is_detected(self, cls, name, monkeypatch, capfd):
+        _activate_locked()
+        # When the tampered class is EgressBlocked itself, the guardian may be
+        # unable to build one; it then refuses with a plain RuntimeError.
+        expected = RuntimeError if cls is tethered.EgressBlocked else tethered.EgressBlocked
+        with monkeypatch.context() as patch:
+            patch.setattr(cls, name, object())
+            _assert_tamper_response(capfd, expected)
+        _assert_intact(capfd)
+
+    def test_refuses_even_when_the_exception_class_cannot_be_built(self, monkeypatch, capfd):
+        """A broken ``EgressBlocked`` must not turn the refusal into a pass or a TypeError."""
+        _activate_locked()
+        with monkeypatch.context() as patch:
+            patch.setattr(tethered.EgressBlocked, "__init__", object())
+            capfd.readouterr()
+            with pytest.raises(RuntimeError, match="integrity violation") as excinfo:
+                socket.getaddrinfo("localhost", 80)
+            assert type(excinfo.value) is RuntimeError
+            assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    def test_staticmethod_code_swap_is_detected(self, capfd):
+        """A function reached only through a descriptor is code-pinned too."""
+        func = _core.scope._warn_scope_overlap
+        original = func.__code__
+        _activate_locked()
+        try:
+            func.__code__ = (lambda global_policy, allow, label: None).__code__
+            _assert_tamper_response(capfd)
+        finally:
+            func.__code__ = original
+
+    @pytest.mark.parametrize("cls", [_core._Config, _policy.AllowPolicy], ids=lambda c: c.__name__)
+    @pytest.mark.parametrize("hook", ["__getattribute__", "__getattr__"])
+    def test_injected_attribute_hook_is_detected(self, cls, hook, monkeypatch, capfd):
+        """An added ``__getattribute__`` redirects reads without rebinding a pinned name."""
+        _activate_locked()
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                cls, hook, lambda self, name: object.__getattribute__(self, name), raising=False
+            )
+            _assert_tamper_response(capfd)
+        _assert_intact(capfd)
+
+    @pytest.mark.parametrize("module", _MODULES, ids=lambda m: m.__name__)
+    def test_shadowing_a_builtin_in_a_module_namespace_is_detected(
+        self, module, monkeypatch, capfd
+    ):
+        """``_core.isinstance = ...`` shadows the builtin for that module only."""
+        _activate_locked()
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "isinstance", lambda obj, cls: False, raising=False)
+            _assert_tamper_response(capfd)
+        _assert_intact(capfd)
+
+    @pytest.mark.parametrize("which", ["config", "policy"])
+    def test_swapping_the_class_of_the_active_objects_is_detected(self, which, capfd):
+        _activate_locked()
+        cfg = _core._config
+        target = cfg if which == "config" else cfg.policy
+
+        class Impostor(type(target)):
+            __slots__ = ()
+
+        object.__setattr__(target, "__class__", Impostor)
+        _assert_tamper_response(capfd)
+
+    def test_tethereds_own_writes_are_not_tampering(self, capfd):
+        """A lookup writes the IP map and the allowed-hostname set in place."""
+        _activate_locked()
+        before = len(_core._ip_to_hostname)
+        _assert_intact(capfd)
+        assert len(_core._ip_to_hostname) > before
+        assert "localhost" in _core._allowed_hostnames
+        _assert_intact(capfd)
+
+    def test_lazily_added_class_attributes_are_not_tampering(self, capfd):
+        """CPython adds bookkeeping keys to class namespaces on demand.
+
+        ``copy``/``pickle`` cache ``__slotnames__``; annotation access can
+        create ``__annotations__`` (or its 3.14 cache keys).  Additions are
+        not pinned, only the keys present at activation are.
+        """
+        _activate_locked()
+        cfg = _core._config
+        copy.copy(cfg.policy)
+        copy.copy(cfg)
+        pickle.dumps(tethered.TetheredLocked())
+        for cls in _own_classes():
+            _ = cls.__annotations__
+            _ = cls.__doc__
+            _ = getattr(cls, "__annotate__", None)
+        for module in _MODULES:
+            _ = getattr(module, "__annotations__", None)
+        _assert_intact(capfd)
+
+
+def _noop_like(func: types.FunctionType) -> types.FunctionType:
+    """Return a do-nothing function with the same free variables as ``func``.
+
+    ``__code__`` can only be assigned a code object with a matching number
+    of free variables, and none of the module-level functions is a closure.
+    """
+    assert not func.__code__.co_freevars
+    return lambda *args, **kwargs: None
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestReportedHelperSwaps:
+    """The one-line bypasses from the review's R27 table."""
+
+    @pytest.mark.parametrize(
+        "module, name, replacement",
+        [
+            (_core, "_extract_host_port", lambda address: None),
+            (_core, "_normalize_host", lambda h: "allowed.example"),
+            (_policy, "_is_localhost", lambda host: True),
+        ],
+        ids=["_core._extract_host_port", "_core._normalize_host", "_policy._is_localhost"],
+    )
+    def test_connect_stays_blocked(self, module, name, replacement, monkeypatch, capfd):
+        tethered.activate(allow=["allowed.example"], locked=True, lock_token=object())
+        blocked = ("192.0.2.1", 443)
+        with pytest.raises(tethered.EgressBlocked):
+            sys.audit("socket.connect", None, blocked)
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+        with monkeypatch.context() as patch:
+            patch.setattr(module, name, replacement)
+            with pytest.raises(tethered.EgressBlocked):
+                sys.audit("socket.connect", None, blocked)
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    def test_site_bypass_launch_stays_blocked(self, monkeypatch, capfd):
+        tethered.activate(
+            allow=["allowed.example"],
+            locked=True,
+            lock_token=object(),
+            external_subprocess_policy="block",
+        )
+        launch = (sys.executable, [sys.executable, "-S", "-c", "pass"], None, None)
+        with pytest.raises(tethered.SubprocessBlocked):
+            sys.audit("subprocess.Popen", *launch)
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_core, "_has_site_bypass_flag", lambda argv: False)
+            with pytest.raises((tethered.EgressBlocked, tethered.SubprocessBlocked)):
+                sys.audit("subprocess.Popen", *launch)
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestSnapshotStaging:
+    """A snapshot the guardian cannot build leaves its previous state untouched."""
+
+    @staticmethod
+    def _bad_snapshots() -> list[tuple[str, object, type[Exception]]]:
+        namespace = vars(_core)
+        return [
+            ("not a list", (), TypeError),
+            ("entry is not a tuple", [["owner", "name", 0]], TypeError),
+            ("wrong arity", [(namespace, "logger")], TypeError),
+            ("name is not a str", [(namespace, 7, _core._PIN_ITEM)], TypeError),
+            ("unknown kind", [(namespace, "logger", 99)], ValueError),
+            ("missing item", [(namespace, "no_such_name", _core._PIN_ITEM)], KeyError),
+            ("present but pinned absent", [(namespace, "logger", _core._PIN_ABSENT)], ValueError),
+            ("namespace is not a dict or class", [(object(), "x", _core._PIN_ITEM)], TypeError),
+            ("missing attribute", [(_core, "no_such_name", _core._PIN_ATTR)], AttributeError),
+            ("code pin on a non-function", [(len, "__code__", _core._PIN_CODE)], TypeError),
+            ("too many entries", [(namespace, "logger", _core._PIN_ITEM)] * 2049, ValueError),
+            # A good entry followed by a bad one: the staged good entry is released.
+            (
+                "fails after a good entry",
+                [(namespace, "logger", _core._PIN_ITEM), (namespace, "nope", _core._PIN_ITEM)],
+                KeyError,
+            ),
+        ]
+
+    @pytest.mark.parametrize("index", range(12))
+    def test_failed_first_activation_leaves_guardian_inactive(self, index):
+        label, snapshot, expected = self._bad_snapshots()[index]
+        guardian = _core._c_guardian
+        cfg = _core._Config(policy=_policy.AllowPolicy([]))
+        with pytest.raises(expected):
+            guardian.activate(cfg, tethered.EgressBlocked, object(), snapshot)
+        assert guardian.is_active() is False, label
+        assert guardian.check_token(None) is True, label
+
+    @pytest.mark.parametrize("index", range(12))
+    def test_failed_reactivation_keeps_the_previous_snapshot(self, index, capfd):
+        label, snapshot, expected = self._bad_snapshots()[index]
+        guardian = _core._c_guardian
+        secret = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=secret)
+        before = _core._config
+        replacement = _core._Config(policy=_policy.AllowPolicy(["evil.test"]))
+        with pytest.raises(expected):
+            guardian.activate(replacement, tethered.EgressBlocked, secret, snapshot)
+        assert guardian.is_active() is True, label
+        assert _core._config is before
+        # Still enforcing the original policy, still verifying the original snapshot.
+        with pytest.raises(tethered.EgressBlocked):
+            socket.getaddrinfo("evil.test", 80)
+        _assert_intact(capfd)
+        assert guardian.check_token(secret) is True
+
+    def test_all_pin_kinds_round_trip(self, capfd):
+        """Each kind is recorded at activation and verified on the next event."""
+
+        class Probe:
+            attr = 1
+
+        def func():
+            """A function to code-pin."""
+
+        namespace = {"present": object()}
+        probe = Probe()
+        secret = object()
+        snapshot = [
+            (probe, "attr", _core._PIN_ATTR),
+            (namespace, "present", _core._PIN_ITEM),
+            (namespace, "missing", _core._PIN_ABSENT),
+            (Probe, "attr", _core._PIN_ITEM),
+            (Probe, "__getattr__", _core._PIN_ABSENT),
+            (func, "__code__", _core._PIN_CODE),
+            (probe, "__class__", _core._PIN_TYPE),
+        ]
+        guardian = _core._c_guardian
+
+        def reset() -> None:
+            # _core._config is None here, matching the config handed to the guardian.
+            guardian.activate(None, tethered.EgressBlocked, secret, snapshot)
+
+        def tampered() -> bool:
+            capfd.readouterr()
+            try:
+                sys.audit("socket.tethered_test_probe")
+            except tethered.EgressBlocked:
+                return "TAMPER DETECTED" in capfd.readouterr().err
+            return False
+
+        try:
+            reset()
+            assert not tampered()
+
+            probe.attr = 2  # instance attribute now shadows the class attribute
+            assert tampered()
+            del probe.attr
+            reset()
+            assert not tampered()
+
+            namespace["present"] = object()
+            assert tampered()
+            reset()
+            del namespace["present"]
+            assert tampered()
+            namespace["present"] = object()
+            reset()
+
+            namespace["missing"] = None
+            assert tampered()
+            del namespace["missing"]
+            reset()
+
+            Probe.attr = 3
+            assert tampered()
+            reset()
+
+            Probe.__getattr__ = lambda self, name: None
+            assert tampered()
+            del Probe.__getattr__
+            reset()
+
+            original = func.__code__
+            func.__code__ = (lambda: None).__code__
+            assert tampered()
+            func.__code__ = original
+            reset()
+
+            probe.__class__ = type("Other", (Probe,), {})
+            assert tampered()
+        finally:
+            guardian.deactivate(secret)
 
 
 @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
