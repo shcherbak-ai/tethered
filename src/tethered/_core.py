@@ -344,7 +344,10 @@ def _normalize_hint(value: object) -> str:
 # Hook installed flag
 _hook_installed: bool = False
 
-# Events that trigger connection enforcement
+# Events that trigger connection enforcement.  These are raised by the socket
+# object's own methods.  asyncio's ProactorEventLoop (the Windows default)
+# connects and sends through _overlapped instead, which raises none of them —
+# see _warn_if_proactor_loop.
 _CONNECT_EVENTS = frozenset(
     (
         "socket.connect",  # also raised by connect_ex() in CPython
@@ -352,6 +355,11 @@ _CONNECT_EVENTS = frozenset(
         "socket.sendmsg",
     )
 )
+
+# True while the one-time ProactorEventLoop warning may still be needed: only
+# on Windows, and only until it has fired.  The check behind it therefore
+# costs nothing on other platforms and nothing once the warning is out.
+_proactor_warning_pending: bool = sys.platform == "win32"
 
 # DNS resolution events to intercept outside getaddrinfo
 _DNS_EVENTS = frozenset(
@@ -551,6 +559,8 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
             _handle_connect(cfg, scope_stack, event, args)
         elif event in _DNS_EVENTS:
             _handle_dns_lookup(cfg, scope_stack, event, args)
+        elif _proactor_warning_pending and event == "socket.__new__":
+            _warn_if_proactor_loop()
         return
 
     # Subprocess launches: parent-side enforcement (warn/block), locked-mode
@@ -575,6 +585,49 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         return
     if event in _PTH_FS_EVENTS:
         _handle_pth_fs_op(cfg, event, args)
+
+
+def _proactor_loop_running() -> bool:
+    """Return True if an asyncio Proactor event loop is running in this thread.
+
+    asyncio is looked up in ``sys.modules``, never imported: if it (or its
+    Proactor implementation) has not been imported, no such loop can be
+    running.
+    """
+    asyncio_mod = sys.modules.get("asyncio")
+    proactor_mod = sys.modules.get("asyncio.proactor_events")
+    if asyncio_mod is None or proactor_mod is None:
+        return False
+    try:
+        loop = asyncio_mod._get_running_loop()
+        return isinstance(loop, proactor_mod.BaseProactorEventLoop)
+    except Exception:  # a partially imported or replaced asyncio — not our loop
+        return False
+
+
+def _warn_if_proactor_loop() -> None:
+    """Warn, once, that connect-time enforcement is unavailable on a Proactor loop.
+
+    Called for a ``socket.__new__`` event while a policy or scope is active.
+    ``ProactorEventLoop`` connects through ``_overlapped.ConnectEx`` (and sends
+    datagrams through ``_overlapped.WSASendTo``), which raise no audit event
+    tethered could act on, and an audit hook cannot add one.  The gap cannot be
+    closed here, so it is at least made visible.
+    """
+    global _proactor_warning_pending
+    if not _proactor_loop_running():
+        return
+    # Cleared before logging: a log handler may itself create a socket.
+    _proactor_warning_pending = False
+    logger.warning(
+        "tethered: an asyncio ProactorEventLoop (the Windows default) is running. "
+        "It connects and sends through overlapped I/O calls that raise no "
+        "socket.connect / socket.sendto audit event, so connect-time enforcement "
+        "is unavailable on this loop: only DNS-time hostname checks apply, and "
+        "raw-IP destinations, port rules and scope() connect checks are NOT "
+        "enforced. Run the event loop as asyncio.SelectorEventLoop for full "
+        "enforcement."
+    )
 
 
 def _hint_from_stack(scope_stack: tuple[_ScopeConfig, ...]) -> str | None:

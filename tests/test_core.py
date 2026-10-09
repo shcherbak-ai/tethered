@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.proactor_events
 import contextlib
 import contextvars
 import logging
@@ -3289,20 +3290,25 @@ class TestScopeAsync:
         assert results["b_blocked_a"] is True
 
 
+def _run_on_loop(main, loop_factory):
+    """Run ``main()`` to completion on a fresh event loop made by ``loop_factory``."""
+    if sys.version_info >= (3, 12):
+        return asyncio.run(main(), loop_factory=loop_factory)
+    loop = loop_factory()
+    try:
+        return loop.run_until_complete(main())
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
+
+
 def _run_on_selector_loop(main):
     """Run ``main()`` to completion on a fresh ``asyncio.SelectorEventLoop``.
 
     Connect-time enforcement needs a selector loop: the Proactor loop (the
     Windows default) connects without raising a ``socket.connect`` audit event.
     """
-    if sys.version_info >= (3, 12):
-        return asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
-    loop = asyncio.SelectorEventLoop()
-    try:
-        return loop.run_until_complete(main())
-    finally:
-        loop.run_until_complete(loop.shutdown_default_executor())
-        loop.close()
+    return _run_on_loop(main, asyncio.SelectorEventLoop)
 
 
 @contextlib.asynccontextmanager
@@ -3585,6 +3591,153 @@ class TestActiveScopeCount:
     def test_never_negative(self):
         _core._adjust_scope_count(-3)
         assert _core._active_scope_count == 0
+
+
+class _FakeProactorLoop(asyncio.proactor_events.BaseProactorEventLoop):
+    """Has the type of a Proactor loop without being one; usable on any platform."""
+
+    _closed = True  # keeps BaseEventLoop.__del__ quiet
+
+    def __init__(self) -> None:
+        pass
+
+
+def _proactor_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "ProactorEventLoop" in record.getMessage()
+    ]
+
+
+_NEW_SOCKET_EVENT = ("socket.__new__", (None, socket.AF_INET, socket.SOCK_STREAM, 0))
+
+
+class TestProactorLoopWarning:
+    """asyncio's ProactorEventLoop (the Windows default) bypasses connect-time checks.
+
+    It connects through ``_overlapped.ConnectEx``, which raises no
+    ``socket.connect`` audit event, so tethered cannot enforce there.  It warns
+    once instead, when a socket is created under an active policy or scope
+    while such a loop is running.
+    """
+
+    # ── Detection helper (platform-independent) ──
+
+    def test_not_running_when_asyncio_is_not_imported(self, monkeypatch):
+        with monkeypatch.context() as patch:
+            patch.setitem(sys.modules, "asyncio", None)
+            assert _core._proactor_loop_running() is False
+
+    def test_not_running_when_proactor_support_is_not_imported(self, monkeypatch):
+        with monkeypatch.context() as patch:
+            patch.setitem(sys.modules, "asyncio.proactor_events", None)
+            assert _core._proactor_loop_running() is False
+
+    def test_not_running_without_an_event_loop(self):
+        assert _core._proactor_loop_running() is False
+
+    def test_not_running_on_a_selector_loop(self):
+        async def main() -> bool:
+            return _core._proactor_loop_running()
+
+        assert _run_on_selector_loop(main) is False
+
+    def test_running_when_the_loop_is_a_proactor_loop(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "_get_running_loop", _FakeProactorLoop)
+        assert _core._proactor_loop_running() is True
+
+    def test_not_running_when_asyncio_is_unusable(self, monkeypatch):
+        def broken():
+            raise RuntimeError("half-imported asyncio")
+
+        monkeypatch.setattr(asyncio, "_get_running_loop", broken)
+        assert _core._proactor_loop_running() is False
+
+    # ── The one-time warning (platform-independent: flag and loop are simulated) ──
+
+    def test_warns_once_under_an_active_policy(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_proactor_warning_pending", True)
+        monkeypatch.setattr(asyncio, "_get_running_loop", _FakeProactorLoop)
+        tethered.activate(allow=["*.example.com"])
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook(*_NEW_SOCKET_EVENT)
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        messages = _proactor_warnings(caplog)
+        assert len(messages) == 1
+        assert "connect-time enforcement is unavailable" in messages[0]
+        assert "only DNS-time hostname checks apply" in messages[0]
+        assert "asyncio.SelectorEventLoop" in messages[0]
+        assert _core._proactor_warning_pending is False
+
+    def test_warns_under_a_scope_alone(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_proactor_warning_pending", True)
+        monkeypatch.setattr(asyncio, "_get_running_loop", _FakeProactorLoop)
+        with caplog.at_level(logging.WARNING, logger="tethered"), tethered.scope(allow=[]):
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        assert len(_proactor_warnings(caplog)) == 1
+
+    def test_no_warning_when_nothing_is_active(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_proactor_warning_pending", True)
+        monkeypatch.setattr(asyncio, "_get_running_loop", _FakeProactorLoop)
+        _core._install_hook()
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        assert _proactor_warnings(caplog) == []
+        assert _core._proactor_warning_pending is True
+
+    def test_no_warning_without_a_proactor_loop(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_proactor_warning_pending", True)
+        tethered.activate(allow=["*.example.com"])
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        assert _proactor_warnings(caplog) == []
+        assert _core._proactor_warning_pending is True  # still to be checked later
+
+    def test_no_check_at_all_once_the_flag_is_clear(self, monkeypatch):
+        """Other platforms, and Windows after the warning: the detection never runs."""
+
+        def must_not_run() -> bool:
+            raise AssertionError("loop detection ran with the flag clear")
+
+        monkeypatch.setattr(_core, "_proactor_warning_pending", False)
+        monkeypatch.setattr(_core, "_proactor_loop_running", must_not_run)
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook(*_NEW_SOCKET_EVENT)
+
+    def test_flag_starts_set_only_on_windows(self):
+        if sys.platform != "win32":
+            assert _core._proactor_warning_pending is False
+
+    # ── The real loop ──
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="ProactorEventLoop is Windows-only")
+    def test_real_proactor_loop_warns_once_and_connect_is_not_blocked(self, monkeypatch, caplog):
+        """Documents the gap: under deny-all, the Proactor loop still connects.
+
+        A blocking socket in the same policy is blocked; ``asyncio.open_connection``
+        on the Proactor loop is not, because no ``socket.connect`` event is
+        raised for it.  tethered says so once.
+        """
+        monkeypatch.setattr(_core, "_proactor_warning_pending", True)
+
+        async def main() -> None:
+            async with _loopback_server() as port:
+                tethered.activate(allow=[], allow_localhost=False)
+                try:
+                    with socket.socket() as blocking, pytest.raises(tethered.EgressBlocked):
+                        blocking.connect(("127.0.0.1", port))
+                    for _ in range(2):
+                        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                        writer.close()
+                        await writer.wait_closed()
+                finally:
+                    tethered.deactivate()
+
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _run_on_loop(main, asyncio.ProactorEventLoop)
+        assert len(_proactor_warnings(caplog)) == 1
+        assert _core._proactor_warning_pending is False
 
 
 def _labels() -> list[str]:
