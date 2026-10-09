@@ -1575,6 +1575,65 @@ class TestDNSLookupInterception:
             _audit_hook("socket.gethostbyname", ("evil.test",))
 
 
+# Both reverse-lookup events, as (event, build audit args from an IP).
+_REVERSE_LOOKUP_EVENTS = [
+    pytest.param("socket.gethostbyaddr", lambda ip: (ip,), id="gethostbyaddr"),
+    pytest.param("socket.getnameinfo", lambda ip: ((ip, 80),), id="getnameinfo"),
+    pytest.param("socket.getnameinfo", lambda ip: ((ip, 80, 0, 0),), id="getnameinfo-4-tuple"),
+]
+
+
+class TestGetnameinfo:
+    """``socket.getnameinfo`` is a reverse lookup and is checked like ``gethostbyaddr``."""
+
+    @pytest.mark.parametrize(("event", "make_args"), _REVERSE_LOOKUP_EVENTS)
+    def test_blocked_and_allowed_like_gethostbyaddr(self, event, make_args):
+        tethered.activate(allow=["198.51.100.0/24", "2001:db8::/32"])
+        _audit_hook(event, make_args("198.51.100.1"))
+        _audit_hook(event, make_args("2001:db8::1"))
+        _audit_hook(event, make_args("127.0.0.1"))  # allow_localhost default
+        with pytest.raises(tethered.EgressBlocked) as exc_info:
+            _audit_hook(event, make_args("203.0.113.1"))
+        assert exc_info.value.host == "203.0.113.1"
+        assert exc_info.value.scope_label is None
+
+    @pytest.mark.parametrize(("event", "make_args"), _REVERSE_LOOKUP_EVENTS)
+    def test_scope_blocks_and_allows(self, event, make_args):
+        with tethered.scope(allow=["198.51.100.0/24"], label="reverse"):
+            _audit_hook(event, make_args("198.51.100.1"))
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook(event, make_args("203.0.113.1"))
+        assert exc_info.value.scope_label == "reverse"
+
+    @pytest.mark.parametrize(("event", "make_args"), _REVERSE_LOOKUP_EVENTS)
+    def test_log_only_reports(self, event, make_args):
+        blocked: list[tuple[str, int | None]] = []
+        tethered.activate(allow=[], log_only=True, on_blocked=lambda h, p: blocked.append((h, p)))
+        _audit_hook(event, make_args("203.0.113.1"))
+        assert blocked == [("203.0.113.1", None)]
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_real_getnameinfo_blocked_before_lookup(self, mode):
+        """The block is raised from the audit event, before any reverse query."""
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked) as exc_info:
+            socket.getnameinfo(("192.0.2.7", 80), 0)
+        assert exc_info.value.host == "192.0.2.7"
+        assert exc_info.value.scope_label == ("deny-all" if mode == "scope" else None)
+
+    def test_real_getnameinfo_allowed(self):
+        tethered.activate(allow=["192.0.2.0/24"])
+        flags = socket.NI_NUMERICHOST | socket.NI_NUMERICSERV
+        assert socket.getnameinfo(("192.0.2.7", 80), flags) == ("192.0.2.7", "80")
+        assert socket.getnameinfo(("127.0.0.1", 80), flags) == ("127.0.0.1", "80")
+
+    def test_malformed_sockaddr_is_blocked(self):
+        tethered.activate(allow=["192.0.2.0/24"])
+        for sockaddr in ((), (123, 80), 123):
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.getnameinfo", (sockaddr,))
+            assert exc_info.value.host.startswith("<unreadable ")
+
+
 class TestIPMapEviction:
     def test_lru_eviction_removes_oldest(self):
         """LRU eviction should remove the least-recently-used entries."""
