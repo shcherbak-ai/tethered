@@ -478,18 +478,23 @@ def _check_scopes(
     port: int | None,
     *,
     _normalized: bool = False,
-) -> _ScopeConfig | None:
+) -> list[_ScopeConfig]:
     """Check host:port against all active scopes.
 
-    Returns the first _ScopeConfig that blocks, or None if all allow.
+    Returns every _ScopeConfig that denies it, outermost first; empty if all
+    allow.  All scopes are evaluated — a log-only scope that denies must not
+    hide a denial by an enforcing scope elsewhere on the stack.  The caller
+    passes each one to :func:`_enforce_scope_block` in order.
     """
+    denying: list[_ScopeConfig] = []
     for sc in scope_stack:
         try:
             if not sc.policy.is_allowed(host, port, _normalized=_normalized):
-                return sc
+                denying.append(sc)
         except Exception:
             if sc.fail_closed:
-                return sc
+                denying.append(sc)
+                continue
             logger.warning(
                 "tethered: error checking %s for %s:%s, failing open",
                 sc.label,
@@ -497,7 +502,7 @@ def _check_scopes(
                 port,
                 exc_info=True,
             )
-    return None
+    return denying
 
 
 def _enforce_scope_block(
@@ -510,7 +515,11 @@ def _enforce_scope_block(
     resolved_from: str | None = None,
     scope_stack: tuple[_ScopeConfig, ...] = (),
 ) -> None:
-    """Log and optionally raise for a scope-level block."""
+    """Log and optionally raise for a scope-level block.
+
+    Returns normally for a log-only scope, so the caller goes on to the next
+    denying scope; raises for an enforcing one.
+    """
     extra = " (allowed by global policy)" if global_allowed else ""
     logger.warning("tethered: %s blocked %s for %s%s", sc.label, event_desc, host, extra)
 
@@ -674,8 +683,9 @@ def _handle_dns_lookup(
                 raise EgressBlocked(host_lower, None, scope_hint=_hint_from_stack(scope_stack))
 
     # ── Scope checks ──
-    blocking_scope = _check_scopes(scope_stack, host_lower, None, _normalized=True)
-    if blocking_scope is not None:
+    # Every denying scope is reported; a log-only one returns and the loop
+    # moves on, the first enforcing one raises.
+    for blocking_scope in _check_scopes(scope_stack, host_lower, None, _normalized=True):
         _enforce_scope_block(
             blocking_scope,
             host_lower,
@@ -768,24 +778,27 @@ def _handle_getaddrinfo(
 
             if not cfg.log_only:
                 raise EgressBlocked(host_lower, None, scope_hint=_hint_from_stack(scope_stack))
-            return
+            # Log-only global denial: carry on to the scope checks — an
+            # enforcing scope must still be able to refuse the lookup.
 
     # Record the hostname for the connect-time fallback-resolve path.
     # Done AFTER the global policy check passes (so we don't invite arbitrary
     # hostnames into the candidate set) and BEFORE the scope check (so
     # log-only scopes still benefit, mirroring how _ip_to_hostname is
     # populated below).
-    with _ip_map_lock:
-        if host_lower in _allowed_hostnames:
-            _allowed_hostnames.move_to_end(host_lower)
-        else:
-            if len(_allowed_hostnames) >= _ALLOWED_HOSTNAMES_MAX_SIZE:
-                _allowed_hostnames.popitem(last=False)
-            _allowed_hostnames[host_lower] = None
+    if global_allowed:
+        with _ip_map_lock:
+            if host_lower in _allowed_hostnames:
+                _allowed_hostnames.move_to_end(host_lower)
+            else:
+                if len(_allowed_hostnames) >= _ALLOWED_HOSTNAMES_MAX_SIZE:
+                    _allowed_hostnames.popitem(last=False)
+                _allowed_hostnames[host_lower] = None
 
     # ── Scope checks (before IP map population) ──
-    blocking_scope = _check_scopes(scope_stack, host_lower, None, _normalized=True)
-    if blocking_scope is not None:
+    # Every denying scope is reported; a log-only one returns and the loop
+    # moves on, the first enforcing one raises.
+    for blocking_scope in _check_scopes(scope_stack, host_lower, None, _normalized=True):
         _enforce_scope_block(
             blocking_scope,
             host_lower,
@@ -794,11 +807,16 @@ def _handle_getaddrinfo(
             global_allowed=global_allowed,
             scope_stack=scope_stack,
         )
-        # If _enforce_scope_block raised (log_only=False), we never reach here.
-        # For log_only scopes, fall through to populate the IP map — without it,
-        # connect-time enforcement can't map the resolved IP back to this hostname,
-        # causing the *global* policy to hard-block a connection that the scope
-        # only intended to log.
+    # If _enforce_scope_block raised (an enforcing scope), we never reach here.
+    # For log_only scopes, fall through to populate the IP map — without it,
+    # connect-time enforcement can't map the resolved IP back to this hostname,
+    # causing the *global* policy to hard-block a connection that the scope
+    # only intended to log.
+
+    if not global_allowed:
+        # Denied by a log-only global policy: the lookup proceeds, but the name
+        # is not recorded — neither as a fallback candidate nor in the IP map.
+        return
 
     # Resolve and store IP -> hostname mapping for allowed hosts.
     # When the C guardian is active, _c_guardian.resolve() manages a C-internal
@@ -1035,18 +1053,21 @@ def _handle_connect(
     # ── Scope checks ──
     # Check resolved hostname first; if blocked, try raw IP as fallback
     # (mirrors global policy: allow if EITHER hostname or IP matches)
-    blocking_scope = _check_scopes(scope_stack, check_host, port, _normalized=True)
-    if blocking_scope is not None and resolved_from is not None:
-        ip_blocking = _check_scopes(scope_stack, host, port, _normalized=True)
-        if ip_blocking is None:
-            blocking_scope = None
-    if blocking_scope is not None:
-        event_desc = f"{event.split('.')[-1]} to {check_host}:{port}"
+    denying = _check_scopes(scope_stack, check_host, port, _normalized=True)
+    if (
+        denying
+        and resolved_from is not None
+        and not _check_scopes(scope_stack, host, port, _normalized=True)
+    ):
+        denying = []
+    # Every denying scope is reported; a log-only one returns and the loop
+    # moves on, the first enforcing one raises.
+    for blocking_scope in denying:
         _enforce_scope_block(
             blocking_scope,
             check_host,
             port,
-            event_desc,
+            f"{event.split('.')[-1]} to {check_host}:{port}",
             global_allowed=global_allowed,
             resolved_from=resolved_from,
             scope_stack=scope_stack,

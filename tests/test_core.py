@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import sys
 import threading
 import types
 
@@ -2943,6 +2944,154 @@ class TestScopeLogOnly:
         assert any(h == "dns.google" for h, _ in blocked)
 
 
+@pytest.fixture
+def no_dns(monkeypatch):
+    """Replace tethered's own resolver call; returns the list of calls it received.
+
+    Keeps synthetic-event tests offline even when a name is allowed through and
+    tethered goes on to resolve it for the IP map.
+    """
+    calls: list[tuple] = []
+
+    def fake_getaddrinfo(*args):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(_csocket, "getaddrinfo", fake_getaddrinfo)
+    return calls
+
+
+# One event of every kind tethered enforces, each for a destination that a
+# deny-all policy (localhost exemption off) refuses.
+_DENIED_EVENTS = [
+    pytest.param("socket.connect", (None, ("192.0.2.1", 443)), id="connect"),
+    pytest.param("socket.sendto", (None, ("192.0.2.1", 53)), id="sendto"),
+    pytest.param("socket.sendmsg", (None, ("192.0.2.1", 53)), id="sendmsg"),
+    pytest.param("socket.getaddrinfo", ("blocked.invalid", 443, 0, 0, 0), id="getaddrinfo"),
+    pytest.param("socket.gethostbyname", ("blocked.invalid",), id="gethostbyname"),
+    pytest.param("socket.gethostbyaddr", ("192.0.2.1",), id="gethostbyaddr"),
+    pytest.param("socket.getnameinfo", (("192.0.2.1", 443),), id="getnameinfo"),
+]
+
+
+class TestLogOnlyDoesNotStopEnforcement:
+    """A log-only layer reports a denial; it never switches off an enforcing layer.
+
+    Every scope on the stack is evaluated.  Each denying log-only scope logs and
+    calls its ``on_blocked``; the first denying enforcing scope raises.  A global
+    log-only denial does not end the evaluation either.
+    """
+
+    @staticmethod
+    def _monitor(seen: list[str], name: str = "monitor") -> tethered.scope:
+        return tethered.scope(
+            allow=[],
+            allow_localhost=False,
+            log_only=True,
+            on_blocked=lambda h, p: seen.append(name),
+            label=name,
+        )
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_outer_log_only_inner_enforcing(self, no_dns, event, args):
+        seen: list[str] = []
+        with (
+            self._monitor(seen),
+            tethered.scope(allow=[], allow_localhost=False, label="enforcer"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook(event, args)
+        assert exc_info.value.scope_label == "enforcer"
+        assert seen == ["monitor"]
+        assert no_dns == []
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_outer_enforcing_inner_log_only(self, no_dns, event, args):
+        seen: list[str] = []
+        with (
+            tethered.scope(allow=[], allow_localhost=False, label="enforcer"),
+            self._monitor(seen),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook(event, args)
+        assert exc_info.value.scope_label == "enforcer"
+        assert seen == []  # the enforcing scope raised before the inner one was reached
+        assert no_dns == []
+
+    def test_real_audit_event_outer_log_only_inner_enforcing(self):
+        """The same composition through ``sys.audit`` instead of a direct hook call."""
+        with (
+            tethered.scope(allow=[], allow_localhost=False, log_only=True),
+            tethered.scope(allow=[], allow_localhost=False, label="enforcer"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            sys.audit("socket.connect", None, ("192.0.2.1", 443))
+        assert exc_info.value.scope_label == "enforcer"
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_global_log_only_does_not_hide_enforcing_scope(self, no_dns, event, args):
+        seen: list[str] = []
+        tethered.activate(
+            allow=[],
+            allow_localhost=False,
+            log_only=True,
+            on_blocked=lambda h, p: seen.append("global"),
+        )
+        with (
+            tethered.scope(allow=[], allow_localhost=False, label="enforcer"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook(event, args)
+        assert exc_info.value.scope_label == "enforcer"
+        assert seen == ["global"]
+        assert no_dns == []
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_every_monitoring_layer_is_notified(self, no_dns, event, args):
+        seen: list[str] = []
+        tethered.activate(
+            allow=[],
+            allow_localhost=False,
+            log_only=True,
+            on_blocked=lambda h, p: seen.append("global"),
+        )
+        with self._monitor(seen, "outer"), self._monitor(seen, "inner"):
+            _audit_hook(event, args)  # nothing enforces, so nothing raises
+        assert seen == ["global", "outer", "inner"]
+        # A name the global policy denied (log-only) is still not recorded.
+        assert no_dns == []
+        assert "blocked.invalid" not in _core._allowed_hostnames
+        with _ip_map_lock:
+            assert not _ip_to_hostname
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_only_the_monitoring_layer_denies(self, no_dns, event, args):
+        seen: list[str] = []
+        with (
+            self._monitor(seen),
+            tethered.scope(allow=["192.0.2.0/24", "*.invalid"], label="enforcer"),
+        ):
+            _audit_hook(event, args)
+        assert seen == ["monitor"]
+
+    @pytest.mark.parametrize(("event", "args"), _DENIED_EVENTS)
+    def test_only_the_enforcing_layer_denies(self, no_dns, event, args):
+        seen: list[str] = []
+        with (
+            tethered.scope(
+                allow=["192.0.2.0/24", "*.invalid"],
+                log_only=True,
+                on_blocked=lambda h, p: seen.append("monitor"),
+            ),
+            tethered.scope(allow=[], allow_localhost=False, label="enforcer"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook(event, args)
+        assert exc_info.value.scope_label == "enforcer"
+        assert seen == []
+        assert no_dns == []
+
+
 class TestScopeFailClosed:
     """Test scope() fail_closed behavior."""
 
@@ -3385,18 +3534,18 @@ class TestScopeDirect:
     """Direct-call tests for scope internals (coverage for audit-hook paths)."""
 
     def test_check_scopes_blocks(self):
-        """_check_scopes returns blocking scope when host not allowed."""
+        """_check_scopes returns the denying scope when host not allowed."""
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, label="test-scope")
         result = _check_scopes((sc,), "evil.test", 80, _normalized=True)
-        assert result is sc
+        assert result == [sc]
 
     def test_check_scopes_allows(self):
-        """_check_scopes returns None when host is allowed."""
+        """_check_scopes returns nothing when host is allowed."""
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, label="test-scope")
         result = _check_scopes((sc,), "api.example.com", 80, _normalized=True)
-        assert result is None
+        assert result == []
 
     def test_check_scopes_fail_closed(self, monkeypatch):
         """_check_scopes returns scope on error when fail_closed=True."""
@@ -3404,15 +3553,23 @@ class TestScopeDirect:
         sc = _ScopeConfig(policy=policy, fail_closed=True, label="test-scope")
         monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
         result = _check_scopes((sc,), "test.example.com", 80, _normalized=True)
-        assert result is sc
+        assert result == [sc]
 
     def test_check_scopes_fail_open(self, monkeypatch):
-        """_check_scopes returns None on error when fail_closed=False."""
+        """_check_scopes returns nothing on error when fail_closed=False."""
         policy = AllowPolicy(["*.example.com"])
         sc = _ScopeConfig(policy=policy, fail_closed=False, label="test-scope")
         monkeypatch.setattr(AllowPolicy, "is_allowed", _raise_runtime)
         result = _check_scopes((sc,), "test.example.com", 80, _normalized=True)
-        assert result is None
+        assert result == []
+
+    def test_check_scopes_returns_every_denying_scope_in_stack_order(self):
+        """Evaluation does not stop at the first denial, log-only or not."""
+        monitor = _ScopeConfig(policy=AllowPolicy([]), log_only=True, label="monitor")
+        allows = _ScopeConfig(policy=AllowPolicy(["192.0.2.0/24"]), label="allows")
+        enforcer = _ScopeConfig(policy=AllowPolicy([]), label="enforcer")
+        result = _check_scopes((monitor, allows, enforcer), "192.0.2.1", 443, _normalized=True)
+        assert result == [monitor, enforcer]
 
     def test_enforce_scope_block_raises(self):
         """_enforce_scope_block raises EgressBlocked when log_only=False."""
