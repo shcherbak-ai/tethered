@@ -407,22 +407,49 @@ class TestSerializedTransitions:
 # ── R19: failure before commit leaves everything as it was ─────────
 
 
+def _network_rule(i: int) -> str:
+    """Distinct rules of one fixed width, so each costs the same to publish."""
+    return f"10.{100 + i // 100}.{100 + i % 100}.0/24:443"
+
+
+def _hostname_of_length(n: int) -> str:
+    """An ordinary-looking host name exactly ``n`` characters long."""
+    assert 20 <= n <= 250
+    remaining = n - len(".test")
+    labels = []
+    while remaining > 60:
+        labels.append("x" * 59)
+        remaining -= 60  # the label and its dot
+    labels.append("x" * remaining)
+    name = ".".join(labels) + ".test"
+    assert len(name) == n
+    return name
+
+
 def _allow_list_publishing(length: int, *, locked: bool = False) -> list[str]:
     """An allow list whose published payload is exactly ``length`` characters.
 
-    Measured by activating a slightly shorter list and reading what was
-    published, so it does not depend on how the payload is encoded — only
-    on one more character of host name costing one more character.  Leaves
-    nothing active.
+    Found by activating shorter lists and reading what was published, so it
+    does not depend on how the payload is encoded — only on every
+    fixed-width rule costing the same and one more character of host name
+    costing one more character.  Leaves nothing active.
     """
-    allow = [f"10.{i // 256}.{i % 256}.0/24:443" for i in range(1200)]
-    allow.append("x" * 50 + ".test")
-    secret = object()
-    tethered.activate(allow=allow, locked=locked, lock_token=secret)
-    measured = len(os.environ[POLICY_VAR])
-    tethered.deactivate(lock_token=secret)
-    assert measured + 50 < length
-    allow[-1] = "x" * (50 + length - measured) + ".test"
+
+    def published(allow: list[str]) -> int:
+        secret = object()
+        tethered.activate(allow=allow, locked=locked, lock_token=secret)
+        size = len(os.environ[POLICY_VAR])
+        tethered.deactivate(lock_token=secret)
+        return size
+
+    rules = [_network_rule(i) for i in range(1000)]
+    filler = _hostname_of_length(100)
+    base = published([*rules, filler])
+    per_rule = published([*rules, _network_rule(1000), filler]) - base
+    extra, rest = divmod(length - base, per_rule)
+    assert extra >= 0
+    rules += [_network_rule(1000 + i) for i in range(extra)]
+    allow = [*rules, _hostname_of_length(100 + rest)]
     return allow
 
 

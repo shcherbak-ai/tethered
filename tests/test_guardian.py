@@ -1008,9 +1008,13 @@ class TestSnapshotTamperDetection:
         """
         _activate_locked()
         cfg = _core._config
-        copy.copy(cfg.policy)
-        copy.copy(cfg)
-        pickle.dumps(tethered.TetheredLocked())
+        # Whether these succeed is beside the point (a class may refuse to be
+        # copied); what they leave behind in the class namespaces is the test.
+        for obj in (cfg.policy, cfg, tethered.TetheredLocked()):
+            with contextlib.suppress(Exception):
+                copy.copy(obj)
+            with contextlib.suppress(Exception):
+                pickle.dumps(obj)
         for cls in _own_classes():
             _ = cls.__annotations__
             _ = cls.__doc__
