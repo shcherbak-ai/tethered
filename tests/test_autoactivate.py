@@ -103,16 +103,13 @@ class TestAutoactivateUnit:
         with _core._state_lock:
             _core._config = None
 
-    def test_c_extension_fallback(self, monkeypatch, caplog):
-        """If C extension is unavailable, locked=true falls back to non-locked + warning."""
+    def test_locked_without_c_extension_refuses_to_start(self, monkeypatch):
+        """The parent asked for locked mode; a child that cannot lock must not run unlocked."""
         monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"], locked=True))
         monkeypatch.setattr(_core, "_c_guardian", None)
-        with caplog.at_level(logging.WARNING, logger="tethered"):
+        with pytest.raises(SystemExit, match=r"C guardian extension is not available"):
             _autoactivate._autoactivate_from_env()
-        cfg = _core._config
-        assert cfg is not None
-        assert cfg.locked is False  # fell back
-        assert any("C guardian extension is not available" in r.message for r in caplog.records)
+        assert _core._config is None
 
 
 class TestAutoactivateIntegration:
@@ -639,3 +636,249 @@ class TestInheritScopes:
         )
         scopes = _core._scopes.get()
         assert scopes[0].hint == ""
+
+    def test_inherit_scopes_non_string_label_falls_back(self):
+        """A non-string label never reaches log messages; the default is used."""
+        _autoactivate._inherit_scopes([{"allow": ["api.example.com"], "label": 42}])
+        assert _core._scopes.get()[0].label == "inherited-scope"
+
+    def test_inherit_scopes_skips_non_string_allow_items(self, caplog):
+        """A non-string allow item skips that entry only — it used to drop every scope."""
+        scopes_payload = [
+            {"allow": ["api.example.com", 5], "label": "bad"},
+            {"allow": ["api.example.com"], "label": "valid"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _autoactivate._inherit_scopes(scopes_payload)
+        assert [s.label for s in _core._scopes.get()] == ["valid"]
+        assert any(r"scopes[0].allow[1] must be str" in r.message for r in caplog.records)
+
+    def test_inherit_scopes_strict_refuses_malformed_entry(self):
+        with pytest.raises(SystemExit, match=r"scopes\[0\]\.log_only must be bool"):
+            _autoactivate._inherit_scopes(
+                [{"allow": ["api.example.com"], "log_only": 0}], strict=True
+            )
+        assert _core._scopes.get() == ()
+
+    def test_inherit_scopes_strict_refuses_rule_the_policy_rejects(self):
+        with pytest.raises(SystemExit, match=r"failed to inherit scope"):
+            _autoactivate._inherit_scopes([{"allow": ["://invalid"]}], strict=True)
+        assert _core._scopes.get() == ()
+
+
+_STRICT_FLAGS = ("locked", "fail_closed")
+
+
+class TestInheritedPayloadValidation:
+    """The payload schema is validated before use, with exact field types.
+
+    When the inherited global asks for ``locked`` or ``fail_closed`` a policy
+    that cannot be established terminates startup (``SystemExit`` — the only
+    thing ``site.py`` does not swallow from a ``.pth`` line).  Otherwise the
+    problem is logged and the child continues, as before.
+    """
+
+    def _run(self, monkeypatch, global_payload: object, scopes: object = None) -> None:
+        payload = {"global": global_payload, "scopes": [] if scopes is None else scopes}
+        monkeypatch.setenv(_CHILD_POLICY_ENV, json.dumps(payload))
+        _autoactivate._autoactivate_from_env()
+
+    @staticmethod
+    def _global(**overrides: object) -> dict[str, object]:
+        return json.loads(_payload(**overrides))["global"]
+
+    @pytest.mark.parametrize("strict_flag", _STRICT_FLAGS)
+    @pytest.mark.parametrize("field", ["log_only", "allow_localhost"])
+    @pytest.mark.parametrize("value", [0, 0.0, 1, "false", None])
+    def test_wrong_type_refuses_to_start_when_strict(self, monkeypatch, strict_flag, field, value):
+        """``0`` is not ``false``: the child used to log a warning and run unprotected."""
+        global_payload = self._global(**{strict_flag: True, field: value})
+        with pytest.raises(SystemExit, match=rf"global\.{field} must be bool"):
+            self._run(monkeypatch, global_payload)
+        assert _core._config is None
+
+    @pytest.mark.parametrize("strict_flag", _STRICT_FLAGS)
+    @pytest.mark.parametrize("value", [1, 0, "yes", None])
+    def test_mistyped_strict_flag_cannot_downgrade(self, monkeypatch, strict_flag, value):
+        """A flag that is not exactly ``false`` still counts as asking for it."""
+        with pytest.raises(SystemExit, match=rf"global\.{strict_flag} must be bool"):
+            self._run(monkeypatch, self._global(**{strict_flag: value}))
+        assert _core._config is None
+
+    def test_wrong_type_logs_and_continues_otherwise(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._run(monkeypatch, self._global(log_only=0))
+        assert _core._config is None
+        assert any(
+            "auto-activation failed: global.log_only must be bool, got int: 0" in r.message
+            for r in caplog.records
+        )
+
+    def test_missing_allow_logs_and_continues(self, monkeypatch, caplog):
+        """A missing ``allow`` used to raise ``KeyError`` out of the bootstrap."""
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._run(monkeypatch, {"log_only": False})
+        assert _core._config is None
+        assert any("global is missing 'allow'" in r.message for r in caplog.records)
+
+    def test_missing_allow_refuses_to_start_when_strict(self, monkeypatch):
+        with pytest.raises(SystemExit, match=r"global is missing 'allow'"):
+            self._run(monkeypatch, {"fail_closed": True})
+        assert _core._config is None
+
+    @pytest.mark.parametrize("allow", ["*.example.com", ["*.example.com", 5], None])
+    def test_allow_must_be_a_list_of_str(self, monkeypatch, allow):
+        with pytest.raises(SystemExit, match=r"global\.allow"):
+            self._run(monkeypatch, self._global(fail_closed=True, allow=allow))
+        assert _core._config is None
+
+    def test_unknown_field_is_ignored_unless_strict(self, monkeypatch):
+        global_payload = self._global(allow=["*.example.com"])
+        global_payload["from_a_newer_version"] = True
+        self._run(monkeypatch, global_payload)
+        assert _core._config is not None
+        assert _core._config.policy.is_allowed("api.example.com", 443)
+
+    def test_unknown_field_refuses_to_start_when_strict(self, monkeypatch):
+        global_payload = self._global(fail_closed=True)
+        global_payload["from_a_newer_version"] = True
+        with pytest.raises(SystemExit, match=r"global has unknown field 'from_a_newer_version'"):
+            self._run(monkeypatch, global_payload)
+        assert _core._config is None
+
+    def test_unknown_top_level_field_refuses_to_start_when_strict(self, monkeypatch):
+        payload = {"global": self._global(fail_closed=True), "scopes": [], "deny": ["x"]}
+        monkeypatch.setenv(_CHILD_POLICY_ENV, json.dumps(payload))
+        with pytest.raises(SystemExit, match=r"unknown field 'deny'"):
+            _autoactivate._autoactivate_from_env()
+        assert _core._config is None
+
+    def test_activation_error_logs_and_continues(self, monkeypatch, caplog):
+        """A rule the parent serialized but ``AllowPolicy`` rejects here."""
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._run(monkeypatch, self._global(allow=["://not-a-rule"]))
+        assert _core._config is None
+        assert any("auto-activation failed: ValueError" in r.message for r in caplog.records)
+
+    def test_activation_error_refuses_to_start_when_strict(self, monkeypatch):
+        with pytest.raises(SystemExit, match=r"auto-activation failed: ValueError"):
+            self._run(monkeypatch, self._global(fail_closed=True, allow=["://not-a-rule"]))
+        assert _core._config is None
+
+    def test_global_that_is_not_an_object_still_inherits_scopes(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._run(monkeypatch, 5, scopes=[{"allow": ["api.example.com"], "label": "kept"}])
+        assert _core._config is None
+        assert [s.label for s in _core._scopes.get()] == ["kept"]
+        assert any("global must be an object, got int" in r.message for r in caplog.records)
+
+    def test_scopes_that_are_not_a_list_log_and_continue(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._run(monkeypatch, self._global(allow=["*.example.com"]), scopes={"allow": []})
+        assert _core._config is not None
+        assert _core._scopes.get() == ()
+        assert any("scopes must be a list, got dict" in r.message for r in caplog.records)
+
+    def test_scopes_that_are_not_a_list_refuse_to_start_when_strict(self, monkeypatch):
+        with pytest.raises(SystemExit, match=r"scopes must be a list, got int"):
+            self._run(monkeypatch, self._global(fail_closed=True), scopes=7)
+
+    def test_malformed_scope_refuses_to_start_when_strict(self, monkeypatch):
+        """A non-string allow item used to raise ``AttributeError`` and drop every scope."""
+        with pytest.raises(SystemExit, match=r"scopes\[1\]\.allow\[0\] must be str"):
+            self._run(
+                monkeypatch,
+                self._global(fail_closed=True),
+                scopes=[{"allow": ["api.example.com"]}, {"allow": [5]}],
+            )
+        assert _core._scopes.get() == ()
+
+    def test_malformed_scope_is_skipped_otherwise(self, monkeypatch):
+        self._run(
+            monkeypatch,
+            self._global(allow=["*.example.com"]),
+            scopes=[{"allow": [5], "label": "bad"}, {"allow": ["api.example.com"], "label": "ok"}],
+        )
+        assert _core._config is not None
+        assert [s.label for s in _core._scopes.get()] == ["ok"]
+
+
+class TestChildStartupFailsClosed:
+    """Real children: when a strict policy cannot be established, user code does not run."""
+
+    _USER_CODE = (
+        "import sys\n"
+        "core = sys.modules.get('tethered._core')\n"
+        "print('USER CODE RAN active=%s' % bool(core and core._config))\n"
+    )
+
+    def _child(self, payload: object) -> subprocess.CompletedProcess[str]:
+        raw = payload if isinstance(payload, str) else json.dumps(payload)
+        return subprocess.run(  # nosec B603
+            [sys.executable, "-c", self._USER_CODE],
+            env={**os.environ, _CHILD_POLICY_ENV: raw},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    @staticmethod
+    def _global(**overrides: object) -> dict[str, object]:
+        return json.loads(_payload(**overrides))["global"]
+
+    def test_valid_payload_runs_protected(self):
+        r = self._child({"global": self._global(fail_closed=True), "scopes": []})
+        assert r.returncode == 0, r.stderr
+        assert "USER CODE RAN active=True" in r.stdout
+
+    @pytest.mark.parametrize("field", ["log_only", "fail_closed", "allow_localhost"])
+    @pytest.mark.parametrize("value", [0, 0.0])
+    def test_locked_payload_with_number_for_bool_does_not_run(self, field, value):
+        """The report's case: one field of a locked payload changed from ``false`` to ``0``."""
+        r = self._child({"global": self._global(locked=True, **{field: value}), "scopes": []})
+        assert r.returncode != 0
+        assert "USER CODE RAN" not in r.stdout
+        assert "tethered: refusing to start" in r.stderr
+        assert f"global.{field} must be bool" in r.stderr
+
+    @pytest.mark.parametrize(
+        ("global_payload", "scopes", "expected"),
+        [
+            ({"fail_closed": True}, [], "global is missing 'allow'"),
+            (
+                {"allow": [], "fail_closed": True, "from_a_newer_version": 1},
+                [],
+                "unknown field 'from_a_newer_version'",
+            ),
+            ({"allow": ["://not-a-rule"], "fail_closed": True}, [], "auto-activation failed"),
+            (
+                {"allow": [], "fail_closed": True},
+                [{"allow": [5]}],
+                "scopes[0].allow[0] must be str",
+            ),
+            ({"allow": [], "fail_closed": True}, [{"allow": ["://x"]}], "failed to inherit scope"),
+        ],
+        ids=["missing-allow", "unknown-field", "activation-raises", "scope-type", "scope-rule"],
+    )
+    def test_strict_payload_that_cannot_be_established_does_not_run(
+        self, global_payload, scopes, expected
+    ):
+        r = self._child({"global": global_payload, "scopes": scopes})
+        assert r.returncode != 0
+        assert "USER CODE RAN" not in r.stdout
+        assert "tethered: refusing to start" in r.stderr
+        assert expected in r.stderr
+
+    def test_non_strict_payload_that_cannot_be_established_still_runs(self):
+        """Neither flag set: today's fail-open default — a warning, then the workload."""
+        r = self._child({"global": self._global(log_only=0), "scopes": []})
+        assert r.returncode == 0, r.stderr
+        assert "USER CODE RAN active=False" in r.stdout
+        assert "auto-activation failed: global.log_only must be bool" in r.stderr
+
+    def test_payload_that_is_not_json_still_runs(self):
+        """Nothing can be read from it, so nothing asked for fail-closed startup."""
+        r = self._child("{not json")
+        assert r.returncode == 0, r.stderr
+        assert "USER CODE RAN active=False" in r.stdout
+        assert "malformed _TETHERED_CHILD_POLICY" in r.stderr

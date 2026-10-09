@@ -2954,12 +2954,7 @@ class TestLaunchEnvMappingCopy:
         payload = json.dumps({"global": {"allow": [], "locked": True}, "scopes": []})
         monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
         monkeypatch.setattr(_core, "_find_execute_child_frame", lambda: object())
-        cfg = _Config(
-            policy=AllowPolicy([]),
-            locked=True,
-            _serialized_payload=payload,
-            _global_payload_dict={"allow": [], "locked": True},
-        )
+        cfg = _Config(policy=AllowPolicy([]), locked=True, _serialized_payload=payload)
         with pytest.raises(tethered.SubprocessBlocked, match=r"could not be read as a mapping"):
             _handle_subprocess(
                 cfg,
@@ -2981,3 +2976,128 @@ class TestLaunchEnvMappingCopy:
         assert state["parent_only"] is None
         assert state["active"] is True
         assert state["scopes"] == 1
+
+
+class TestTypeExactPayloadComparison:
+    """The launch payload's ``global`` must equal the canonical one type-exactly.
+
+    Dict equality treats ``0`` as ``False``, so a payload the child's
+    ``activate()`` rejects used to pass the locked-mode check — and the child
+    then ran with no policy.  The canonical side comes from the immutable
+    ``_serialized_payload``, never from the mutable ``_global_payload_dict``.
+    """
+
+    _GLOBAL: ClassVar[dict[str, object]] = {
+        "allow": ["*.example.com"],
+        "allow_localhost": True,
+        "log_only": False,
+        "fail_closed": False,
+        "external_subprocess_policy": "allow",
+        "locked": True,
+    }
+    _CANONICAL = json.dumps({"global": _GLOBAL, "scopes": []})
+
+    def _cfg(self, **fields: object) -> _Config:
+        return _Config(
+            policy=AllowPolicy(["*.example.com"]),
+            external_subprocess_policy="allow",
+            locked=True,
+            _serialized_payload=self._CANONICAL,
+            **fields,
+        )
+
+    def _payload(self, **overrides: object) -> str:
+        return json.dumps({"global": {**self._GLOBAL, **overrides}, "scopes": []})
+
+    def _classify(self, text: str | None) -> str:
+        return _core._classify_payload(text, self._CANONICAL, self._CANONICAL)
+
+    def test_identical_text_is_exact(self):
+        assert self._classify(self._CANONICAL) == "exact"
+
+    def test_other_serialization_of_the_same_global(self):
+        """Key order, whitespace and the scope list do not change the ``global``."""
+        reordered = json.dumps(
+            {"scopes": [{"allow": []}], "global": dict(reversed(list(self._GLOBAL.items())))},
+            indent=2,
+        )
+        assert self._classify(reordered) == "same-global"
+
+    @pytest.mark.parametrize("field", ["log_only", "fail_closed", "allow_localhost", "locked"])
+    @pytest.mark.parametrize("as_type", [int, float])
+    def test_number_for_bool_is_a_substitution(self, field, as_type):
+        """Equal under ``==``, but not the same JSON value."""
+        value = as_type(self._GLOBAL[field])
+        assert value == self._GLOBAL[field]
+        assert self._classify(self._payload(**{field: value})) == "substituted"
+
+    def test_missing_or_extra_field_is_a_substitution(self):
+        missing = {k: v for k, v in self._GLOBAL.items() if k != "log_only"}
+        assert self._classify(json.dumps({"global": missing, "scopes": []})) == "substituted"
+        assert self._classify(self._payload(extra=None)) == "substituted"
+
+    @pytest.mark.parametrize("text", ["[1, 2]", "null", '{"allow": ["evil.test"]}'])
+    def test_json_without_the_canonical_global_is_a_substitution(self, text):
+        assert self._classify(text) == "substituted"
+
+    @pytest.mark.parametrize("text", ["{not json", "", None])
+    def test_not_json_is_corrupt(self, text):
+        assert self._classify(text) == "corrupt"
+
+    @pytest.mark.parametrize("field", ["log_only", "fail_closed", "allow_localhost"])
+    def test_locked_check_refuses_number_for_bool_in_explicit_env(self, field):
+        tampered = self._payload(**{field: int(self._GLOBAL[field])})
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            _handle_subprocess(
+                self._cfg(),
+                "subprocess.Popen",
+                ("/bin/sh", [], None, {_CHILD_POLICY_ENV: tampered}),
+            )
+
+    def test_locked_check_refuses_number_for_bool_in_os_environ(self, monkeypatch):
+        monkeypatch.setenv(_CHILD_POLICY_ENV, self._payload(log_only=0))
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            _handle_subprocess(self._cfg(), "subprocess.Popen", ("/bin/sh", [], None, None))
+
+    def test_mutated_global_payload_dict_is_not_trusted(self, monkeypatch):
+        """Widening the mutable dict in place neither passes the check nor reaches a child."""
+        monkeypatch.setenv(_CHILD_POLICY_ENV, self._CANONICAL)
+        cfg = self._cfg(_global_payload_dict=json.loads(self._CANONICAL)["global"])
+        cfg._global_payload_dict["allow"].append("evil.test")
+        widened = json.dumps({"global": cfg._global_payload_dict, "scopes": []})
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            _handle_subprocess(
+                cfg, "subprocess.Popen", ("/bin/sh", [], None, {_CHILD_POLICY_ENV: widened})
+            )
+        scope_cfg = _ScopeConfig(policy=AllowPolicy(["api.example.com"]), label="s")
+        new_env = _build_per_launch_env(
+            "subprocess.Popen", ("/x", [], None, None), (scope_cfg,), cfg
+        )
+        assert json.loads(new_env[_CHILD_POLICY_ENV])["global"] == self._GLOBAL
+
+    def test_canonical_payload_is_rebuilt_for_a_config_without_the_serialized_field(self):
+        cfg = _Config(policy=AllowPolicy(["b.example.com", "a.example.com"]), fail_closed=True)
+        assert json.loads(_core._canonical_payload(cfg)) == {
+            "global": {
+                "allow": ["a.example.com", "b.example.com"],
+                "allow_localhost": True,
+                "log_only": False,
+                "fail_closed": True,
+                "external_subprocess_policy": "warn",
+                "locked": False,
+            },
+            "scopes": [],
+        }
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.parametrize("field", ["log_only", "fail_closed", "allow_localhost"])
+    def test_locked_parent_refuses_to_launch_with_number_for_bool(self, field):
+        """End to end: the parent no longer approves a payload the child would reject."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        payload = json.loads(os.environ[_CHILD_POLICY_ENV])
+        payload["global"][field] = int(payload["global"][field])
+        env = {**os.environ, _CHILD_POLICY_ENV: json.dumps(payload)}
+        with pytest.raises(tethered.SubprocessBlocked, match=r"substitution attempt"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "pass"], env=env, capture_output=True, timeout=30
+            )

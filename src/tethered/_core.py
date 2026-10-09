@@ -1793,6 +1793,46 @@ def _snapshot_env(env: Any) -> list[tuple[Any, Any]] | None:
             return None
 
 
+def _classify_payload(text: str | None, expected: str, payload: str) -> str:
+    """Compare one ``_TETHERED_CHILD_POLICY`` value against what the child must receive.
+
+    ``expected`` is the exact value tethered would write for this launch and
+    ``payload`` the canonical at-rest payload.  Returns:
+
+    - ``"exact"`` — the value is ``expected``;
+    - ``"same-global"`` — another serialization or scope list around the
+      canonical ``global`` (scopes can only narrow within that ceiling);
+    - ``"corrupt"`` — not JSON;
+    - ``"substituted"`` — a different ``global``.
+
+    The ``global`` comparison is on canonical JSON text, so it is type-exact:
+    ``0`` is not ``false`` (a child would reject the former and run with no
+    policy).
+    """
+    if text == expected:
+        return "exact"
+    if text is None:
+        return "corrupt"
+    try:
+        parsed = json.loads(text)
+        same_global = isinstance(parsed, dict) and json.dumps(
+            parsed.get("global"), sort_keys=True
+        ) == json.dumps(json.loads(payload)["global"], sort_keys=True)
+    except (TypeError, ValueError, KeyError, RecursionError):
+        return "corrupt"
+    return "same-global" if same_global else "substituted"
+
+
+def _launch_payload(cfg: _Config | None, scope_stack: tuple[_ScopeConfig, ...]) -> str:
+    """Return the payload a ``subprocess.Popen`` child launched right now must receive."""
+    if cfg is None:
+        return _build_env_payload(None, scope_stack)
+    payload = _canonical_payload(cfg)
+    if not scope_stack:
+        return payload
+    return _build_env_payload(json.loads(payload)["global"], scope_stack)
+
+
 def _build_per_launch_env(
     event: str,
     args: tuple[Any, ...],
@@ -1815,8 +1855,7 @@ def _build_per_launch_env(
     if pairs is None:
         return None
     new_env = dict(pairs)
-    global_dict = cfg._global_payload_dict if cfg is not None else None
-    new_env[_CHILD_POLICY_ENV] = _build_env_payload(global_dict, scope_stack)
+    new_env[_CHILD_POLICY_ENV] = _launch_payload(cfg, scope_stack)
     return new_env
 
 
@@ -1857,8 +1896,9 @@ def _handle_subprocess(
     reads consistent.
     """
     # Locked-mode payload-integrity enforcement.  Verify that the policy the
-    # child will see has a canonical 'global' field matching the parent's
-    # frozen-at-activate-time _global_payload_dict.  Two source paths:
+    # child will see has a 'global' field equal — type-exactly — to the one
+    # in the parent's canonical payload (the immutable ``_serialized_payload``;
+    # the mutable ``_global_payload_dict`` is not trusted).  Two source paths:
     #   1. Explicit env=dict — check the dict's value.
     #   2. Inherited env (None) — check os.environ.  Catches Python-level
     #      mutation (os.environ.pop / __setitem__ / __delitem__) AND ctypes-
@@ -1890,13 +1930,13 @@ def _handle_subprocess(
                 event,
                 f"{desc} — {source} strips {_CHILD_POLICY_ENV}",
             )
-        # Parse the env value as JSON.  Corrupted payload is treated as a
-        # tamper attempt — wrap json.loads in try/except so the exception
-        # never escapes the audit hook (which CPython logs and then ALLOWS
-        # the syscall — that would be a bypass).
-        try:
-            parsed_payload = json.loads(env_payload)
-        except (json.JSONDecodeError, TypeError):
+        # Compare with the canonical payload.  A value that is not JSON is
+        # classified as corrupt and treated as a tamper attempt; the
+        # comparison itself never raises, so no stray exception escapes the
+        # audit hook in place of ``SubprocessBlocked``.
+        payload = _canonical_payload(cfg)
+        state = _classify_payload(env_payload, payload, payload)
+        if state == "corrupt":
             desc = _describe_subprocess_launch(event, args)
             logger.warning(
                 "tethered: blocked subprocess launch with corrupted policy payload: %s (%s)",
@@ -1907,11 +1947,8 @@ def _handle_subprocess(
                 event,
                 f"{desc} — {source} carries a {_CHILD_POLICY_ENV} value that is "
                 "not valid JSON (corruption / tamper attempt)",
-            ) from None
-        if (
-            not isinstance(parsed_payload, dict)
-            or parsed_payload.get("global") != cfg._global_payload_dict
-        ):
+            )
+        if state == "substituted":
             desc = _describe_subprocess_launch(event, args)
             logger.warning(
                 "tethered: blocked subprocess launch with substituted policy payload: %s (%s)",
@@ -1924,7 +1961,7 @@ def _handle_subprocess(
                 "'global' field differs from the parent's canonical payload "
                 "(substitution attempt)",
             )
-        # parsed_payload["scopes"] is intentionally NOT integrity-checked.
+        # The payload's "scopes" are intentionally NOT integrity-checked.
 
     # Auto-inheriting Python child launches are covered by tethered.pth →
     # _autoactivate.  For those launches:
@@ -2798,7 +2835,7 @@ def _build_env_payload(
 
     Used for both the at-rest value (empty scopes) written by
     :func:`_propagate_policy_to_env` and the per-launch values built by
-    :func:`_handle_subprocess` when scopes are active.
+    :func:`_launch_payload` when scopes are active.
     """
     return json.dumps(
         {
@@ -2809,11 +2846,11 @@ def _build_env_payload(
 
 
 def _build_child_policy_payload(cfg: _Config) -> dict[str, Any]:
-    """Test compatibility helper — returns the canonical ``global`` dict.
+    """Rebuild the canonical ``global`` dict from ``cfg``'s fields.
 
-    Production code reads ``cfg._global_payload_dict`` directly; this wrapper
-    rebuilds it from cfg fields so tests that construct ``_Config`` without
-    populating the field continue to work.
+    Production configs carry it serialized in ``_serialized_payload`` (see
+    :func:`_canonical_payload`); this rebuild serves configs constructed
+    without that field, as tests do.
     """
     return _build_global_payload_dict(
         cfg.policy,
@@ -2822,6 +2859,20 @@ def _build_child_policy_payload(cfg: _Config) -> dict[str, Any]:
         external_subprocess_policy=cfg.external_subprocess_policy,
         locked=cfg.locked,
     )
+
+
+def _canonical_payload(cfg: _Config) -> str:
+    """Return the canonical at-rest payload for ``cfg``.
+
+    ``cfg._serialized_payload`` — an immutable ``str`` whose identity the C
+    guardian protects in locked mode — is the source of truth for everything
+    tethered compares a launch environment against or writes into one.  The
+    mutable ``cfg._global_payload_dict`` is never consulted: code in the
+    process can alter its contents without changing its identity.  A config
+    built without the serialized field gets the payload rebuilt from its
+    fields.
+    """
+    return cfg._serialized_payload or _build_env_payload(_build_child_policy_payload(cfg), ())
 
 
 def _compute_pth_path() -> str:
