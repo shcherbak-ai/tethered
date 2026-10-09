@@ -2686,114 +2686,37 @@ class scope:
         # Warn about dead or overly broad rules when a global policy is active
         cfg = _config
         if cfg is not None:
-            self._warn_scope_overlap(cfg.policy, allow, label)
+            self._warn_scope_overlap(cfg.policy, policy, allow, label)
 
     @staticmethod
     def _warn_scope_overlap(
         global_policy: AllowPolicy,
+        scope_policy: AllowPolicy,
         allow: list[str],
         label: str,
     ) -> None:
-        """Warn about scope rules that have no or partial overlap with the global policy."""
-        for rule in allow:
-            rule_stripped = rule.strip().lower()
-            # Parse port from the rule
-            port_part: int | None = None
-            host_part = rule_stripped
+        """Warn about scope rules that have no or partial overlap with the global policy.
 
-            # Handle bracketed IPv6: [2001:db8::1]:443 or [2001:db8::]/32:443
-            if rule_stripped.startswith("["):
-                bracket_end = rule_stripped.find("]")
-                if bracket_end != -1:
-                    inner = rule_stripped[1:bracket_end]
-                    remainder = rule_stripped[bracket_end + 1 :]
-                    # CIDR suffix: [2001:db8::]/32 or [2001:db8::]/32:443
-                    if remainder.startswith("/"):
-                        cidr_and_rest = remainder[1:]
-                        if ":" in cidr_and_rest:
-                            cidr_str, port_str = cidr_and_rest.rsplit(":", 1)
-                            if port_str.isascii() and port_str.isdigit():
-                                port_part = int(port_str)
-                            host_part = inner + "/" + cidr_str
-                        else:
-                            host_part = inner + "/" + cidr_and_rest
-                    else:
-                        if ":" in remainder and remainder.split(":")[-1].isdigit():
-                            port_part = int(remainder.split(":")[-1])
-                        host_part = inner
-            elif ":" in rule_stripped:
-                parts = rule_stripped.rsplit(":", 1)
-                if parts[1].isascii() and parts[1].isdigit():
-                    host_part = parts[0]
-                    port_part = int(parts[1])
-
-            # Wildcard hostname rules
-            if "*" in host_part or "?" in host_part:
-                overlap = global_policy._check_wildcard_overlap(host_part, port_part)
-                if overlap == "none":
-                    logger.warning(
-                        "tethered: %s rule %r has no overlap with global policy"
-                        " — it will never match",
-                        label,
-                        rule,
-                    )
-                elif overlap == "partial":
-                    logger.warning(
-                        "tethered: %s rule %r is broader than the global policy"
-                        " — only a subset will be reachable",
-                        label,
-                        rule,
-                    )
-                continue
-
-            # CIDR rules
-            if "/" in host_part:
-                try:
-                    network = ipaddress.ip_network(host_part, strict=False)
-                    overlap = global_policy._check_cidr_overlap(network, port_part)
-                    if overlap == "none":
-                        logger.warning(
-                            "tethered: %s rule %r has no overlap with global policy"
-                            " — it will never match",
-                            label,
-                            rule,
-                        )
-                    elif overlap == "partial":
-                        logger.warning(
-                            "tethered: %s rule %r is broader than the global policy"
-                            " — only a subset will be reachable",
-                            label,
-                            rule,
-                        )
-                except ValueError:
-                    pass
-                continue
-
-            # Exact hostname/IP rules
-            if port_part is not None:
-                if global_policy.is_allowed(host_part, port_part):
-                    continue
+        Each rule is judged as ``scope_policy`` parsed it (``_parsed_rules``
+        has one entry per ``allow`` entry, in the same order); ``allow`` only
+        supplies the text the user wrote, for the message.
+        """
+        # strict=False: the two always pair up, and a warning pass is not the
+        # place to raise if they ever did not.
+        for raw, rule in zip(allow, scope_policy._parsed_rules, strict=False):
+            overlap = global_policy._check_rule_overlap(rule)
+            if overlap == "none":
                 logger.warning(
                     "tethered: %s rule %r has no overlap with global policy — it will never match",
                     label,
-                    rule,
+                    raw,
                 )
-            elif global_policy._has_any_port_rule(host_part):
-                # Global has an any-port rule for this host — full match
-                continue
-            elif global_policy.is_allowed(host_part, None):
-                # Host exists but only on specific ports — scope is broader
+            elif overlap == "partial":
                 logger.warning(
                     "tethered: %s rule %r is broader than the global policy"
                     " — only a subset will be reachable",
                     label,
-                    rule,
-                )
-            else:
-                logger.warning(
-                    "tethered: %s rule %r has no overlap with global policy — it will never match",
-                    label,
-                    rule,
+                    raw,
                 )
 
     def __enter__(self) -> scope:

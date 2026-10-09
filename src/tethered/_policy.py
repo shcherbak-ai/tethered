@@ -52,8 +52,9 @@ class _NetworkRule(NamedTuple):
     def network(self) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
         """The network as an ``ipaddress`` object, rebuilt on every access.
 
-        For serialization and tests — matching and the scope-overlap check
-        work on the integer fields and never come through here.
+        For serialization, tests and the scope-overlap check of a scope's own
+        range rule — matching works on the integer fields and never comes
+        through here.
         """
         if self.version == 4:
             return ipaddress.IPv4Network((self.net, self.prefixlen))
@@ -101,13 +102,14 @@ class AllowPolicy:
         "_host_rules",
         "_network_rule_fields",
         "_network_rules",
+        "_parsed_rules",
     )
 
     def __init__(self, allow: list[str], *, allow_localhost: bool = True) -> None:
         self._allow_localhost = allow_localhost
 
-        host_rules: list[_HostRule] = []
-        network_rules: list[_NetworkRule] = []
+        # One parsed rule per allow-list entry, in the order given.
+        parsed_rules: list[_HostRule | _NetworkRule] = []
 
         for raw in allow:
             rule = raw.strip().lower()
@@ -137,7 +139,7 @@ class AllowPolicy:
             if rule.startswith("["):
                 bracketed = _parse_bracketed_ip(rule, raw)
                 if bracketed is not None:
-                    network_rules.append(_NetworkRule.from_network(*bracketed))
+                    parsed_rules.append(_NetworkRule.from_network(*bracketed))
                     continue
 
             if _has_port_suffix(rule):
@@ -160,7 +162,7 @@ class AllowPolicy:
             # Try to parse as CIDR network or IP address
             try:
                 network = ipaddress.ip_network(rule, strict=False)
-                network_rules.append(_NetworkRule.from_network(network, port))
+                parsed_rules.append(_NetworkRule.from_network(network, port))
                 continue
             except ValueError:
                 pass
@@ -208,27 +210,36 @@ class AllowPolicy:
                 _warn_address_shaped_wildcard(raw)
 
             # It's a hostname pattern
-            host_rules.append(_HostRule(pattern=rule, port=port))
+            parsed_rules.append(_HostRule(pattern=rule, port=port))
 
         # Split exact-match hostname rules from wildcard rules for O(1) lookup.
         exact_any_port: set[str] = set()
         exact_with_port: set[tuple[str, int]] = set()
         exact_hosts_with_port: set[str] = set()
         wildcard_rules: list[_HostRule] = []
-        for rule_obj in host_rules:
-            if "*" in rule_obj.pattern or "?" in rule_obj.pattern or "[" in rule_obj.pattern:
+        network_rules: list[_NetworkRule] = []
+        for rule_obj in parsed_rules:
+            if isinstance(rule_obj, _NetworkRule):
+                network_rules.append(rule_obj)
+                continue
+            pattern, rule_port = rule_obj
+            if _is_wildcard_pattern(pattern):
                 wildcard_rules.append(rule_obj)
-            elif rule_obj.port is None:
-                exact_any_port.add(rule_obj.pattern)
+            elif rule_port is None:
+                exact_any_port.add(pattern)
             else:
-                exact_with_port.add((rule_obj.pattern, rule_obj.port))
-                exact_hosts_with_port.add(rule_obj.pattern)
+                exact_with_port.add((pattern, rule_port))
+                exact_hosts_with_port.add(pattern)
 
         self._exact_hosts_any_port: frozenset[str] = frozenset(exact_any_port)
         self._exact_hosts: frozenset[tuple[str, int]] = frozenset(exact_with_port)
         self._exact_hosts_with_port: frozenset[str] = frozenset(exact_hosts_with_port)
         self._host_rules: tuple[_HostRule, ...] = tuple(wildcard_rules)
         self._network_rules: tuple[_NetworkRule, ...] = tuple(network_rules)
+        # Every rule again, as parsed and in allow-list order.  Matching never
+        # reads this: it lets the scope-overlap check pair each rule with the
+        # text the user wrote without parsing that text a second time.
+        self._parsed_rules: tuple[_HostRule | _NetworkRule, ...] = tuple(parsed_rules)
         # Plain-tuple copies of the rule fields, which is what the matching
         # methods read.  Unpacking an exact tuple looks nothing up on the rule
         # classes, so whatever is patched onto _HostRule or _NetworkRule (a
@@ -241,9 +252,9 @@ class AllowPolicy:
             (r.version, r.net, r.mask, r.port) for r in network_rules
         )
 
-    def _has_any_port_rule(self, host: str) -> bool:
+    def _has_any_port_rule(self, host: str, *, _normalized: bool = False) -> bool:
         """Check if a host has a port-unrestricted rule (exact or wildcard or CIDR)."""
-        host_lower = _normalize_host(host)
+        host_lower = host if _normalized else _normalize_host(host)
         if host_lower in self._exact_hosts_any_port:
             return True
         for pattern, rule_port in self._host_rule_fields:
@@ -337,13 +348,62 @@ class AllowPolicy:
 
         return False
 
+    def _check_rule_overlap(self, rule: _HostRule | _NetworkRule) -> str:
+        """Check how one rule of a scope overlaps with this policy.
+
+        ``rule`` is an entry of the scope policy's ``_parsed_rules``, so it is
+        judged as ``AllowPolicy`` parsed it — the rule text is not read again.
+
+        Returns:
+            "none" — no connection can satisfy both the rule and this policy.
+            "partial" — some overlap, but the rule is broader than this policy.
+            "full" — this policy allows everything the rule allows.
+        """
+        if isinstance(rule, _NetworkRule):
+            version, net, mask, prefixlen, port = rule
+            # A network rule of this policy that contains the scope rule's
+            # network, on that rule's port or on any port, covers it.
+            for rule_version, rule_net, rule_mask, rule_port in self._network_rule_fields:
+                if (
+                    rule_version == version
+                    and rule_mask <= mask
+                    and net & rule_mask == rule_net
+                    and (rule_port is None or rule_port == port)
+                ):
+                    return "full"
+            if prefixlen < (32 if version == 4 else 128):
+                # A range that no single rule covers: partial or no overlap.
+                return self._check_cidr_overlap(rule.network, port)
+            # A single address is one destination, like an exact hostname.  A
+            # wildcard over address text ("192.0.2.*"), the localhost allowance
+            # or the IPv4 address inside an IPv4-mapped one can still allow it.
+            host = str(ipaddress.IPv4Address(net) if version == 4 else ipaddress.IPv6Address(net))
+        else:
+            host, port = rule
+            if host in self._exact_hosts_any_port or (host, port) in self._exact_hosts:
+                return "full"  # an exact host listed as it is, on that port or on any port
+            if _is_wildcard_pattern(host):
+                return self._check_wildcard_overlap(host, port)
+
+        # One destination, in the normalized form that matching compares.
+        if port is not None:
+            return "full" if self.is_allowed(host, port, _normalized=True) else "none"
+        if self._has_any_port_rule(host, _normalized=True) or (
+            self._allow_localhost and _is_localhost(host)
+        ):
+            return "full"
+        # Allowed without a port but by no any-port rule: on some ports only.
+        return "partial" if self.is_allowed(host, _normalized=True) else "none"
+
     def _check_wildcard_overlap(self, pattern: str, port: int | None) -> str:
         """Check how a wildcard scope rule overlaps with this policy.
 
         Returns:
             "none" — no connection can satisfy both (dead rule or disjoint ports).
             "partial" — some overlap but the scope is broader (on hostnames, port, or both).
-            "full" — an identical rule exists in this policy (same pattern, same port).
+            "full" — a wildcard rule of this policy is sure to cover the scope rule:
+                the same pattern, or "*" + text that the scope pattern ends with,
+                on the same port or on any port.
         """
 
         def _ports_overlap(global_port: int | None) -> bool:
@@ -354,12 +414,18 @@ class AllowPolicy:
         # Best result across all global rules: full > partial > none
         best = "none"
 
-        # Check global wildcard rules — only identical pattern+port is "full"
-        for rule in self._host_rules:
-            if rule.pattern == pattern and rule.port == port:
-                return "full"
-            if rule.pattern == pattern and _ports_overlap(rule.port):
-                best = "partial"
+        # Check global wildcard rules for one that matches every hostname of
+        # the scope rule: the same pattern, or "*" + text that the scope
+        # pattern ends with.  That is "full" on the scope rule's port or on
+        # any port, and "partial" when only the scope rule is open to all ports
+        for rule_pattern, rule_port in self._host_rule_fields:
+            if rule_pattern == pattern or (
+                pattern.endswith(rule_pattern[1:]) and _is_suffix_wildcard(rule_pattern)
+            ):
+                if rule_port is None or rule_port == port:
+                    return "full"
+                if _ports_overlap(rule_port):
+                    best = "partial"
 
         # Check exact hostnames — a wildcard matching an exact host is always
         # "partial" at best because the wildcard covers more hosts
@@ -484,6 +550,27 @@ def _is_ip_like(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_wildcard_pattern(pattern: str) -> bool:
+    """Return True for a hostname pattern that ``fnmatch`` has to match.
+
+    "*", "?" or a character set ("[seq]"); anything else is an exact hostname
+    and is looked up in a set.
+    """
+    return "*" in pattern or "?" in pattern or "[" in pattern
+
+
+def _is_suffix_wildcard(pattern: str) -> bool:
+    """Return True for "*" followed by literal text, such as "*.example.com".
+
+    Such a pattern matches exactly the hostnames that end with the text, and
+    with them every hostname of a pattern that ends with the text itself: the
+    text holds no "[" or "]", so there it cannot be the inside of a character
+    set and is literal too.
+    """
+    text = pattern[1:]
+    return pattern.startswith("*") and not _is_wildcard_pattern(text) and "]" not in text
 
 
 # An fnmatch character set: "[seq]" or "[!seq]", where a "]" directly after

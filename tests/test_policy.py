@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import logging
 
@@ -16,6 +17,8 @@ from tethered._policy import (
     _HostRule,
     _is_ip_like,
     _is_localhost,
+    _is_suffix_wildcard,
+    _is_wildcard_pattern,
     _NetworkRule,
     _normalize_host,
 )
@@ -1073,6 +1076,310 @@ class TestRuleImmutability:
             (rule,) = AllowPolicy([text])._network_rules
             assert rule.network == ipaddress.ip_network(text)
             assert _NetworkRule.from_network(rule.network, rule.port) == rule
+
+
+class TestParsedRules:
+    """``_parsed_rules`` keeps every rule as parsed: one per allow-list entry, in order."""
+
+    def test_one_entry_per_allow_list_entry_in_order(self):
+        policy = AllowPolicy(
+            [
+                "B.Example.com:443",
+                "10.0.0.0/8",
+                "*.example.com",
+                "db.internal",
+                "[::1]:53",
+                "[ab].example.com",
+                "b.example.com.:443",
+            ]
+        )
+
+        assert policy._parsed_rules == (
+            _HostRule("b.example.com", 443),
+            _NetworkRule(4, 10 << 24, 0xFF000000, 8, None),
+            _HostRule("*.example.com", None),
+            _HostRule("db.internal", None),
+            _NetworkRule(6, 1, (1 << 128) - 1, 128, 53),
+            _HostRule("[ab].example.com", None),
+            _HostRule("b.example.com", 443),
+        )
+        assert [type(rule) for rule in policy._parsed_rules] == [
+            _HostRule,
+            _NetworkRule,
+            _HostRule,
+            _HostRule,
+            _NetworkRule,
+            _HostRule,
+            _HostRule,
+        ]
+
+    def test_matching_structures_are_built_from_the_same_rules(self):
+        policy = AllowPolicy(
+            ["*.example.com:443", "api.example.com", "10.0.0.0/8", "a?.example.org", "[::1]:53"]
+        )
+        hosts = [rule for rule in policy._parsed_rules if isinstance(rule, _HostRule)]
+        networks = [rule for rule in policy._parsed_rules if isinstance(rule, _NetworkRule)]
+
+        assert tuple(r for r in hosts if _is_wildcard_pattern(r.pattern)) == policy._host_rules
+        assert tuple(networks) == policy._network_rules
+        assert {r.pattern for r in hosts if not _is_wildcard_pattern(r.pattern)} == (
+            policy._exact_hosts_any_port
+        )
+
+    def test_empty_allow_list(self):
+        assert AllowPolicy([])._parsed_rules == ()
+
+    @pytest.mark.parametrize(
+        ("pattern", "wildcard"),
+        [
+            ("*.example.com", True),
+            ("api?.example.com", True),
+            ("[ab].example.com", True),
+            ("x[!a].example.com", True),
+            ("a[b", True),
+            ("api.example.com", False),
+            ("localhost", False),
+            ("1.2.3.4.5", False),
+            ("a]b", False),
+        ],
+    )
+    def test_wildcard_patterns_are_the_ones_fnmatch_has_to_match(self, pattern, wildcard):
+        """One test decides it, for the policy's own lookup tables and the overlap check."""
+        assert _is_wildcard_pattern(pattern) is wildcard
+
+        policy = AllowPolicy([pattern])
+        assert (policy._host_rules == (_HostRule(pattern, None),)) is wildcard
+        assert (pattern in policy._exact_hosts_any_port) is not wildcard
+
+
+# Spellings that the parser reads as one and the same rule.
+_SAME_RULE_SPELLINGS = [
+    ["api.example.com", "API.Example.com", "api.example.com.", "  api.example.com  "],
+    ["api.example.com:443", "API.EXAMPLE.com.:443"],
+    ["host..", "HOST.."],
+    ["ho st:443"],  # a hostname that matching rejects is still the same rule
+    ["*.example.com", "*.EXAMPLE.com", "*.example.com."],
+    ["*.example.com:443", "*.Example.com.:443"],
+    ["api-??.example.com:443", "API-??.example.com:443"],
+    ["[ab].example.com", "[AB].example.com."],
+    ["[ab].example.com:443", "[AB].Example.com.:443"],
+    ["x[!a].example.com:443", "X[!A].example.com:443"],
+    ["192.0.2.7", "192.0.2.7/32", "[192.0.2.7]", "[192.0.2.7]/32"],
+    ["192.0.2.7:443", "[192.0.2.7]:443", "192.0.2.7/32:443", "[192.0.2.7]/32:443"],
+    [
+        "2001:db8::1",
+        "[2001:db8::1]",
+        "2001:DB8::1",
+        "2001:db8:0:0:0:0:0:1",
+        "2001:db8::1/128",
+        "[2001:db8::1]/128",
+    ],
+    ["[2001:db8::1]:443", "[2001:DB8:0::1]:443", "[2001:db8::1]/128:443"],
+    ["::1", "[::1]", "0:0:0:0:0:0:0:1"],
+    ["2001:db8::443"],
+    ["fe80::1%eth0", "fe80::1"],
+    ["198.51.100.0/24", "198.51.100.9/24", "[198.51.100.0]/24"],
+    ["198.51.100.0/24:443", "[198.51.100.0]/24:443", "198.51.100.77/24:443"],
+    ["2001:db8::/32", "[2001:db8::]/32", "2001:DB8::/32", "2001:db8:ffff::/32"],
+    ["[2001:db8::]/32:443", "[2001:DB8::]/32:443"],
+]
+
+
+class TestRuleOverlap:
+    """``_check_rule_overlap``: how one parsed rule of a scope sits inside a global policy."""
+
+    @staticmethod
+    def _overlap(global_allow, scope_rule, *, allow_localhost=False):
+        (rule,) = AllowPolicy([scope_rule])._parsed_rules
+        policy = AllowPolicy(global_allow, allow_localhost=allow_localhost)
+        return policy._check_rule_overlap(rule)
+
+    @pytest.mark.parametrize("allow_localhost", [True, False])
+    @pytest.mark.parametrize("spellings", _SAME_RULE_SPELLINGS, ids=lambda s: s[0])
+    def test_a_rule_fully_overlaps_itself_in_every_spelling(self, spellings, allow_localhost):
+        for global_rule in spellings:
+            for scope_rule in spellings:
+                overlap = self._overlap([global_rule], scope_rule, allow_localhost=allow_localhost)
+                assert overlap == "full", (global_rule, scope_rule)
+
+    @pytest.mark.parametrize(
+        ("global_allow", "scope_rule", "expected"),
+        [
+            # An exact hostname is one destination.
+            (["api.example.com"], "api.example.com:443", "full"),
+            (["api.example.com:443"], "api.example.com", "partial"),
+            (["api.example.com:443"], "api.example.com:80", "none"),
+            (["*.example.com"], "api.example.com", "full"),
+            (["*.example.com:443"], "api.example.com:443", "full"),
+            (["*.example.com:443"], "api.example.com", "partial"),
+            (["[ab]pi.example.com:443"], "api.example.com:443", "full"),
+            (["other.test"], "api.example.com", "none"),
+            (["other.test"], "api.example.com:443", "none"),
+            # "host.." is stored as "host.", which only the query "host.." reaches.
+            (["host"], "host..", "none"),
+            (["host:443"], "host..", "none"),
+            # A wildcard: the same pattern, or one that "*" + text is sure to cover.
+            (["*.example.com"], "*.example.com:443", "full"),
+            (["*.example.com:443"], "*.example.com", "partial"),
+            (["*.example.com:443"], "*.example.com:80", "none"),
+            (["*.example.com:443", "*.example.com:80"], "*.example.com:80", "full"),
+            (["*.example.com"], "*.s3.example.com", "full"),
+            (["*.example.com:443"], "*.s3.example.com:443", "full"),
+            (["*.example.com:443"], "*.s3.example.com", "partial"),
+            (["*.example.com:443"], "*.s3.example.com:80", "none"),
+            (["*.example.com"], "shard-[0-9].example.com:443", "full"),
+            (["*.example.com"], "[ab].example.com", "full"),
+            (["*.s3.example.com"], "*.example.com", "partial"),
+            (["*.example.com"], "*example.com", "partial"),
+            (["a.example.com"], "[ab].example.com", "partial"),
+            (["a.example.com:443"], "[ab].example.com", "partial"),
+            (["a.example.com:443"], "[ab].example.com:80", "none"),
+            (["other.test", "*.other.test"], "x[ab].example.com", "none"),
+            # A range: inside one network rule, on its port or on any port.
+            (["10.0.0.0/8"], "10.1.0.0/16", "full"),
+            (["10.0.0.0/8"], "10.1.0.0/16:443", "full"),
+            (["10.0.0.0/8"], "10.0.0.0/8:443", "full"),
+            (["10.0.0.0/8:443"], "10.1.0.0/16:443", "full"),
+            (["10.0.0.0/8:80", "10.0.0.0/8:443"], "10.1.0.0/16:443", "full"),
+            (["[2001:db8::]/32:443"], "[2001:db8:1::]/48:443", "full"),
+            (["10.0.0.0/8:443"], "10.0.0.0/8", "partial"),
+            (["10.0.0.0/8:443"], "10.1.0.0/16", "partial"),
+            (["10.0.0.0/24"], "10.0.0.0/8", "partial"),
+            (["10.1.0.0/16"], "10.0.0.0/8", "partial"),
+            (["10.0.0.0/8:443"], "10.1.0.0/16:80", "none"),
+            (["192.168.0.0/16"], "10.0.0.0/8", "none"),
+            (["2001:db8::/32"], "10.0.0.0/8", "none"),
+            # Another family, although every IPv4 integer lies inside ::/0.
+            (["::/0"], "10.0.0.0/8", "none"),
+            # A single address is one destination too, however it is written.
+            (["10.0.0.0/8"], "10.1.2.3", "full"),
+            (["10.0.0.0/8"], "10.1.2.3:443", "full"),
+            (["10.0.0.0/8"], "10.1.2.3/32:443", "full"),
+            (["10.0.0.0/8:443"], "10.1.2.3:443", "full"),
+            (["10.0.0.0/8:443"], "10.1.2.3", "partial"),
+            (["10.0.0.0/8:443"], "10.1.2.3/32", "partial"),
+            (["10.0.0.0/8:443"], "10.1.2.3:80", "none"),
+            (["2001:db8::/32"], "2001:db8::1", "full"),
+            (["[2001:db8::]/32:443"], "2001:db8::1", "partial"),
+            (["2001:db8::/32"], "2001:db9::1", "none"),
+            # ::a00:1 and 10.0.0.1 are the same integer.
+            (["10.0.0.0/8"], "::a00:1", "none"),
+            # Not inside a network rule, but allowed as text or as the embedded IPv4 address.
+            (["192.0.2.*"], "192.0.2.7", "full"),
+            (["192.0.2.*:443"], "192.0.2.7/32:443", "full"),
+            (["192.0.2.*:443"], "192.0.2.7", "partial"),
+            (["192.0.2.*:443"], "192.0.2.7:80", "none"),
+            (["10.0.0.0/8"], "[::ffff:10.1.2.3]:443", "full"),
+        ],
+    )
+    def test_overlap(self, global_allow, scope_rule, expected):
+        assert self._overlap(global_allow, scope_rule) == expected
+
+    @pytest.mark.parametrize(
+        "scope_rule",
+        [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "127.9.9.9",
+            "::1",
+            "[::1]:8080",
+            "0.0.0.0",
+        ],
+    )
+    def test_localhost_rule_follows_the_localhost_setting(self, scope_rule):
+        """Localhost is allowed on every port or not at all, so never "partial"."""
+        global_allow = ["api.example.com:443"]
+        assert self._overlap(global_allow, scope_rule, allow_localhost=True) == "full"
+        assert self._overlap(global_allow, scope_rule, allow_localhost=False) == "none"
+
+    def test_any_port_lookup_of_an_already_normalized_host(self):
+        policy = AllowPolicy(["host"], allow_localhost=False)
+        assert policy._has_any_port_rule("HOST.") is True
+        assert policy._has_any_port_rule("host", _normalized=True) is True
+        # Taken as given: "host." is the stored form of the rule "host..".
+        assert policy._has_any_port_rule("host.", _normalized=True) is False
+
+
+class TestWildcardUnderSuffixWildcard:
+    """A wildcard is "full" under ``*`` + text only when that is certain."""
+
+    _HOSTNAMES = (
+        "a.example.com",
+        "b.example.com",
+        "x.example.com",
+        "xa.example.com",
+        "xb.example.com",
+        "a].example.com",
+        "x.s3.example.com",
+        "api-01.example.com",
+        "badexample.com",
+        "example.com",
+        "x.example.org",
+    )
+
+    @staticmethod
+    def _overlap(outer, inner):
+        return AllowPolicy([outer], allow_localhost=False)._check_wildcard_overlap(inner, None)
+
+    @pytest.mark.parametrize("pattern", ["*.example.com", "*example.com", "*-api.example.com"])
+    def test_suffix_wildcard(self, pattern):
+        assert _is_suffix_wildcard(pattern) is True
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "?.example.com",  # no leading "*"
+            "api.*",
+            "api.example.com",
+            "?",
+            "*.example.*",  # a wildcard after the "*"
+            "**.example.com",
+            "*.[ab].example.com",  # a character set after the "*"
+            "*].example.com",  # "]" could close a character set of the other pattern
+        ],
+    )
+    def test_not_a_suffix_wildcard(self, pattern):
+        assert _is_suffix_wildcard(pattern) is False
+
+    @pytest.mark.parametrize(
+        ("outer", "inner"),
+        [
+            ("*.example.com", "*.s3.example.com"),
+            ("*.example.com", "api-??.example.com"),
+            ("*.example.com", "[ab].example.com"),
+            ("*.example.com", "x[!a].example.com"),
+            ("*example.com", "*.example.com"),
+        ],
+    )
+    def test_covered_pattern_matches_nothing_else(self, outer, inner):
+        assert self._overlap(outer, inner) == "full"
+        matched = [h for h in self._HOSTNAMES if fnmatch.fnmatchcase(h, inner)]
+        assert matched
+        assert all(fnmatch.fnmatchcase(h, outer) for h in matched)
+
+    @pytest.mark.parametrize(
+        ("outer", "inner"),
+        [
+            ("*.example.com", "*example.com"),  # also matches "badexample.com"
+            ("*.s3.example.com", "*.example.com"),
+            ("?.example.com", "a?.example.com"),
+            ("api.*", "api.example.*"),
+            ("*.example.*", "*.example.com"),
+            ("*.[ab].example.com", "x.[ab].example.com"),
+        ],
+    )
+    def test_not_reported_as_covered(self, outer, inner):
+        assert self._overlap(outer, inner) != "full"
+
+    def test_closing_bracket_in_the_text_is_refused(self):
+        """The end of the scope pattern could be the end of a character set, not that text."""
+        assert "[ab].example.com".endswith("].example.com")
+        assert fnmatch.fnmatchcase("a.example.com", "[ab].example.com")
+        assert not fnmatch.fnmatchcase("a.example.com", "*].example.com")
+
+        assert self._overlap("*].example.com", "[ab].example.com") != "full"
 
 
 class TestScopeIdStripping:

@@ -4689,14 +4689,14 @@ class TestScopeLogging:
         assert "no overlap" not in caplog.text
         assert "broader than the global policy" in caplog.text
 
-    def test_invalid_cidr_in_scope_skipped(self, caplog):
-        """Invalid CIDR-like rule in scope is skipped without error."""
+    def test_hostname_with_a_slash_is_judged_as_a_hostname(self, caplog):
+        """``not-a-cidr/99`` is no network: the parser keeps it as a hostname rule."""
         tethered.activate(allow=["api.stripe.com:443"])
 
         with caplog.at_level(logging.WARNING, logger="tethered"):
             tethered.scope(allow=["not-a-cidr/99"])
 
-        # Should not crash; the invalid rule is treated as unparseable
+        assert "'not-a-cidr/99' has no overlap with global policy" in caplog.text
 
     def test_decorator_enter_exit_logged(self, caplog):
         """DEBUG messages logged on decorator enter/exit."""
@@ -4710,6 +4710,218 @@ class TestScopeLogging:
 
         assert "entered scope(*.example.com)" in caplog.text
         assert "exited scope(*.example.com)" in caplog.text
+
+
+# One rule in two spellings that the parser reads as the same rule.
+_SAME_RULE_SPELLINGS = [
+    ("api.example.com", "api.example.com"),
+    ("api.example.com", " API.Example.com. "),
+    ("api.example.com:443", "api.example.com:443"),
+    ("api.example.com:443", "API.Example.com.:443"),
+    ("not-a-cidr/99", "not-a-cidr/99"),
+    ("*.example.com", "*.example.com"),
+    ("*.example.com", "*.EXAMPLE.com."),
+    ("*.example.com:443", "*.example.com:443"),
+    ("*.example.com:443", "*.Example.com.:443"),
+    ("api-??.example.com:443", "api-??.example.com:443"),
+    ("[ab].example.com", "[ab].example.com"),
+    ("[ab].example.com:443", "[ab].example.com:443"),
+    ("[ab].example.com:443", "[AB].Example.com.:443"),
+    ("[!a].example.com:443", "[!a].example.com:443"),
+    ("edge-[0-9].example.com", "edge-[0-9].example.com"),
+    ("edge-[0-9].example.com:443", "edge-[0-9].example.com:443"),
+    ("192.0.2.7", "192.0.2.7"),
+    ("192.0.2.7", "192.0.2.7/32"),
+    ("192.0.2.7", "[192.0.2.7]"),
+    ("192.0.2.7:443", "192.0.2.7:443"),
+    ("192.0.2.7:443", "[192.0.2.7]:443"),
+    ("192.0.2.7:443", "192.0.2.7/32:443"),
+    ("2001:db8::1", "2001:db8::1"),
+    ("2001:db8::1", "[2001:db8::1]"),
+    ("2001:db8::1", "2001:DB8:0:0:0:0:0:1"),
+    ("2001:db8::1", "2001:db8::1/128"),
+    ("2001:db8::443", "2001:db8::443"),
+    ("2001:db8::a", "2001:db8::a"),
+    ("::1", "::1"),
+    ("::1", "[::1]"),
+    ("[2001:db8::1]:443", "[2001:db8::1]:443"),
+    ("[2001:db8::1]:443", "[2001:DB8::1]/128:443"),
+    ("fe80::1%eth0", "fe80::1"),
+    ("198.51.100.0/24", "198.51.100.0/24"),
+    ("198.51.100.0/24", "198.51.100.9/24"),
+    ("198.51.100.0/24", "[198.51.100.0]/24"),
+    ("198.51.100.0/24:443", "198.51.100.0/24:443"),
+    ("198.51.100.0/24:443", "[198.51.100.0]/24:443"),
+    ("2001:db8::/32", "2001:db8::/32"),
+    ("2001:db8::/32", "[2001:db8::]/32"),
+    ("[2001:db8::]/32:443", "[2001:db8::]/32:443"),
+    ("[2001:db8::]/32:443", "[2001:DB8::]/32:443"),
+]
+
+
+class TestScopeOverlapFollowsThePolicyParser:
+    """The overlap warnings judge each scope rule as ``AllowPolicy`` parsed it.
+
+    Offline: scopes are only constructed and the log records inspected.
+    """
+
+    @staticmethod
+    def _overlap_warnings(caplog, global_allow, scope_allow, **activate_kwargs):
+        """Return ``(kind, rule text)`` for each overlap warning, in the order logged."""
+        tethered.activate(allow=global_allow, **activate_kwargs)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.scope(allow=scope_allow, label="probe")
+        found = []
+        for record in caplog.records:
+            message = record.getMessage()
+            if "has no overlap with global policy — it will never match" in message:
+                kind = "none"
+            elif "is broader than the global policy — only a subset will be reachable" in message:
+                kind = "broader"
+            else:
+                continue
+            assert record.args[0] == "probe"
+            assert repr(record.args[1]) in message
+            found.append((kind, record.args[1]))
+        return found
+
+    @pytest.mark.parametrize("swap", [False, True], ids=["as-listed", "swapped"])
+    @pytest.mark.parametrize(("first", "second"), _SAME_RULE_SPELLINGS)
+    def test_rule_identical_to_a_global_rule_is_not_reported(self, caplog, first, second, swap):
+        """For every rule kind, with and without a port, in each spelling of the rule."""
+        assert AllowPolicy([first])._parsed_rules == AllowPolicy([second])._parsed_rules
+        global_rule, scope_rule = (second, first) if swap else (first, second)
+
+        # allow_localhost=False: nothing but the rule itself can account for "::1".
+        warnings = self._overlap_warnings(
+            caplog, [global_rule], [scope_rule], allow_localhost=False
+        )
+
+        assert warnings == []
+
+    def test_leading_character_set_is_not_read_as_a_bracketed_ip(self, caplog):
+        """``[ab].example.com:443`` was read as the IP ``ab`` and reported as never matching."""
+        assert (
+            self._overlap_warnings(caplog, ["[ab].example.com:443"], ["[ab].example.com:443"]) == []
+        )
+
+    @pytest.mark.parametrize("rule", ["2001:db8::1", "::1", "2001:db8::443"])
+    def test_last_group_of_an_unbracketed_ipv6_address_is_not_a_port(self, caplog, rule):
+        assert self._overlap_warnings(caplog, [rule], [rule], allow_localhost=False) == []
+
+    def test_character_set_pattern_is_judged_as_a_wildcard(self, caplog):
+        """It covers more hostnames than the one exact host the global policy lists."""
+        assert self._overlap_warnings(
+            caplog, ["xa.example.com:443"], ["x[ab].example.com:443"]
+        ) == [("broader", "x[ab].example.com:443")]
+
+    def test_character_set_pattern_without_overlap(self, caplog):
+        assert self._overlap_warnings(caplog, ["*.stripe.com"], ["x[ab].example.com"]) == [
+            ("none", "x[ab].example.com")
+        ]
+
+    def test_warning_names_the_rule_as_the_user_wrote_it(self, caplog):
+        written = "  Dead.Example.TEST.:443 "
+        tethered.activate(allow=["api.stripe.com:443"])
+
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.scope(allow=[written])
+
+        assert f"rule {written!r} has no overlap with global policy" in caplog.text
+
+    def test_each_warning_is_paired_with_its_own_rule(self, caplog):
+        """Rules of every kind, mixed and repeated: the text follows the parsed rule."""
+        warnings = self._overlap_warnings(
+            caplog,
+            ["api.example.com:443", "10.0.0.0/8:5432"],
+            [
+                "10.9.9.9",
+                "api.example.com:443",
+                "*.dead.test",
+                " API.Example.com.:443 ",
+                "10.0.0.0/8",
+                "[10.1.0.0]/16:5432",
+                "dead.test",
+                "*.dead.test",
+            ],
+        )
+
+        assert warnings == [
+            ("broader", "10.9.9.9"),
+            ("none", "*.dead.test"),
+            ("broader", "10.0.0.0/8"),
+            ("none", "dead.test"),
+            ("none", "*.dead.test"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("global_rule", "scope_rule"),
+        [
+            ("10.0.0.0/8", "10.1.2.3:443"),
+            ("10.0.0.0/8", "10.1.2.3/32:443"),
+            ("192.0.2.*", "192.0.2.7"),
+            ("192.0.2.*", "192.0.2.7/32"),
+            ("2001:db8::/32", "[2001:db8::1]:443"),
+            ("2001:db8::/32", "[2001:db8::1]/128:443"),
+        ],
+    )
+    def test_single_address_is_judged_alike_with_and_without_a_prefix(
+        self, caplog, global_rule, scope_rule
+    ):
+        """``ADDR/32`` is the rule ``ADDR``; it used to take the CIDR path and be reported."""
+        assert self._overlap_warnings(caplog, [global_rule], [scope_rule]) == []
+
+    @pytest.mark.parametrize(
+        ("global_rule", "scope_rule"),
+        [
+            ("*.example.com", "*.example.com:443"),
+            ("10.0.0.0/8", "10.0.0.0/8:5432"),
+            ("10.0.0.0/8", "10.0.1.0/24:5432"),
+            ("2001:db8::/32", "[2001:db8:1::]/48:443"),
+        ],
+    )
+    def test_port_specific_rule_inside_an_any_port_rule_is_not_reported(
+        self, caplog, global_rule, scope_rule
+    ):
+        assert self._overlap_warnings(caplog, [global_rule], [scope_rule]) == []
+        tethered.deactivate()
+        # The other way round the scope rule is the broader one.
+        assert self._overlap_warnings(caplog, [scope_rule], [global_rule]) == [
+            ("broader", global_rule)
+        ]
+
+    @pytest.mark.parametrize(
+        ("global_rule", "scope_rule"),
+        [
+            ("*.amazonaws.com:443", "*.s3.amazonaws.com:443"),
+            ("*.amazonaws.com", "*.s3.amazonaws.com:443"),
+            ("*.example.com:443", "shard-[0-9].example.com:443"),
+            ("*.example.com", "[ab].example.com"),
+        ],
+    )
+    def test_wildcard_inside_a_suffix_wildcard_is_not_reported(
+        self, caplog, global_rule, scope_rule
+    ):
+        assert self._overlap_warnings(caplog, [global_rule], [scope_rule]) == []
+
+    def test_wildcard_inside_a_suffix_wildcard_on_other_ports(self, caplog):
+        assert self._overlap_warnings(caplog, ["*.amazonaws.com:443"], ["*.s3.amazonaws.com"]) == [
+            ("broader", "*.s3.amazonaws.com")
+        ]
+        tethered.deactivate()
+        assert self._overlap_warnings(
+            caplog, ["*.amazonaws.com:443"], ["*.s3.amazonaws.com:80"]
+        ) == [("none", "*.s3.amazonaws.com:80")]
+
+    @pytest.mark.parametrize("rule", ["localhost", "127.0.0.1", "::1"])
+    def test_localhost_rule_without_a_port(self, caplog, rule):
+        """The global policy allows localhost on every port, or not at all."""
+        assert self._overlap_warnings(caplog, ["api.stripe.com:443"], [rule]) == []
+        tethered.deactivate()
+        assert self._overlap_warnings(
+            caplog, ["api.stripe.com:443"], [rule], allow_localhost=False
+        ) == [("none", rule)]
 
 
 class TestScopeRestrictionOnly:
