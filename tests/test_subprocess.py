@@ -4110,6 +4110,48 @@ class TestLaunchesThatBypassPopen:
             policy != "allow"
         )
 
+    @pytest.mark.parametrize(
+        ("args", "described_as"),
+        [
+            pytest.param((None, '"C:\\tools\\curl.exe" evil.test', None), "C:\\tools\\curl.exe"),
+            pytest.param((None, "curl evil.test", None), "curl"),
+            # What CPython 3.10-3.14 actually deliver for the command line: a
+            # character or two of garbage.  It must not reach the log.
+            pytest.param((None, "\x03", None), "<unknown>", id="garbage-command-line"),
+            pytest.param((None, None, None), "<unknown>", id="nothing"),
+        ],
+    )
+    def test_create_process_without_an_executable_is_described_safely(self, args, described_as):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked) as exc_info:
+            _handle_subprocess(cfg, "_winapi.CreateProcess", args)
+        assert exc_info.value.description.startswith(f"_winapi.CreateProcess({described_as})")
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="_winapi exists on Windows only")
+    def test_real_create_process_event_does_not_carry_the_command_line(self):
+        """Pins the CPython behaviour the handling above is written for.
+
+        If this starts failing, CPython delivers the real command line and
+        interpreter options become visible on this route.
+        """
+        import _winapi
+
+        seen: list[tuple] = []
+
+        def record(event, args):
+            if event == "_winapi.CreateProcess":
+                seen.append(args)
+
+        sys.addaudithook(record)
+        cmdline = f'"{sys.executable}" -c pass'
+        handles = _winapi.CreateProcess(
+            sys.executable, cmdline, None, None, False, 0, None, None, None
+        )
+        _winapi.CloseHandle(handles[0])
+        _winapi.CloseHandle(handles[1])
+        assert seen[0][0] == sys.executable
+        assert seen[0][1] != cmdline
+
     @pytest.mark.parametrize("application_name", [sys.executable, None])
     def test_direct_create_process_of_python_is_a_python_launch(
         self, application_name, monkeypatch

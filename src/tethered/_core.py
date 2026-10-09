@@ -2134,6 +2134,13 @@ def _resolve_winapi_launch(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], dict
     :func:`_find_venv_launcher_env`).  For any other caller the environment
     is unknown and the launch is treated as inheriting the process
     environment.
+
+    The command line cannot be relied on either.  CPython 3.10 to 3.14 format
+    the event's ``command_line`` argument, a Python object, as a C wide
+    string, so what arrives is a character or two of garbage and not the
+    command line.  Interpreter options such as ``-S`` are therefore not
+    visible on this route: a launch is judged by its executable.  The value
+    is still passed on, so a fixed CPython is picked up without a change here.
     """
     executable, cmdline, cwd = (*args, None, None, None)[:3]
     env = None
@@ -2201,8 +2208,17 @@ def _resolve_fork_exec_launch(args: tuple[Any, ...]) -> tuple[Any, ...]:
 def _describe_launch(event: str, args: tuple[Any, ...], launch_args: tuple[Any, ...]) -> str:
     """Describe a launch for logs, covering the events without a ``subprocess.Popen`` shape."""
     if event in ("_winapi.CreateProcess", "_posixsubprocess.fork_exec"):
-        target = launch_args[0] or launch_args[1] or "<unknown>"
-        return f"{event}({_env_text(target) or target})"
+        program = _env_text(launch_args[0]) if launch_args[0] else None
+        if not program:
+            # No executable given: name the program from the command line,
+            # unless that is unusable.  CPython's _winapi.CreateProcess event
+            # does not deliver the real command line (see
+            # _resolve_winapi_launch), so never print it unchecked.
+            cmdline = launch_args[1]
+            program = _cmdline_program(cmdline) if isinstance(cmdline, str) else None
+            if not program or not program.isprintable():
+                program = "<unknown>"
+        return f"{event}({program})"
     return _describe_subprocess_launch(event, args)
 
 
