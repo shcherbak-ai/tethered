@@ -84,6 +84,13 @@ class TestNormalizeHost:
     def test_whitespace(self):
         assert _normalize_host("  api.stripe.com  ") == "api.stripe.com"
 
+    @pytest.mark.parametrize("host", ["0\r.", "host \t.", "api.stripe.com\n."])
+    def test_whitespace_before_trailing_dot(self, host):
+        """Whitespace hidden behind the trailing dot is stripped with it."""
+        result = _normalize_host(host)
+        assert result == result.strip()
+        assert not result.endswith(".")
+
     def test_trailing_dot_non_hex_hostname(self):
         assert _normalize_host("stripe.com.") == "stripe.com"
 

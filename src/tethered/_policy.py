@@ -445,7 +445,9 @@ def _normalize_host(host: str) -> str:
         h = h.translate(_FULLWIDTH_DOT_TABLE)
     # Strip exactly one trailing dot from FQDNs (e.g. "api.stripe.com." -> "api.stripe.com")
     if h.endswith(".") and not _is_ip_like(h):
-        h = h[:-1]
+        # Re-strip: the dot can hide whitespace the initial strip() could not
+        # reach ("host\r." -> "host\r").
+        h = h[:-1].rstrip()
     # Strip IPv6 scope ID (e.g. "fe80::1%eth0" -> "fe80::1")
     # Only strip when host contains ":" (IPv6 indicator) to avoid
     # truncating non-IPv6 hostnames that happen to contain "%".
