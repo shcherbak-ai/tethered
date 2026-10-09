@@ -361,12 +361,17 @@ _CONNECT_EVENTS = frozenset(
 # costs nothing on other platforms and nothing once the warning is out.
 _proactor_warning_pending: bool = sys.platform == "win32"
 
-# DNS resolution events to intercept outside getaddrinfo
+# DNS resolution events to intercept outside getaddrinfo.
+#
+# ``socket.getnameinfo`` is deliberately absent.  Its audit event carries the
+# address but not the flags, so a reverse lookup cannot be told apart from
+# purely numeric formatting (``NI_NUMERICHOST``), which needs no DNS and which
+# libraries call on every peer and local address.  Checking the event would
+# refuse those calls for any address no rule names.
 _DNS_EVENTS = frozenset(
     (
         "socket.gethostbyname",  # also raised by gethostbyname_ex()
         "socket.gethostbyaddr",
-        "socket.getnameinfo",
     )
 )
 
@@ -785,26 +790,18 @@ def _handle_dns_lookup(
     event: str,
     args: tuple[Any, ...],
 ) -> None:
-    """Intercept gethostbyname/gethostbyaddr/getnameinfo to enforce policy.
+    """Intercept gethostbyname/gethostbyaddr to enforce policy.
 
     These DNS resolution functions fire different audit events than getaddrinfo,
     so they must be intercepted separately to prevent DNS-based exfiltration.
 
     Audit event args for gethostbyname: (host,) — also raised by gethostbyname_ex
     Audit event args for gethostbyaddr: (host,)
-    Audit event args for getnameinfo: (sockaddr,) — a tuple starting with the host
-
-    ``gethostbyaddr`` and ``getnameinfo`` are reverse lookups, so an IP host is
-    checked against the policy; ``gethostbyname`` of an IP literal resolves
-    nothing and is skipped.  The event does not carry ``getnameinfo``'s flags,
-    so a purely numeric call (``NI_NUMERICHOST``) is checked like any other.
 
     The host may be ``str``, ``bytes`` or ``bytearray``.  ``None`` and empty
     hosts name the local machine and are not checked.
     """
     host = args[0]
-    if event == "socket.getnameinfo" and isinstance(host, tuple) and host:
-        host = host[0]
     if not isinstance(host, str):
         if host is None:
             return
@@ -817,7 +814,7 @@ def _handle_dns_lookup(
 
     host_lower = _normalize_host(host)
 
-    if event == "socket.gethostbyname" and _is_ip(host_lower):
+    if event != "socket.gethostbyaddr" and _is_ip(host_lower):
         return
 
     # Self-introspection short-circuit: ``socket.getfqdn()``,
