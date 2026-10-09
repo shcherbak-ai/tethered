@@ -131,7 +131,7 @@ Race-free across threads (frame-locals are per-call, not shared global state): t
 
 ## What's inherited and what isn't
 
-The child re-activates with: `allow`, `allow_localhost`, `log_only`, `fail_closed`, `external_subprocess_policy`, `locked` (with a fresh per-process token), and the active scope chain (each scope's `allow`, `allow_localhost`, `log_only`, `fail_closed`, `label`).
+The child re-activates with: `allow`, `allow_localhost`, `log_only`, `fail_closed`, `external_subprocess_policy`, `locked` (with a fresh per-process token), and the active scope chain (each scope's `allow`, `allow_localhost`, `log_only`, `fail_closed`, `label`, `hint`).
 
 Not inherited: `on_blocked` (callbacks can't cross process boundaries), the parent's exact `lock_token` (identity-compared; can't survive serialization).
 

@@ -81,7 +81,7 @@ import tethered
 tethered.activate(allow=["*.stripe.com:443"])  # too late
 ```
 
-For maximum protection, combine early activation with `locked=True` (which also propagates to spawn-mode children with their own per-process tokens and refuses launches that strip the policy env var) and, if your workload doesn't legitimately spawn subprocesses, `external_subprocess_policy="block"` to forbid them entirely.
+For maximum protection, combine early activation with `locked=True` (which also propagates to spawn-mode children with their own per-process tokens and refuses launches that strip the policy env var) and, if your workload doesn't legitimately launch external programs, `external_subprocess_policy="block"` to refuse every external launch. Python children of the same interpreter still start under `"block"`; they inherit the policy instead.
 
 ## Recommendations
 
