@@ -257,6 +257,41 @@ def _adjust_scope_count(delta: int) -> None:
         _active_scope_count = max(0, _active_scope_count + delta)
 
 
+def _push_scope(scope_cfg: _ScopeConfig) -> None:
+    """Push ``scope_cfg`` onto the current context's scope stack."""
+    _scopes.set((*_scopes.get(), scope_cfg))
+    _adjust_scope_count(1)
+
+
+def _pop_scope(scope_cfg: _ScopeConfig) -> None:
+    """Remove ``scope_cfg`` from the current context's scope stack.
+
+    Removes this scope's own entry — its last occurrence, by identity — and
+    leaves every other entry in place.  Restoring a snapshot taken at entry
+    (``ContextVar.reset``) is wrong as soon as scopes exit out of order, which
+    a generator suspended inside ``with scope():`` makes ordinary: the
+    restore would drop scopes entered since and resurrect ones already gone.
+    """
+    stack = _scopes.get()
+    for index in range(len(stack) - 1, -1, -1):
+        if stack[index] is scope_cfg:
+            _scopes.set(stack[:index] + stack[index + 1 :])
+            break
+    else:
+        # Exited in a different context from the one that entered it (a
+        # generator stepped in several contexts, an async generator closed
+        # by the event loop).  There is nothing to remove here: the entry
+        # stays with the context that holds it, which is the only place the
+        # scope was ever enforced.
+        logger.warning(
+            "tethered: %s was exited in a context that did not enter it; a scope is "
+            "enforced only in the context that entered it, so code run elsewhere "
+            "inside its block (e.g. a generator stepped across contexts) was not covered",
+            scope_cfg.label,
+        )
+    _adjust_scope_count(-1)
+
+
 def _validate_allow(allow: object) -> None:
     """Validate the ``allow`` parameter for activate() and scope()."""
     if not isinstance(allow, list):
@@ -1955,6 +1990,12 @@ class scope:
     **intersection** — a connection must be allowed by both the global
     policy and every active scope.
 
+    A scope is active in the context (thread or asyncio task) that entered
+    it, from entry until that block exits, wherever the code in between
+    runs.  In a generator, do not ``yield`` from inside a ``with scope():``
+    block: the scope would stay active in the consumer's context between
+    values.  Scope each I/O call inside the generator body instead.
+
     Args:
         allow: List of allowed destinations (same syntax as ``activate()``).
         allow_localhost: If True (default), always allow loopback addresses.
@@ -1982,7 +2023,7 @@ class scope:
             guidance.
     """
 
-    __slots__ = ("_scope_cfg", "_token")
+    __slots__ = ("_entered", "_scope_cfg")
 
     def __init__(
         self,
@@ -2015,7 +2056,7 @@ class scope:
             label=label,
             hint=normalized_hint,
         )
-        self._token: contextvars.Token[tuple[_ScopeConfig, ...]] | None = None
+        self._entered = False
 
         # Warn about dead or overly broad rules when a global policy is active
         cfg = _config
@@ -2131,13 +2172,12 @@ class scope:
                 )
 
     def __enter__(self) -> scope:
-        if self._token is not None:
+        if self._entered:
             msg = "tethered.scope: this instance is already entered; create a new scope() instance"
             raise RuntimeError(msg)
         _install_hook()
-        current = _scopes.get()
-        self._token = _scopes.set((*current, self._scope_cfg))
-        _adjust_scope_count(1)
+        _push_scope(self._scope_cfg)
+        self._entered = True
         logger.debug("tethered: entered %s", self._scope_cfg.label)
         return self
 
@@ -2147,19 +2187,20 @@ class scope:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        assert self._token is not None  # nosec B101
-        _adjust_scope_count(-1)
-        _scopes.reset(self._token)
-        self._token = None
+        self._entered = False
+        _pop_scope(self._scope_cfg)
         logger.debug("tethered: exited %s", self._scope_cfg.label)
 
     def __call__(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Use as a decorator on sync or async functions."""
         if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
             msg = (
-                "tethered.scope cannot decorate generator or async generator functions "
-                "because the scope would exit after the first yield. "
-                "Use 'with tethered.scope(allow=[...]):' inside the function body instead."
+                "tethered.scope cannot decorate generator or async generator functions: "
+                "the decorated call returns before the generator body runs, so the scope "
+                "would never cover it. Inside the generator body, wrap each I/O call in "
+                "its own 'with tethered.scope(allow=[...]):' block and do not yield from "
+                "inside one — a scope that is open across a yield stays active in the "
+                "consumer's context until the generator resumes."
             )
             raise TypeError(msg)
 
@@ -2170,15 +2211,12 @@ class scope:
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 _install_hook()
-                current = _scopes.get()
-                token = _scopes.set((*current, scope_cfg))
-                _adjust_scope_count(1)
+                _push_scope(scope_cfg)
                 logger.debug("tethered: entered %s", scope_cfg.label)
                 try:
                     return await fn(*args, **kwargs)
                 finally:
-                    _adjust_scope_count(-1)
-                    _scopes.reset(token)
+                    _pop_scope(scope_cfg)
                     logger.debug("tethered: exited %s", scope_cfg.label)
 
             return async_wrapper
@@ -2186,15 +2224,12 @@ class scope:
         @functools.wraps(fn)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             _install_hook()
-            current = _scopes.get()
-            token = _scopes.set((*current, scope_cfg))
-            _adjust_scope_count(1)
+            _push_scope(scope_cfg)
             logger.debug("tethered: entered %s", scope_cfg.label)
             try:
                 return fn(*args, **kwargs)
             finally:
-                _adjust_scope_count(-1)
-                _scopes.reset(token)
+                _pop_scope(scope_cfg)
                 logger.debug("tethered: exited %s", scope_cfg.label)
 
         return sync_wrapper

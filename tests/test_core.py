@@ -3172,6 +3172,19 @@ class TestScopeDecorator:
             async def gen():
                 yield 1
 
+    def test_generator_error_recommends_scoping_each_io_call(self):
+        """The message must not recommend wrapping the body, yields included, in one scope."""
+        with pytest.raises(TypeError) as exc_info:
+
+            @tethered.scope(allow=["*.example.com"])
+            def gen():
+                yield 1
+
+        message = str(exc_info.value)
+        assert "each I/O call" in message
+        assert "do not yield from inside one" in message
+        assert "consumer's context" in message
+
     def test_decorator_propagates_exception(self):
         """Exceptions from the decorated function propagate normally."""
 
@@ -3571,6 +3584,190 @@ class TestActiveScopeCount:
 
     def test_never_negative(self):
         _core._adjust_scope_count(-3)
+        assert _core._active_scope_count == 0
+
+
+def _labels() -> list[str]:
+    """Labels on the current context's scope stack, outermost first."""
+    return [sc.label for sc in _scopes.get()]
+
+
+def _scoped_generator(label: str):
+    """A generator that yields twice from inside a deny-all scope."""
+    with tethered.scope(allow=[], allow_localhost=False, label=label):
+        yield 1
+        yield 2
+
+
+class TestScopeExitOutOfOrder:
+    """A scope's exit removes its own entry, whatever was entered or exited since.
+
+    Scopes normally nest, but a generator suspended inside ``with scope():``
+    exits whenever its consumer resumes it.  Exit used to restore the stack
+    snapshot taken at entry, which deleted scopes entered in between and
+    resurrected ones that had already exited.
+    """
+
+    def test_generator_exit_keeps_the_callers_scope(self):
+        gen = _scoped_generator("GEN")
+        assert next(gen) == 1
+        # Inherent to generators and context variables: between yields the
+        # scope sits on the consumer's stack.
+        assert _labels() == ["GEN"]
+
+        with tethered.scope(allow=[], allow_localhost=False, label="CALLER"):
+            assert list(gen) == [2]  # GEN exits here, before CALLER
+            assert _labels() == ["CALLER"]
+            with pytest.raises(tethered.EgressBlocked) as exc_info:
+                _audit_hook("socket.connect", (None, ("127.0.0.1", 9)))
+            assert exc_info.value.scope_label == "CALLER"
+
+        # ... and GEN does not come back when CALLER's block ends.
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_generator_exit_keeps_the_callers_scope_real_socket(self, tcp_listener):
+        gen = _scoped_generator("GEN")
+        next(gen)
+        with tethered.scope(allow=[], allow_localhost=False, label="CALLER"):
+            list(gen)
+            with (
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client,
+                pytest.raises(tethered.EgressBlocked) as exc_info,
+            ):
+                client.connect(("127.0.0.1", tcp_listener))
+        assert exc_info.value.scope_label == "CALLER"
+        assert _labels() == []
+
+    def test_closing_a_suspended_generator_removes_its_scope(self):
+        gen = _scoped_generator("GEN")
+        next(gen)
+        assert _labels() == ["GEN"]
+        gen.close()
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_interleaved_generators(self):
+        first, second = _scoped_generator("FIRST"), _scoped_generator("SECOND")
+        next(first)
+        next(second)
+        assert _labels() == ["FIRST", "SECOND"]
+        first.close()  # not the innermost entry
+        assert _labels() == ["SECOND"]
+        second.close()
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_in_order_nesting_is_unchanged(self):
+        with tethered.scope(allow=[], label="OUTER"):
+            with tethered.scope(allow=[], label="INNER"):
+                assert _labels() == ["OUTER", "INNER"]
+            assert _labels() == ["OUTER"]
+        assert _labels() == []
+
+    def test_sync_decorator_exit_keeps_a_scope_entered_inside_the_call(self):
+        gen = _scoped_generator("GEN")
+
+        @tethered.scope(allow=[], label="DECORATED")
+        def start() -> list[str]:
+            next(gen)
+            return _labels()
+
+        assert start() == ["DECORATED", "GEN"]
+        assert _labels() == ["GEN"]  # the generator is still inside its scope
+        gen.close()
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_sync_decorator_survives_an_exit_from_under_it(self):
+        gen = _scoped_generator("GEN")
+        next(gen)
+
+        @tethered.scope(allow=[], label="DECORATED")
+        def finish() -> list[str]:
+            gen.close()  # removes GEN from below DECORATED
+            return _labels()
+
+        assert finish() == ["DECORATED"]
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_async_decorator_exits_out_of_order(self):
+        async def main() -> tuple[list[str], list[str], list[str]]:
+            gen = _scoped_generator("GEN")
+
+            @tethered.scope(allow=[], label="DECORATED")
+            async def start() -> list[str]:
+                next(gen)
+                return _labels()
+
+            inside = await start()
+            after = _labels()
+            gen.close()
+            return inside, after, _labels()
+
+        assert asyncio.run(main()) == (["DECORATED", "GEN"], ["GEN"], [])
+        assert _core._active_scope_count == 0
+
+    def test_recursive_decorated_call_removes_one_entry_per_exit(self):
+        depths: list[int] = []
+
+        @tethered.scope(allow=[], label="RECURSIVE")
+        def descend(n: int) -> None:
+            depths.append(len(_scopes.get()))
+            if n:
+                descend(n - 1)
+            assert len(_scopes.get()) == depths[-1 - n]
+
+        descend(2)
+        assert depths == [1, 2, 3]
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+
+    def test_exit_in_another_context_warns_and_keeps_the_count_consistent(self, caplog):
+        """A scope entered in one context and exited in another has nothing to remove."""
+        outer = tethered.scope(allow=[], label="MINE")
+        stray = tethered.scope(allow=[], label="STRAY")
+        other_context = contextvars.copy_context()
+        other_context.run(stray.__enter__)
+        assert _core._active_scope_count == 1
+
+        with outer, caplog.at_level(logging.WARNING, logger="tethered"):
+            stray.__exit__(None, None, None)  # this context never entered it
+            assert _labels() == ["MINE"]  # nobody else's entry was touched
+        assert "STRAY was exited in a context that did not enter it" in caplog.text
+        assert _labels() == []
+        assert _core._active_scope_count == 0
+        # The entry stays with the context that holds it.
+        assert [sc.label for sc in other_context[_scopes]] == ["STRAY"]
+
+    def test_instance_can_be_entered_again_after_exit(self):
+        s = tethered.scope(allow=[], label="REUSED")
+        for _ in range(2):
+            with s:
+                assert _labels() == ["REUSED"]
+            assert _labels() == []
+
+    def test_one_instance_shared_by_threads_leaves_no_entries_behind(self):
+        """Contending threads may be refused entry, but none keeps a stale entry."""
+        shared = tethered.scope(allow=[], label="SHARED")
+        leftovers: list[list[str]] = []
+
+        def churn():
+            for _ in range(300):
+                try:
+                    with shared:
+                        pass
+                except RuntimeError:  # "already entered" — another thread is inside
+                    pass
+            leftovers.append(_labels())
+
+        workers = [threading.Thread(target=churn) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+        assert leftovers == [[]] * 8
         assert _core._active_scope_count == 0
 
 
