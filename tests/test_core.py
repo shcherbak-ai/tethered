@@ -3810,6 +3810,10 @@ class TestUvloopWarning:
     never needed here: a stand-in module in ``sys.modules`` is what the check
     looks for.  (The flag starts clear on Windows, where uvloop does not
     exist; the tests set it.)
+
+    Only a log-only policy and a scope without a policy get as far as this
+    warning: every other policy is refused over a loaded uvloop, and keeps
+    it from loading afterwards (``TestUvloopRefusal``).
     """
 
     @pytest.fixture
@@ -3819,12 +3823,12 @@ class TestUvloopWarning:
 
     def test_activate_warns_once(self, uvloop_loaded, caplog):
         with caplog.at_level(logging.WARNING, logger="tethered"):
-            tethered.activate(allow=["*.example.com"])
-            tethered.activate(allow=["*.example.org"])
+            tethered.activate(allow=["*.example.com"], log_only=True)
+            tethered.activate(allow=["*.example.org"], log_only=True)
         (message,) = _uvloop_warnings(caplog)
         assert "raises no audit event" in message
         assert "neither blocked nor reported" in message
-        assert "under a locked policy and inside a scope() as well" in message
+        assert "by a log-only policy and inside a scope() alike" in message
         assert "uvicorn: --loop asyncio" in message
         assert _core._uvloop_warning_pending is False
 
@@ -3837,7 +3841,7 @@ class TestUvloopWarning:
         monkeypatch.setattr(_core, "_uvloop_warning_pending", True)
         monkeypatch.delitem(sys.modules, "uvloop", raising=False)
         with caplog.at_level(logging.WARNING, logger="tethered"):
-            tethered.activate(allow=["*.example.com"])
+            tethered.activate(allow=["*.example.com"], log_only=True)
             _audit_hook(*_NEW_SOCKET_EVENT)
             assert _uvloop_warnings(caplog) == []
             assert _core._uvloop_warning_pending is True  # still to be checked later
@@ -3883,9 +3887,11 @@ class TestUvloopRefusal:
     servers that prefer uvloop take it only if that import works and run on
     the standard asyncio event loop otherwise, which is where a policy is
     enforced; code that asks for uvloop by name fails with the reason.  A
-    uvloop that was loaded first cannot be taken away again: a ``locked`` or
-    ``fail_closed`` policy is then not activated, and any other policy is,
-    with the warning ``TestUvloopWarning`` covers.
+    uvloop that was loaded first cannot be taken away again, so ``activate()``
+    then refuses, as it does when its hook cannot be installed: the policy
+    would not be applied.  A log-only policy refuses nothing, neither the
+    import nor the activation, and gets the warning ``TestUvloopWarning``
+    covers.
 
     uvloop itself is not installed here.  The stand-in is a package of the
     same shape: an ``__init__`` that imports its ``loop`` module.
@@ -3962,11 +3968,11 @@ class TestUvloopRefusal:
         tethered.deactivate()
         assert __import__("uvloop").Loop is not None
 
-    def test_a_uvloop_that_is_loaded_keeps_importing_its_own_modules(self, uvloop_on_path):
-        __import__("uvloop")
+    def test_only_the_package_and_its_loop_module_are_refused(self, uvloop_on_path):
+        """Its other modules raise events too; refusing those would add nothing."""
         tethered.activate(allow=["*.example.com"])
-        assert importlib.import_module("uvloop.extra").VALUE == 1
-        assert __import__("uvloop").Loop is not None  # no event: it is in sys.modules
+        for name in ("uvloop.includes", "uvloop._version", "uvloop.extra", "uvloopy"):
+            _audit_hook("import", (name, None, None, None, None))
 
     def test_other_imports_and_odd_import_events_pass(self, uvloop_on_path, tmp_path):
         (tmp_path / "not_uvloop_at_all.py").write_text("VALUE = 2\n", encoding="utf-8")
@@ -3979,32 +3985,42 @@ class TestUvloopRefusal:
         _audit_hook("import", (None, None, None, None, None))
         _audit_hook("import", (b"uvloop", None, None, None, None))
 
-    @pytest.mark.parametrize("strict", [{"fail_closed": True}, {"locked": True}])
-    def test_a_strict_policy_is_not_activated_over_uvloop(self, uvloop_loaded, strict):
-        if "locked" in strict:
-            strict = {**strict, "lock_token": object()}
-        with pytest.raises(RuntimeError, match=r"activate\(\) refused — uvloop is loaded") as exc:
-            tethered.activate(allow=["*.example.com"], **strict)
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{}, {"fail_closed": True}, {"locked": True}, {"external_subprocess_policy": "block"}],
+        ids=["plain", "fail_closed", "locked", "block"],
+    )
+    def test_no_enforcing_policy_is_activated_over_uvloop(self, uvloop_loaded, kwargs, caplog):
+        if "locked" in kwargs:
+            kwargs = {**kwargs, "lock_token": object()}
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(RuntimeError, match=r"activate\(\) refused — uvloop is loaded") as exc,
+        ):
+            tethered.activate(allow=["*.example.com"], **kwargs)
         assert "--loop asyncio" in str(exc.value)
+        assert "before uvloop is imported" in str(exc.value)
         assert _core._config is None
         assert _core._CHILD_POLICY_ENV not in os.environ
+        assert _uvloop_warnings(caplog) == []  # refused, not warned about
 
-    def test_a_refused_strict_policy_leaves_the_active_one_in_place(self, uvloop_loaded):
-        tethered.activate(allow=["*.example.com"])
+    def test_a_refused_policy_leaves_the_active_one_in_place(self, uvloop_loaded):
+        tethered.activate(allow=["*.example.com"], log_only=True)
         before = _core._config
         published = os.environ[_core._CHILD_POLICY_ENV]
         with pytest.raises(RuntimeError, match="uvloop is loaded"):
-            tethered.activate(allow=["*.example.org"], fail_closed=True)
+            tethered.activate(allow=["*.example.org"])
         assert _core._config is before
         assert os.environ[_core._CHILD_POLICY_ENV] == published
 
-    def test_a_strict_log_only_policy_is_activated_with_the_warning(self, uvloop_loaded, caplog):
+    @pytest.mark.parametrize("kwargs", [{}, {"fail_closed": True}], ids=["plain", "fail_closed"])
+    def test_a_log_only_policy_is_activated_with_the_warning(self, uvloop_loaded, kwargs, caplog):
         with caplog.at_level(logging.WARNING, logger="tethered"):
-            tethered.activate(allow=["*.example.com"], fail_closed=True, log_only=True)
+            tethered.activate(allow=["*.example.com"], log_only=True, **kwargs)
         assert _core._config is not None
         assert len(_uvloop_warnings(caplog)) == 1
 
-    def test_a_strict_policy_is_activated_when_uvloop_is_not_loaded(self, monkeypatch):
+    def test_a_policy_is_activated_when_uvloop_is_not_loaded(self, monkeypatch):
         monkeypatch.delitem(sys.modules, "uvloop", raising=False)
         tethered.activate(allow=["*.example.com"], fail_closed=True)
         assert _core._config is not None

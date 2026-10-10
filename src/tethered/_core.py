@@ -532,14 +532,14 @@ _UVLOOP_IMPORT_REFUSED_MSG = (
     "error."
 )
 
-_UVLOOP_STRICT_MSG = (
+_UVLOOP_LOADED_MSG = (
     "tethered: activate() refused — uvloop is loaded in this process. A uvloop event loop "
     "does its networking outside Python's socket module and raises no audit event, so the "
     "policy would not be applied to the connections, name lookups, datagrams and process "
-    "launches made through it, and locked=True / fail_closed=True ask for a policy that "
-    "is applied or nothing. Nothing was changed. Run the application on the standard "
+    "launches made through it. Nothing was changed. Run the application on the standard "
     "asyncio event loop (uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the "
-    "environment)."
+    "environment), or call activate() before uvloop is imported: it is then kept from "
+    "loading, and a server that chooses it automatically falls back on its own."
 )
 
 # DNS resolution events to intercept outside getaddrinfo.
@@ -896,13 +896,14 @@ def _warn_if_proactor_loop() -> None:
 def _warn_if_uvloop() -> None:
     """Warn, once, that what goes through a uvloop event loop is not seen.
 
-    Called when a policy is activated, when a scope is entered, and for a
-    ``socket.__new__`` event while either is active.  uvloop is the loop
-    uvicorn picks whenever it is installed, and under it a policy, locked
-    or not, is silently not applied to anything the loop itself does:
-    there is no audit event for tethered to act on, and an audit hook
-    cannot add one.  The gap cannot be closed here, so it is at least made
-    visible.
+    For the two cases in which tethered works next to a loaded uvloop: a
+    log-only policy, which refuses nothing (``activate()`` refuses every
+    other policy, and no uvloop is loaded while one is active), and a
+    ``scope()`` with no policy under it.  Called when a log-only policy is
+    activated, when a scope is entered, and for a ``socket.__new__`` event
+    while either is active.  Nothing the loop itself does raises an audit
+    event for tethered to act on, and an audit hook cannot add one, so what
+    would have been reported or refused is at least said to be missing.
 
     uvloop is looked up in ``sys.modules``, never imported.  That it is
     loaded is taken as the sign that it is in use: servers import it only
@@ -917,9 +918,9 @@ def _warn_if_uvloop() -> None:
         "tethered: uvloop is loaded in this process. A uvloop event loop does its "
         "networking outside Python's socket module and raises no audit event, so "
         "tethered sees none of the connections, name lookups, datagrams and process "
-        "launches made through it: they are neither blocked nor reported, under a "
-        "locked policy and inside a scope() as well. Run the application on the "
-        "standard asyncio event loop for enforcement (uvicorn: --loop asyncio)."
+        "launches made through it: they are neither blocked nor reported, by a "
+        "log-only policy and inside a scope() alike. Run the application on the "
+        "standard asyncio event loop (uvicorn: --loop asyncio)."
     )
 
 
@@ -939,8 +940,8 @@ def _refuse_uvloop_import() -> None:
     This is a guard against a deployment that would silently not be
     enforced, not a barrier to code that is out to get around tethered:
     such code can load any other extension that does its own networking.
-    A uvloop that is already loaded is the business of ``activate()``
-    (``_UVLOOP_STRICT_MSG``) and of ``_warn_if_uvloop``.
+    A uvloop that is already loaded is the business of ``activate()``,
+    which refuses (``_UVLOOP_LOADED_MSG``), and of ``_warn_if_uvloop``.
     """
     global _uvloop_refusal_unlogged
     if _uvloop_refusal_unlogged:
@@ -3324,11 +3325,11 @@ def activate(
             it (a hook that raises ``RuntimeError`` for the
             ``sys.addaudithook`` event makes Python drop a new hook without
             reporting an error): nothing would be enforced, so nothing is
-            activated.  Also if ``locked`` or ``fail_closed`` is set, without
-            ``log_only``, while uvloop is loaded in the process: nothing that
-            goes through a uvloop event loop raises an audit event, so the
-            policy would not be applied to it (any other policy is
-            activated, with a warning).  Also if the call is made from inside an
+            activated.  Also if uvloop is loaded in the process and
+            ``log_only`` is not set: nothing that goes through a uvloop
+            event loop raises an audit event, so the policy would not be
+            applied to it (a log-only policy is activated, with a
+            warning).  Also if the call is made from inside an
             ``activate()`` or ``deactivate()`` that the same thread is
             running in another interpreter of the process (waiting for
             that one would never end), or if another thread is in the
@@ -3409,11 +3410,14 @@ def activate(
         _local_hostname=local_hostname,
     )
 
-    # A policy that asks to be applied or nothing is not put in place over an
-    # event loop it would not be applied to.  Any other policy is, with a
-    # warning; a log-only policy refuses nothing, this included.
-    if (locked or fail_closed) and not log_only and "uvloop" in sys.modules:
-        raise RuntimeError(_UVLOOP_STRICT_MSG)
+    # A policy is not put in place over an event loop it would not be applied
+    # to.  A uvloop that is loaded cannot be taken away again, so the call is
+    # refused, as it is when the audit hook cannot be installed (while a
+    # policy is active uvloop is not loaded in the first place: see
+    # _refuse_uvloop_import).  A log-only policy refuses nothing, this
+    # included, and gets the warning.
+    if not log_only and "uvloop" in sys.modules:
+        raise RuntimeError(_UVLOOP_LOADED_MSG)
     if _uvloop_warning_pending:
         _warn_if_uvloop()
 
