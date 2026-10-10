@@ -20,11 +20,15 @@ raised by a ``.pth`` line, so anything else would let the workload run
 unprotected).
 
 A subinterpreter runs this module too, with the environment of the process
-it lives in.  A lock exists once per process — the C guardian holds it for
-the interpreter that took it and refuses every other interpreter the
-guarded operations — so a subinterpreter that inherits a ``locked`` policy
-enforces the same policy unlocked instead of refusing to start (see
-:func:`_establish_unlocked`).
+it lives in.  A lock exists once per process: the C guardian holds it for
+the interpreter that took it.  A subinterpreter that starts while a policy
+is locked joins that lock — it gets a locked, pinned copy of the policy,
+built from the guardian's own record of it and not from the variable (see
+:func:`_join_locked_policy`).  One that cannot join starts all the same and
+is refused the guarded operations by the guardian for as long as the lock
+is held.  Where no lock is active, a subinterpreter that inherits a
+``locked`` policy enforces the same policy unlocked instead of refusing to
+start (see :func:`_establish_unlocked`).
 """
 
 from __future__ import annotations
@@ -117,13 +121,21 @@ def _autoactivate_from_env() -> None:
     part.  A value that is not a JSON object at all cannot ask for anything
     and is logged and ignored.
 
-    In a subinterpreter a ``locked`` global is established unlocked, since
-    the lock exists once per process (:func:`_establish_unlocked`); every
-    other strict failure terminates its startup as well.
+    In a subinterpreter of a process in which a policy is locked, the
+    global policy does not come from the variable at all: the interpreter
+    joins the lock (:func:`_join_locked_policy`) and only ``scopes`` is read
+    from the variable.  Where no lock is active, a ``locked`` global is
+    established unlocked in a subinterpreter, since the lock exists once
+    per process (:func:`_establish_unlocked`).  Every other strict failure
+    terminates a subinterpreter's startup as well.
     """
     raw = os.environ.get("_TETHERED_CHILD_POLICY")
     if raw is None:
         return
+
+    # Before the variable is read: what a locked process enforces is not
+    # for the variable to say.
+    joined = _join_locked_policy()
 
     try:
         payload = json.loads(raw)
@@ -137,19 +149,73 @@ def _autoactivate_from_env() -> None:
 
     # Read leniently: anything but an explicit ``false`` counts as asking, so
     # a mistyped flag (``"locked": 1``) cannot downgrade the failure mode.
+    # The policy that was joined is a locked one whatever the variable says.
     global_payload = payload.get("global")
-    strict = isinstance(global_payload, dict) and not (
-        global_payload.get("locked", False) is False
-        and global_payload.get("fail_closed", False) is False
+    strict = joined or (
+        isinstance(global_payload, dict)
+        and not (
+            global_payload.get("locked", False) is False
+            and global_payload.get("fail_closed", False) is False
+        )
     )
     try:
-        _apply_inherited_policy(payload, strict)
+        _apply_inherited_policy(payload, strict, joined)
     except Exception as e:
         _fail("auto-activation failed", f"{type(e).__name__}: {e}", strict)
 
 
-def _apply_inherited_policy(payload: dict, strict: bool) -> None:
-    """Validate and apply the inherited ``global`` and ``scopes``."""
+def _join_locked_policy() -> bool:
+    """Join the policy that is locked in this process, if one is.  Return True if joined.
+
+    The lock is taken by one interpreter and binds all of them.  An
+    interpreter that starts while it is held — this one, if the guardian
+    reports a locked payload — gets a locked copy of that policy, pinned by
+    the guardian like the owner's, through :func:`tethered._core._join_locked`.
+    The policy is the guardian's record of it: the variable is not
+    consulted, so nothing that was done to it changes what is enforced
+    here.
+
+    A join that fails must not stop the interpreter from starting (up to
+    Python 3.12 that would end the whole process): the failure is logged
+    and startup continues.  The guardian then refuses this interpreter the
+    guarded operations for as long as the lock is held.
+
+    Nothing is joined when no policy is locked, when the C extension cannot
+    be loaded here, or when a policy is already in place (a state copied by
+    ``fork()``).
+    """
+    try:
+        import tethered._core as _core
+
+        guardian = _core._c_guardian
+        payload = (
+            None if guardian is None or _core._config is not None else guardian.locked_payload()
+        )
+    except Exception:
+        # (_apply_inherited_policy() meets the same failure and reports it.)
+        return False
+    if payload is None:
+        return False
+    try:
+        _core._join_locked(payload)
+    except Exception as e:
+        logger.warning(
+            "tethered: this interpreter could not join the locked policy of its process "
+            "(%s: %s) — while that lock is held it gets no network access and no "
+            "process launches",
+            type(e).__name__,
+            e,
+        )
+        return False
+    return True
+
+
+def _apply_inherited_policy(payload: dict, strict: bool, joined: bool = False) -> None:
+    """Validate and apply the inherited ``global`` and ``scopes``.
+
+    ``joined`` — the interpreter has joined the locked policy of its
+    process, which is its global policy; only ``scopes`` is applied.
+    """
     # Late imports — keep the no-policy path cheap (just an env-var lookup)
     # and avoid pulling tethered._core in if the user didn't want tethered.
     import tethered
@@ -157,7 +223,7 @@ def _apply_inherited_policy(payload: dict, strict: bool) -> None:
 
     # Idempotent: fork-spawned children already have tethered active via
     # process-state copy.  Don't re-activate over an existing policy.
-    if _core._config is not None:
+    if _core._config is not None and not joined:
         return
 
     if strict:
@@ -165,7 +231,7 @@ def _apply_inherited_policy(payload: dict, strict: bool) -> None:
             if key not in ("global", "scopes"):
                 _fail("malformed _TETHERED_CHILD_POLICY", f"unknown field {key!r}", strict)
 
-    global_payload = payload.get("global")
+    global_payload = None if joined else payload.get("global")
     if global_payload is not None:
         problem = _schema_problem(global_payload, _GLOBAL_FIELDS, "global", strict)
         if problem is None and "allow" not in global_payload:

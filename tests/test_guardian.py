@@ -2641,6 +2641,8 @@ class TestJoinIsNotForTheOwner:
             assert str(excinfo.value) == (
                 _CANNOT_JOIN + "this interpreter is the one that holds the lock"
             )
+        with pytest.raises(RuntimeError, match="holds the lock"):
+            _core._join_locked(guardian.locked_payload())
 
         # Nothing moved: the same config, intact, still the token's to release.
         assert _core._config is held

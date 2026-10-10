@@ -3283,6 +3283,83 @@ def deactivate(*, lock_token: object | None = None) -> None:
     logger.info("tethered: deactivated")
 
 
+def _join_locked(payload: str) -> None:
+    """Join this interpreter to the policy another interpreter of the process has locked.
+
+    For the ``tethered.pth`` bootstrap of an interpreter that is created
+    while a policy is locked.  A lock exists once per process, and so does
+    its token: such an interpreter cannot take the lock, it joins it.  It
+    then holds a ``locked`` config of its own, pinned by an integrity
+    snapshot of its own modules, and the C guardian verifies its guarded
+    events as it does the owner's.  The guardian accepts a join only while
+    the interpreter starts — before anything but its startup files has run
+    in it — and only once.
+
+    ``payload`` is the guardian's own copy of the locked policy's serialized
+    payload (``_c_guardian.locked_payload()``), not the value of
+    ``_TETHERED_CHILD_POLICY``, which code in the process can change.  The
+    policy is rebuilt from it with the functions :func:`activate` uses; the
+    guardian then compares the rebuilt ``_serialized_payload`` with its
+    copy, byte for byte, so a payload this code would read differently is
+    refused, never approximated.
+
+    Nothing is published: the variable is one for the whole process and
+    already carries the payload.  No token is involved: the lock stays the
+    owning interpreter's to replace or release, and ``on_blocked`` does not
+    cross interpreters.
+
+    Raises ``RuntimeError`` when the guardian refuses the join, and
+    ``TypeError`` / ``ValueError`` / ``KeyError`` for a payload that is not
+    that of a locked policy.  ``_config`` is bound only by a successful join.
+    """
+    if _c_guardian is None:
+        msg = "tethered: joining a locked policy requires the C guardian extension"
+        raise RuntimeError(msg)
+
+    fields = json.loads(payload)["global"]
+    allow = fields["allow"]
+    external_subprocess_policy = fields["external_subprocess_policy"]
+    flags = {
+        name: fields[name] for name in ("allow_localhost", "log_only", "fail_closed", "locked")
+    }
+    _validate_allow(allow)
+    for name, value in flags.items():
+        _validate_bool(value, name)
+    if not flags["locked"] or external_subprocess_policy not in _EXTERNAL_SUBPROCESS_POLICIES:
+        msg = "tethered: the payload to join is not that of a locked policy"
+        raise ValueError(msg)
+
+    policy = AllowPolicy(allow, allow_localhost=flags["allow_localhost"])
+    global_payload_dict = _build_global_payload_dict(
+        policy,
+        log_only=flags["log_only"],
+        fail_closed=flags["fail_closed"],
+        external_subprocess_policy=external_subprocess_policy,
+        locked=True,
+    )
+    cfg = _Config(
+        policy=policy,
+        log_only=flags["log_only"],
+        fail_closed=flags["fail_closed"],
+        locked=True,
+        external_subprocess_policy=external_subprocess_policy,
+        _serialized_payload=_build_env_payload(global_payload_dict, ()),
+        _global_payload_dict=global_payload_dict,
+        _pth_path=_compute_pth_path(),
+        _local_hostname=_capture_local_hostname(),
+    )
+    with _lifecycle_lock:
+        _install_hook()
+        # The guardian binds _config itself, in one step with its own state
+        # (see activate()).
+        _c_guardian.join(globals(), cfg, _build_integrity_snapshot(cfg))
+    logger.info(
+        "tethered: joined the locked policy of this process with %d rules (log_only=%s)",
+        len(allow),
+        cfg.log_only,
+    )
+
+
 def _restore_policy_env(previous: _Config | None, previous_env: str | None) -> None:
     """Put ``_TETHERED_CHILD_POLICY`` back after a transition that did not commit.
 

@@ -1156,3 +1156,467 @@ class TestLockedPayloadInASubinterpreter:
         assert asked == [True]
         assert _core._config.locked is True
         assert _core._c_guardian.is_active() is True
+
+
+class _LockHeldElsewhere:
+    """Stands in for the C guardian of a process in which another interpreter holds the lock.
+
+    The real guardian accepts a join only from an interpreter that is still
+    starting, which the main interpreter of a test run never is; and code
+    that runs in a real subinterpreter is invisible to coverage.  So the
+    Python side of a join is run here, against this: ``join()`` does what
+    the real one does on success (it binds ``_config`` itself) or refuses
+    with ``refusal``.  ``test_subinterpreters.py`` joins for real.
+    """
+
+    def __init__(self, payload: str | None, *, refusal: str | None = None) -> None:
+        self._payload = payload
+        self._refusal = refusal
+        self.joins: list[tuple[dict, object, list]] = []
+
+    def is_active(self) -> bool:
+        return self._payload is not None
+
+    def locked_payload(self) -> str | None:
+        return self._payload
+
+    def join(self, namespace: dict, config: object, snapshot: list) -> None:
+        self.joins.append((namespace, config, snapshot))
+        if self._refusal is not None:
+            raise RuntimeError(self._refusal)
+        namespace["_config"] = config
+
+    def check_token(self, token: object) -> bool:
+        return False  # no interpreter but the owner holds the token
+
+    def verify(self) -> bool:
+        return True
+
+
+def _locked_payload_of(**policy: object) -> str:
+    """The payload the guardian holds for a policy: what ``activate()`` serializes for it."""
+    token = object()
+    tethered.activate(**policy, locked=True, lock_token=token)
+    payload = _core._config._serialized_payload
+    tethered.deactivate(lock_token=token)
+    assert _core._config is None
+    return payload
+
+
+_JOINED_POLICY = {
+    "allow": ["*.example.com", "10.0.0.0/8:5432", "db.internal"],
+    "allow_localhost": False,
+    "fail_closed": True,
+    "external_subprocess_policy": "block",
+}
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestJoinLocked:
+    """``_core._join_locked()``: the policy an interpreter offers the guardian when it joins."""
+
+    @pytest.fixture
+    def elsewhere(self, monkeypatch):
+        """A lock on ``_JOINED_POLICY`` held by another interpreter; returns the stand-in."""
+        stand_in = _LockHeldElsewhere(_locked_payload_of(**_JOINED_POLICY))
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        return stand_in
+
+    def test_it_offers_a_locked_copy_of_the_policy(self, elsewhere, caplog):
+        payload = elsewhere.locked_payload()
+        with caplog.at_level(logging.INFO, logger="tethered"):
+            _core._join_locked(payload)
+
+        ((namespace, offered, snapshot),) = elsewhere.joins
+        cfg = _core._config
+        assert cfg is offered  # bound by the guardian, in its own commit
+        assert namespace is vars(_core)
+        assert cfg.locked is True
+        assert cfg.fail_closed is True
+        assert cfg.log_only is False
+        assert cfg.external_subprocess_policy == "block"
+        assert cfg.on_blocked is None  # callbacks do not cross interpreters
+        assert cfg.policy._allow_localhost is False
+        assert cfg.policy.is_allowed("api.example.com", 443)
+        assert cfg.policy.is_allowed("10.1.2.3", 5432)
+        assert not cfg.policy.is_allowed("evil.test", 443)
+        # What the guardian compares with its own copy, byte for byte.
+        assert cfg._serialized_payload == payload
+        # The snapshot pins this very config and its policy.
+        assert (cfg, "__class__", _core._PIN_TYPE) in snapshot
+        assert (cfg.policy, "__class__", _core._PIN_TYPE) in snapshot
+        assert (vars(_core), "_join_locked", _core._PIN_ITEM) in snapshot
+        assert _core._hook_installed is True
+        assert [r.getMessage() for r in caplog.records if "joined" in r.getMessage()] == [
+            "tethered: joined the locked policy of this process with 3 rules (log_only=False)"
+        ]
+
+    def test_the_policy_is_enforced(self, elsewhere):
+        _core._join_locked(elsewhere.locked_payload())
+        with pytest.raises(tethered.EgressBlocked, match="is not in the allow list"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        sys.audit("socket.connect", None, ("10.1.2.3", 5432))
+        # No token exists here: the lock is not this interpreter's to give up.
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.deactivate()
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.activate(allow=["0.0.0.0/0"])
+        assert _core._config.locked is True
+
+    def test_nothing_is_published(self, elsewhere, monkeypatch):
+        """The variable is the whole process's, and the owner has written it."""
+        monkeypatch.setenv(_CHILD_POLICY_ENV, "left as it was")
+        _core._join_locked(elsewhere.locked_payload())
+        assert os.environ[_CHILD_POLICY_ENV] == "left as it was"
+        monkeypatch.delenv(_CHILD_POLICY_ENV)
+        _core._config = None
+        _core._join_locked(elsewhere.locked_payload())
+        assert _CHILD_POLICY_ENV not in os.environ
+
+    def test_the_config_is_the_one_activate_would_build(self, monkeypatch):
+        """Guards against drift: field for field, what the owner's ``activate()`` built."""
+        token = object()
+        tethered.activate(**_JOINED_POLICY, locked=True, lock_token=token)
+        expected = _core._config
+        tethered.deactivate(lock_token=token)
+
+        monkeypatch.setattr(_core, "_c_guardian", _LockHeldElsewhere(expected._serialized_payload))
+        _core._join_locked(expected._serialized_payload)
+        actual = _core._config
+        assert actual is not None
+        assert actual is not expected
+        for field in dataclasses.fields(_Config):
+            if field.name != "policy":
+                assert getattr(actual, field.name) == getattr(expected, field.name), field.name
+        assert _serialize_allow_list(actual.policy) == _serialize_allow_list(expected.policy)
+        assert actual.policy._allow_localhost == expected.policy._allow_localhost
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            {"allow": []},
+            {"allow": ["api.example.com:443", "*.example.org"], "log_only": True},
+            {"allow": ["[2001:db8::]/32:443", "2001:db8::1", "192.0.2.0/24"]},
+            {"allow": ["b.test", "a.test", "A.TEST:8443", "trailing.dot."]},
+            {"allow": ["xn--bcher-kva.example", "*.sub.example.com:8080"], "fail_closed": True},
+            {"allow": ["127.0.0.1:5000"], "allow_localhost": False},
+            {"allow": ["*.example.com"], "external_subprocess_policy": "allow"},
+        ],
+        ids=["empty", "ports", "ipv6", "order-and-case", "idna", "no-localhost", "subprocess"],
+    )
+    def test_the_rebuilt_payload_is_the_guardians_to_the_byte(self, policy, monkeypatch):
+        """Else the guardian would refuse every join of that policy."""
+        payload = _locked_payload_of(**policy)
+        stand_in = _LockHeldElsewhere(payload)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        _core._join_locked(payload)
+        assert _core._config._serialized_payload == payload
+        assert _core._config.locked is True
+
+    def test_a_join_the_guardian_refuses_binds_nothing(self, monkeypatch):
+        payload = _locked_payload_of(**_JOINED_POLICY)
+        stand_in = _LockHeldElsewhere(payload, refusal="tethered: cannot join the locked policy")
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        with pytest.raises(RuntimeError, match="cannot join the locked policy"):
+            _core._join_locked(payload)
+        assert len(stand_in.joins) == 1
+        assert _core._config is None
+
+    def test_it_needs_the_extension(self, monkeypatch):
+        payload = _locked_payload_of(**_JOINED_POLICY)
+        monkeypatch.setattr(_core, "_c_guardian", None)
+        with pytest.raises(RuntimeError, match="requires the C guardian extension"):
+            _core._join_locked(payload)
+        assert _core._config is None
+
+    @staticmethod
+    def _altered(payload: str, **changes: object) -> str:
+        parsed = json.loads(payload)
+        for name, value in changes.items():
+            if value is ...:
+                del parsed["global"][name]
+            else:
+                parsed["global"][name] = value
+        return json.dumps(parsed)
+
+    @pytest.mark.parametrize(
+        ("changes", "expected"),
+        [
+            ({"locked": False}, ValueError),
+            ({"locked": 1}, TypeError),
+            ({"log_only": 0}, TypeError),
+            ({"fail_closed": "no"}, TypeError),
+            ({"allow_localhost": None}, TypeError),
+            ({"external_subprocess_policy": "sometimes"}, ValueError),
+            ({"external_subprocess_policy": 5}, ValueError),
+            ({"external_subprocess_policy": ["allow"]}, TypeError),
+            ({"allow": "*.example.com"}, TypeError),
+            ({"allow": ["*.example.com", 5]}, TypeError),
+            ({"allow": ["://not-a-rule"]}, ValueError),
+            ({"allow": ...}, KeyError),
+            ({"locked": ...}, KeyError),
+            ({"log_only": ...}, KeyError),
+            ({"external_subprocess_policy": ...}, KeyError),
+        ],
+        ids=[
+            "not-locked",
+            "locked-not-bool",
+            "log-only-not-bool",
+            "fail-closed-not-bool",
+            "allow-localhost-not-bool",
+            "unknown-subprocess-policy",
+            "subprocess-policy-not-str",
+            "subprocess-policy-a-list",
+            "allow-not-a-list",
+            "allow-item-not-str",
+            "bad-rule",
+            "no-allow",
+            "no-locked",
+            "no-log-only",
+            "no-subprocess-policy",
+        ],
+    )
+    def test_a_payload_that_is_not_a_locked_policys_is_not_offered(
+        self, changes, expected, elsewhere
+    ):
+        """Nothing is guessed or defaulted: the guardian is not even asked."""
+        with pytest.raises(expected):
+            _core._join_locked(self._altered(elsewhere.locked_payload(), **changes))
+        assert elsewhere.joins == []
+        assert _core._config is None
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ("{not json", ValueError),
+            ("[]", TypeError),
+            ("null", TypeError),
+            ("{}", KeyError),
+            ('{"global": null, "scopes": []}', TypeError),
+            ('{"global": [], "scopes": []}', TypeError),
+            ('{"global": "locked", "scopes": []}', TypeError),
+        ],
+        ids=["not-json", "a-list", "null", "no-global", "null-global", "list-global", "str-global"],
+    )
+    def test_a_payload_of_another_shape_is_not_offered(self, payload, expected, elsewhere):
+        with pytest.raises(expected):
+            _core._join_locked(payload)
+        assert elsewhere.joins == []
+        assert _core._config is None
+
+
+_JOIN_WARNING = "tethered: this interpreter could not join the locked policy of its process"
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestBootstrapUnderALock:
+    """The bootstrap of an interpreter that starts while another one holds the lock.
+
+    Run in the main interpreter against a stand-in for the guardian (see
+    ``_LockHeldElsewhere``); ``test_subinterpreters.py`` runs the same paths
+    for real, in interpreters coverage cannot see.
+    """
+
+    @pytest.fixture
+    def locked_payload(self) -> str:
+        return _locked_payload_of(**_JOINED_POLICY)
+
+    @pytest.fixture
+    def elsewhere(self, locked_payload, monkeypatch):
+        stand_in = _LockHeldElsewhere(locked_payload)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        return stand_in
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_it_joins_with_the_guardians_payload(self, elsewhere, locked_payload, monkeypatch):
+        monkeypatch.setenv(_CHILD_POLICY_ENV, locked_payload)
+        _autoactivate._autoactivate_from_env()
+        assert len(elsewhere.joins) == 1
+        assert _core._config.locked is True
+        assert _core._config._serialized_payload == locked_payload
+        assert _core._scopes.get() == ()
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            _payload(allow=["0.0.0.0/0"], locked=False),
+            _payload(allow=["0.0.0.0/0"], locked=True),
+            json.dumps({"global": None, "scopes": []}),
+            json.dumps({"scopes": []}),
+        ],
+        ids=["unlocked-and-permissive", "locked-and-permissive", "null-global", "no-global"],
+    )
+    def test_the_policy_is_not_the_variables_to_say(
+        self, variable, elsewhere, locked_payload, monkeypatch, caplog
+    ):
+        """Whatever was done to the variable, what is joined is what is locked."""
+        monkeypatch.setenv(_CHILD_POLICY_ENV, variable)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _autoactivate._autoactivate_from_env()
+        assert _core._config._serialized_payload == locked_payload
+        assert _core._config.locked is True
+        assert not _core._config.policy.is_allowed("evil.test", 443)
+        assert os.environ[_CHILD_POLICY_ENV] == variable  # and it is left as it was
+        assert self._warnings(caplog) == []
+
+    @pytest.mark.parametrize("variable", ["{not json", "[]", "7"], ids=["not-json", "list", "int"])
+    def test_a_variable_that_cannot_be_read_does_not_undo_the_join(
+        self, variable, elsewhere, locked_payload, monkeypatch, caplog
+    ):
+        monkeypatch.setenv(_CHILD_POLICY_ENV, variable)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _autoactivate._autoactivate_from_env()
+        assert _core._config._serialized_payload == locked_payload
+        (warning,) = self._warnings(caplog)
+        assert "malformed _TETHERED_CHILD_POLICY" in warning
+
+    def test_without_the_variable_nothing_is_joined(self, elsewhere, monkeypatch):
+        """The bootstrap does nothing at all then — the guardian is not even asked."""
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        _autoactivate._autoactivate_from_env()
+        assert elsewhere.joins == []
+        assert _core._config is None
+
+    def test_scopes_are_still_inherited_from_the_variable(
+        self, elsewhere, locked_payload, monkeypatch
+    ):
+        variable = json.loads(locked_payload)
+        variable["scopes"] = [{"allow": ["api.example.com"], "label": "inherited"}]
+        monkeypatch.setenv(_CHILD_POLICY_ENV, json.dumps(variable))
+        _autoactivate._autoactivate_from_env()
+        assert _core._config.locked is True
+        assert [s.label for s in _core._scopes.get()] == ["inherited"]
+
+    @pytest.mark.parametrize(
+        ("variable", "expected"),
+        [
+            # The variable says "unlocked": the policy that was joined is a
+            # locked one all the same, and what cannot be established stops startup.
+            ({"global": {"allow": [], "locked": False}, "scopes": [{"allow": [5]}]}, "scopes"),
+            ({"global": {"allow": []}, "scopes": "none"}, "scopes must be a list"),
+            ({"global": None, "scopes": [], "from_a_newer_version": 1}, "unknown field"),
+        ],
+        ids=["bad-scope", "scopes-not-a-list", "unknown-field"],
+    )
+    def test_having_joined_it_is_strict_about_the_rest(
+        self, variable, expected, elsewhere, monkeypatch
+    ):
+        monkeypatch.setenv(_CHILD_POLICY_ENV, json.dumps(variable))
+        with pytest.raises(SystemExit, match=expected):
+            _autoactivate._autoactivate_from_env()
+        assert _core._config.locked is True  # the join itself stands
+
+    def test_a_policy_already_in_place_is_left_alone(self, monkeypatch, locked_payload):
+        """A state copied by ``fork()``: nothing is joined over it."""
+
+        class MustNotBeAsked(_LockHeldElsewhere):
+            def locked_payload(self) -> str | None:
+                raise AssertionError("the guardian was asked")
+
+        tethered.activate(allow=["*.first.com"])
+        first = _core._config
+        monkeypatch.setattr(_core, "_c_guardian", MustNotBeAsked(locked_payload))
+        monkeypatch.setenv(_CHILD_POLICY_ENV, locked_payload)
+        assert _autoactivate._join_locked_policy() is False
+        _autoactivate._autoactivate_from_env()
+        assert _core._config is first
+
+    def test_nothing_is_joined_where_nothing_is_locked(self, monkeypatch):
+        """The real guardian, inactive: startup goes by the variable, as ever."""
+        assert _core._c_guardian.locked_payload() is None
+        assert _autoactivate._join_locked_policy() is False
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"]))
+        _autoactivate._autoactivate_from_env()
+        assert _core._config.locked is False
+        assert _core._config.policy.is_allowed("api.example.com", 443)
+
+    def test_nothing_is_joined_without_the_extension(self, monkeypatch):
+        monkeypatch.setattr(_core, "_c_guardian", None)
+        assert _autoactivate._join_locked_policy() is False
+        assert _core._config is None
+
+    # ── A join that fails must not stop the interpreter from starting ──
+
+    def test_a_refused_join_is_reported_and_startup_goes_on(
+        self, locked_payload, monkeypatch, caplog
+    ):
+        refusal = "tethered: cannot join the locked policy: this interpreter's startup is over"
+        stand_in = _LockHeldElsewhere(locked_payload, refusal=refusal)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _autoactivate._join_locked_policy() is False
+        assert len(stand_in.joins) == 1
+        assert _core._config is None
+        assert self._warnings(caplog) == [
+            f"{_JOIN_WARNING} (RuntimeError: {refusal}) — while that lock is held it gets "
+            "no network access and no process launches"
+        ]
+
+    def test_a_payload_that_cannot_be_joined_is_reported_too(self, monkeypatch, caplog):
+        """Not only the guardian's refusal: anything the join raises."""
+        stand_in = _LockHeldElsewhere(_payload(allow=["*.example.com"], locked=False))
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _autoactivate._join_locked_policy() is False
+        assert stand_in.joins == []
+        (warning,) = self._warnings(caplog)
+        assert warning.startswith(f"{_JOIN_WARNING} (ValueError: ")
+
+    def test_after_a_failed_join_a_locked_variable_is_enforced_unlocked(
+        self, locked_payload, monkeypatch, caplog
+    ):
+        """In a subinterpreter, as when nothing is locked: the guardian refuses it meanwhile."""
+        stand_in = _LockHeldElsewhere(locked_payload, refusal="no")
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.setattr(_autoactivate, "_in_subinterpreter", lambda: True)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, locked_payload)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _autoactivate._autoactivate_from_env()  # no SystemExit
+        cfg = _core._config
+        assert cfg is not None
+        assert cfg.locked is False
+        assert not cfg.policy.is_allowed("evil.test", 443)
+        (warning,) = self._warnings(caplog)
+        assert warning.startswith(_JOIN_WARNING)
+
+    def test_after_a_failed_join_an_unlocked_variable_cannot_be_activated(
+        self, locked_payload, monkeypatch, caplog
+    ):
+        """Another interpreter's lock is active: ``activate()`` refuses, startup goes on."""
+        stand_in = _LockHeldElsewhere(locked_payload, refusal="no")
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"]))
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _autoactivate._autoactivate_from_env()  # no SystemExit
+        assert _core._config is None
+        first, second = self._warnings(caplog)
+        assert first.startswith(_JOIN_WARNING)
+        assert second.startswith("tethered: auto-activation failed: TetheredLocked")
+
+    def test_a_guardian_that_cannot_be_asked_joins_nothing(
+        self, locked_payload, monkeypatch, caplog
+    ):
+        class CannotBeAsked(_LockHeldElsewhere):
+            def locked_payload(self) -> str | None:
+                raise RuntimeError("no answer")
+
+        stand_in = CannotBeAsked(locked_payload)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _autoactivate._join_locked_policy() is False
+        assert stand_in.joins == []
+        assert self._warnings(caplog) == []
+
+    def test_a_core_module_that_cannot_be_imported_is_reported_once(self, monkeypatch, caplog):
+        """By the code that needs it next, in its own words — not as a failed join."""
+        monkeypatch.setitem(sys.modules, "tethered._core", None)  # import raises ImportError
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"]))
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _autoactivate._join_locked_policy() is False
+            _autoactivate._autoactivate_from_env()
+        (warning,) = self._warnings(caplog)
+        assert warning.startswith("tethered: auto-activation failed: ")
+        assert _JOIN_WARNING not in warning
