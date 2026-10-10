@@ -2495,6 +2495,113 @@ class TestAJoinThatFails:
         assert TAMPER_ALERT not in child.stderr
 
 
+# Child process of TestAProcessWithoutSite, run with ``python -S``.
+# ``sys.argv[1]`` is the directory that holds the tethered package: without
+# site, neither site-packages nor an editable install's path is on sys.path.
+_WITHOUT_SITE = '''
+import json, sys
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered
+import tethered._core as core
+
+def create(shared_gil):
+    if sys.version_info >= (3, 13):
+        return interps.create("legacy" if shared_gil else "isolated")
+    if sys.version_info >= (3, 12):
+        return interps.create(isolated=not shared_gil)
+    return interps.create()
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+# Run in an interpreter created under the lock.  Its startup ran no site, so
+# nothing loaded tethered there and nothing ever marked that startup as over.
+LATER = """
+import json, sys
+loaded_at_startup = "tethered._core" in sys.modules
+sys.path.insert(0, %r)
+import tethered._core as core
+
+def outcome(call, *args):
+    try:
+        call(*args)
+    except RuntimeError as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+print(json.dumps({
+    "no_site": sys.flags.no_site,
+    "loaded at startup": loaded_at_startup,
+    "join": outcome(core._join_locked, core._c_guardian.locked_payload()),
+    "guardian.join": outcome(core._c_guardian.join, vars(core), None, []),
+    "config": core._config,
+    "connect": outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9)),
+}), flush=True)
+""" % sys.argv[1]
+
+print(json.dumps({"no_site": sys.flags.no_site}), flush=True)
+tethered.activate(allow=["127.0.0.1"], locked=True, lock_token=object())
+for shared_gil in ((False, True) if sys.version_info >= (3, 12) else (True,)):
+    interp = create(shared_gil)
+    run(interp, LATER)
+    interps.destroy(interp)
+print(json.dumps({"main": core._c_guardian.verify()}), flush=True)
+'''
+
+
+class TestAProcessWithoutSite:
+    """``python -S``: no interpreter runs ``site``, so none ever finishes "starting".
+
+    The guardian tells an interpreter's startup from what runs after it by
+    the import of ``sitecustomize`` that ends ``site``'s work.  Without
+    ``site`` that never comes, in any interpreter: the window in which a
+    join is accepted would stay open for code that runs there later, which
+    could offer the guardian anything.  So in such a process nobody joins.
+    (Nor does a bootstrap run there to try: ``.pth`` files are ``site``'s.)
+    """
+
+    def test_nobody_joins(self):
+        package_dir = os.path.dirname(os.path.dirname(os.path.abspath(tethered.__file__)))
+        env = {k: v for k, v in os.environ.items() if k != _CHILD_POLICY_ENV}
+        child = subprocess.run(  # nosec B603
+            [sys.executable, "-S", "-c", _WITHOUT_SITE, package_dir],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert child.returncode == 0, child.stderr
+        first, *later, last = [json.loads(line) for line in child.stdout.splitlines()]
+        assert first == {"no_site": 1}
+        assert len(later) == (2 if OWN_GIL else 1)
+        refused = [
+            "RuntimeError",
+            CANNOT_JOIN + "this process runs without the site module (-S), so the startup "
+            "of an interpreter cannot be told from what runs after it",
+        ]
+        for found in later:
+            assert found == {
+                "no_site": 1,
+                "loaded at startup": False,
+                "join": refused,
+                "guardian.join": refused,
+                # A refused join binds nothing, and the interpreter is outside the lock.
+                "config": None,
+                "connect": ["EgressBlocked", f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}"],
+            }
+        assert last == {"main": True}
+        assert TAMPER_ALERT not in child.stderr
+
+
 @pytest.mark.skipif(not OWN_GIL, reason="before Python 3.12 every interpreter shares one GIL")
 class TestConcurrency:
     def test_many_interpreters_created_at_once_all_join(self, ports, tmp_path, capfd):
