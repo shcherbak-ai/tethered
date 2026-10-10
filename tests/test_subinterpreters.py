@@ -88,6 +88,24 @@ SUBPROCESS_BLOCKED = "tethered._core.SubprocessBlocked"
 TETHERED_LOCKED = "tethered._core.TetheredLocked"
 RUNTIME_ERROR = "builtins.RuntimeError"
 
+# What activate() and deactivate() say (TetheredLocked) in an interpreter
+# that does not hold the lock of its process.
+ACTIVATE_LOCKED = (
+    "tethered: activate() blocked — a locked policy is active and the requested policy "
+    "differs from it. Pass the original lock_token to replace a locked policy."
+)
+DEACTIVATE_LOCKED = (
+    "tethered: deactivate() blocked — policy is locked. "
+    "Pass the same lock_token to deactivate() to unlock."
+)
+# What taking the activation claim says (RuntimeError) on a thread that
+# holds it in another interpreter.
+CANNOT_WAIT_FOR_ITSELF = (
+    "tethered: this thread is in the middle of an activate() or deactivate() in another "
+    "interpreter of this process, which cannot finish while a call made from inside it "
+    "waits for it"
+)
+
 # A destination no test policy allows (TEST-NET-3); only ever named in
 # synthetic audit events, never connected to.
 ELSEWHERE_ADDRESS = ("203.0.113.9", 443)
@@ -2394,6 +2412,342 @@ print(json.dumps({
 '''
 
 
+# Child process of test_a_lock_taken_amid_the_unlocked_transitions_of_other_interpreters:
+# ``sys.argv`` holds a directory for the findings and the number of
+# interpreters that keep activating and deactivating unlocked policies.
+_LOCK_AMID_UNLOCKED_TRANSITIONS = '''
+import faulthandler, json, os, sys, threading
+
+faulthandler.dump_traceback_later(120, exit=True)  # a hang is a failure, not a wait
+
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered._core as core  # loads the extension here; nothing is locked
+
+out_dir, others = sys.argv[1], int(sys.argv[2])
+
+def create():
+    if sys.version_info >= (3, 13):
+        return interps.create("isolated")
+    return interps.create(isolated=True)
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+PREPARE = "import tethered\\nimport tethered._core\\n"
+
+COMMON = """
+import json, sys, time
+import tethered
+import tethered._core as core
+
+def outcome(call, *args, **kwargs):
+    try:
+        call(*args, **kwargs)
+    except BaseException as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+def report(found):
+    found["config"] = None if core._config is None else core._config._serialized_payload
+    found["verify"] = core._c_guardian.verify()
+    found["connect"] = outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9))
+    with open(%(path)r, "w", encoding="utf-8") as f:
+        json.dump(found, f)
+"""
+
+# Locks once the variable has been seen to change a number of times: the
+# others are in the middle of it then.
+LOCK = COMMON + """
+seen, changes = None, 0
+deadline = time.monotonic() + 20
+while changes < 40 and time.monotonic() < deadline:
+    now = core._c_guardian.process_policy_env()
+    if now != seen:
+        seen, changes = now, changes + 1
+found = {"changes seen": changes, "took": outcome(
+    tethered.activate, allow=["127.0.0.1:1"], allow_localhost=False, locked=True,
+    lock_token=object(),
+)}
+if found["took"] == "ok":
+    found["env state"] = core._process_env_state(core._config._serialized_payload)
+    found["process env"] = core._c_guardian.process_policy_env()
+report(found)
+"""
+
+# Activates an unlocked policy of its own and deactivates it, over and over,
+# until it is refused, and then a few times more.
+CHURN = COMMON + """
+done, refusals = 0, []
+deadline = time.monotonic() + 60
+while len(refusals) < 6 and time.monotonic() < deadline:
+    turn = done + len(refusals)
+    if turn %% 2 == 0:
+        call, result = "activate", outcome(tethered.activate, allow=[%(allow)r])
+    else:
+        call, result = "deactivate", outcome(tethered.deactivate)
+    if result == "ok" and not refusals:
+        done += 1
+    else:
+        refusals.append([call, result])
+report({"done": done, "refusals": refusals})
+"""
+
+start = threading.Barrier(others + 1)
+failures = []
+
+def race(n):
+    try:
+        interp = create()
+        try:
+            run(interp, PREPARE)
+            path = os.path.join(out_dir, "%d.json" % n)
+            if n == 0:
+                code = LOCK % {"path": path}
+            else:
+                code = CHURN % {"path": path, "allow": "127.0.0.1:%d" % (1000 + n)}
+            start.wait(timeout=60)
+            run(interp, code)
+        finally:
+            # By the thread that created it (see the concurrency test of joins).
+            interps.destroy(interp)
+    except BaseException as exc:
+        failures.append(repr(exc))
+
+threads = [threading.Thread(target=race, args=(n,)) for n in range(others + 1)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join(timeout=100)
+assert not failures, failures
+assert not any(thread.is_alive() for thread in threads)
+
+found = []
+for n in range(others + 1):
+    with open(os.path.join(out_dir, "%d.json" % n), encoding="utf-8") as f:
+        found.append(json.load(f))
+print(json.dumps({
+    "locker": found[0],
+    "others": found[1:],
+    "main": [core._c_guardian.is_active(), core._c_guardian.verify()],
+}))
+'''
+
+
+# Child process of TestTakingTurns: the activation claim between real
+# interpreters.  ``sys.argv[1]`` says which kind the others are ("shared" or
+# "own" GIL).  The interpreters talk through pipes, which the whole process
+# shares.  The last scenario leaves the process locked.
+_TAKING_TURNS = '''
+import faulthandler, json, os, sys, threading, time
+
+faulthandler.dump_traceback_later(100, exit=True)  # a hang is a failure, not a wait
+
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered
+import tethered._core as core
+
+shared_gil = sys.argv[1] == "shared"
+claim = core._activation_claim
+guardian = core._c_guardian
+VARIABLE = "_TETHERED_CHILD_POLICY"
+out = {}
+
+def create():
+    if sys.version_info >= (3, 13):
+        return interps.create("legacy" if shared_gil else "isolated")
+    if sys.version_info >= (3, 12):
+        return interps.create(isolated=not shared_gil)
+    return interps.create(isolated=False)
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+def in_another_interpreter(code):
+    """Start a thread that creates an interpreter, runs ``code`` in it and destroys it."""
+    def work():
+        interp = create()
+        try:
+            run(interp, SETUP + code)
+        finally:
+            interps.destroy(interp)  # by the thread that created it
+    thread = threading.Thread(target=work)
+    thread.start()
+    return thread
+
+def outcome(call, *args, **kwargs):
+    try:
+        call(*args, **kwargs)
+    except BaseException as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+def take_and_give_up():
+    with claim:
+        pass
+
+def read_line(fd):
+    text = b""
+    while not text.endswith(b"\\n"):
+        text += os.read(fd, 1)
+    return text.decode()
+
+# Runs first in every other interpreter.
+SETUP = """
+import json, os, sys, time
+import tethered
+import tethered._core as core
+
+claim = core._activation_claim
+
+def outcome(call, *args, **kwargs):
+    try:
+        call(*args, **kwargs)
+    except BaseException as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+def take_and_give_up():
+    with claim:
+        pass
+
+def tell(fd, text="x"):
+    os.write(fd, text.encode())
+"""
+
+# The other interpreter says when it still held the claim (a clock reading
+# taken just before it gave it up); whoever waited for it got on later.
+HOLD = """
+with claim:
+    tell(%d)
+    until = time.monotonic() + 0.4
+    while time.monotonic() < until:
+        %s
+    tell(%d, repr(time.monotonic()) + "\\\\n")
+"""
+
+# 1. A thread of another interpreter holds the claim, and needs its GIL to
+#    get on.  This interpreter waits for it, without keeping a GIL the two
+#    may share, and then takes the claim.
+ready_r, ready_w = os.pipe()
+told_r, told_w = os.pipe()
+holder = in_another_interpreter(HOLD % (ready_w, "pass", told_w))
+os.read(ready_r, 1)
+with claim:
+    got = time.monotonic()
+still_held_at = float(read_line(told_r))
+holder.join(60)
+out["waits until it is given up"] = got >= still_held_at
+
+# 2. The same, for a transition: it waits and then goes through.
+holder = in_another_interpreter(HOLD % (ready_w, "time.sleep(0.01)", told_w))
+os.read(ready_r, 1)
+activated = outcome(tethered.activate, allow=["mine.test"])
+done = time.monotonic()
+still_held_at = float(read_line(told_r))
+holder.join(60)
+out["a transition waits"] = {
+    "activate": activated,
+    "until it is given up": done >= still_held_at,
+    "published": guardian.process_policy_env() == core._config._serialized_payload,
+    "deactivate": outcome(tethered.deactivate),
+    "cleared": guardian.process_policy_env(),
+}
+
+# 3. The holder is this very thread, in another interpreter: whatever is
+#    run there from inside the block cannot wait for the block to end.
+answer_r, answer_w = os.pipe()
+interp = create()
+run(interp, SETUP)
+with claim:
+    run(interp, """
+tell(%d, json.dumps({
+    "claim": outcome(take_and_give_up),
+    "activate": outcome(tethered.activate, allow=["theirs.test"]),
+    "deactivate": outcome(tethered.deactivate),
+    "config": core._config,
+    # Nor is the claim that interpreter's to give up: it holds nothing.
+    "held": claim.held(),
+    "give up": outcome(claim.__exit__, None, None, None),
+    "restore": outcome(claim.restore, 0),
+}) + "\\\\n")
+""" % answer_w)
+    out["the same thread"] = json.loads(read_line(answer_r))
+    out["the same thread"]["published"] = guardian.process_policy_env()
+    out["the same thread"]["held here"] = claim.held()
+#    Once the block is over, that interpreter takes the claim like any other.
+run(interp, """tell(%d, json.dumps(outcome(take_and_give_up)) + "\\\\n")""" % answer_w)
+out["the same thread"]["afterwards"] = json.loads(read_line(answer_r))
+
+# 4. An interpreter goes away with the claim taken.  First on this thread ...
+run(interp, "claim.__enter__()\\n")
+out["its holder is gone"] = {"while it lives": outcome(take_and_give_up)}
+interps.destroy(interp)
+out["its holder is gone"]["afterwards"] = outcome(take_and_give_up)
+
+#    ... then on another one, with a thread of this interpreter waiting.
+ready_r, ready_w = os.pipe()
+go_r, go_w = os.pipe()
+holder = in_another_interpreter("""
+claim.__enter__()
+tell(%d)
+os.read(%d, 1)
+""" % (ready_w, go_r))
+os.read(ready_r, 1)
+took = threading.Event()
+
+def wait_for_it():
+    with claim:
+        took.set()
+
+waiter = threading.Thread(target=wait_for_it)
+waiter.start()
+out["its holder is gone"]["a waiter"] = [took.wait(0.3)]
+os.write(go_w, b"x")  # the holder's script ends, and its interpreter with it
+out["its holder is gone"]["a waiter"].append(took.wait(60))
+holder.join(60)
+waiter.join(60)
+
+# 5. Another interpreter locks a policy while this one's activate() waits
+#    for the claim: it is refused at the door, having written nothing.
+ready_r, ready_w = os.pipe()
+locker = in_another_interpreter("""
+with claim:
+    tell(%d)
+    time.sleep(0.4)
+    tethered.activate(
+        allow=["127.0.0.1:1"], allow_localhost=False, locked=True, lock_token=object()
+    )
+""" % ready_w)
+os.read(ready_r, 1)
+refused = outcome(tethered.activate, allow=["mine.test"])
+locker.join(60)
+out["refused at the door"] = {
+    "activate": refused,
+    "config": core._config,
+    "published here": os.environ.get(VARIABLE),
+    "the process carries the locked policy": (
+        guardian.process_policy_env() == guardian.locked_payload() is not None
+    ),
+    "deactivate": outcome(tethered.deactivate),
+}
+print(json.dumps(out))
+'''
+
+
 class TestAJoinThatFails:
     """An interpreter that cannot join the lock starts all the same, outside it.
 
@@ -2602,6 +2956,77 @@ class TestAProcessWithoutSite:
         assert TAMPER_ALERT not in child.stderr
 
 
+class TestTakingTurns:
+    """The interpreters of a process take turns at changing the policy and the variable.
+
+    ``_TETHERED_CHILD_POLICY`` is one variable for all of them, and
+    ``activate()`` / ``deactivate()`` write it before they commit.  Whoever
+    does that holds the C guardian's activation claim meanwhile; the others
+    wait for it, and then go by what they find.  (``test_lifecycle.py`` has
+    the same between threads of one interpreter.)
+
+    Run in a child process: a claim that is not given up, or a wait that
+    keeps a shared GIL, would hang everything that comes after.
+    """
+
+    @pytest.mark.parametrize("shared_gil", GIL_KINDS)
+    def test_the_claim_between_interpreters(self, shared_gil):
+        env = {k: v for k, v in os.environ.items() if k != _CHILD_POLICY_ENV}
+        child = subprocess.run(  # nosec B603
+            [sys.executable, "-c", _TAKING_TURNS, "shared" if shared_gil else "own"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert child.returncode == 0, child.stderr
+        assert TAMPER_ALERT not in child.stderr
+        out = json.loads(child.stdout.splitlines()[-1])
+
+        # A thread of another interpreter holds it: this one waits, with its
+        # GIL released, and then takes it.
+        assert out["waits until it is given up"] is True
+        assert out["a transition waits"] == {
+            "activate": "ok",
+            "until it is given up": True,
+            "published": True,
+            "deactivate": "ok",
+            "cleared": None,
+        }
+
+        # The holder is the same thread, further down the stack: refused,
+        # with nothing changed.
+        refused = ["RuntimeError", CANNOT_WAIT_FOR_ITSELF]
+        assert out["the same thread"] == {
+            "claim": refused,
+            "activate": refused,
+            "deactivate": refused,
+            "config": None,
+            "held": 0,
+            "give up": ["RuntimeError", "tethered: this thread does not hold the activation claim"],
+            "restore": "ok",
+            "published": None,
+            "held here": 1,
+            "afterwards": "ok",
+        }
+
+        # An interpreter that goes away with the claim does not keep it.
+        assert out["its holder is gone"] == {
+            "while it lives": refused,
+            "afterwards": "ok",
+            "a waiter": [False, True],
+        }
+
+        # The one that waited while a policy was locked is told at the door.
+        assert out["refused at the door"] == {
+            "activate": ["TetheredLocked", ACTIVATE_LOCKED],
+            "config": None,
+            "published here": None,
+            "the process carries the locked policy": True,
+            "deactivate": ["TetheredLocked", DEACTIVATE_LOCKED],
+        }
+
+
 @pytest.mark.skipif(not OWN_GIL, reason="before Python 3.12 every interpreter shares one GIL")
 class TestConcurrency:
     def test_many_interpreters_created_at_once_all_join(self, ports, tmp_path, capfd):
@@ -2672,8 +3097,11 @@ class TestConcurrency:
         """Several interpreters, each under its own GIL, lock a policy at the same moment.
 
         Nothing has been locked in the process before, so they also race to
-        install the guardian's audit hook.  One of them gets the lock; the
-        others are told so and are left without a policy, outside the lock.
+        install the guardian's audit hook.  They take turns (the activation
+        claim): the first one publishes its policy and locks it, and each of
+        the others, when its turn comes, finds the lock taken and is told so
+        at the door, before it has written anything.  They are left without
+        a policy, outside the lock.
 
         Run in child processes (a few, for a few races): the winner is
         destroyed with its token, and its process stays locked.
@@ -2706,35 +3134,14 @@ class TestConcurrency:
             assert winner["connect"][0] == "EgressBlocked"
             assert winner["connect"][1].endswith("is not in the allow list")
             # The variable carries the winner's policy, so a child of the
-            # winner inherits it.  A loser may have written its own payload
-            # there last, before the lock was there to refuse it (about every
-            # other race, when the policies differ): the winner puts its own
-            # back once it holds the lock.
-            #
-            # That narrows the race and cannot close it.  A loser's write that
-            # passed the guardian's hook before the lock was committed can
-            # still reach the environment after the winner has looked (a few
-            # races in a hundred under load).  The winner then sees a foreign
-            # payload, which fails closed: _refuse_launch() refuses every
-            # launch of its that would inherit the environment.
-            if policies == "same" or winner["env state"] == "exact":
-                assert winner["env state"] == "exact"
-                assert winner["process env"] == winner["config"]
-            else:
-                assert winner["env state"] == "foreign"
-                left_behind = json.loads(winner["process env"])["global"]
-                assert left_behind["locked"] is True
-                assert left_behind["allow"] != json.loads(winner["config"])["global"]["allow"]
+            # winner inherits it: nobody else wrote it while the winner
+            # published and locked, and nobody could afterwards.
+            assert winner["env state"] == "exact", found
+            assert winner["process env"] == winner["config"]
 
             for loser in losers:
-                kind, message = loser["took"]
-                # Told at the door (TetheredLocked), or — the usual case when
-                # they really start together — when it touches the variable:
-                # publishing its policy (os.putenv), or taking it back after
-                # losing at the guardian's commit (os.unsetenv).
-                assert kind == "TetheredLocked" or (
-                    kind == "SubprocessBlocked" and message.endswith(NO_VARIABLE_CHANGES)
-                ), loser["took"]
+                # Told at the door, never by a refused write of the variable.
+                assert loser["took"] == ["TetheredLocked", ACTIVATE_LOCKED], found
                 assert loser["config"] is None, loser
                 assert loser["verify"] is False
                 assert loser["connect"] == [
@@ -2743,6 +3150,68 @@ class TestConcurrency:
                 ]
 
             # The main interpreter took no part and is outside the lock too.
+            assert result["main"] == [True, False]
+
+    def test_a_lock_taken_amid_the_unlocked_transitions_of_other_interpreters(self, tmp_path):
+        """One interpreter locks a policy while others keep changing theirs, each under its own GIL.
+
+        The others activate an unlocked policy of their own and deactivate
+        it, in a loop: each round writes the variable and then removes it.
+        Every one of those transitions happens wholly before the lock or
+        not at all.  The lock holder finds its own payload in the variable,
+        and the others are told at the door from then on (they are never
+        refused in the middle of a write).
+
+        Run in child processes, like the race for the first lock.
+        """
+        others = 5
+        for attempt in range(3):
+            out_dir = tmp_path / f"race-{attempt}"
+            out_dir.mkdir()
+            env = {k: v for k, v in os.environ.items() if k != _CHILD_POLICY_ENV}
+            child = subprocess.run(  # nosec B603
+                [sys.executable, "-c", _LOCK_AMID_UNLOCKED_TRANSITIONS, str(out_dir), str(others)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            assert child.returncode == 0, child.stderr
+            assert TAMPER_ALERT not in child.stderr
+            result = json.loads(child.stdout.splitlines()[-1])
+
+            locker = result["locker"]
+            # It really was in the middle of the others' transitions ...
+            assert locker["changes seen"] == 40, result
+            # ... and holds its policy, pinned and enforced, with the
+            # variable carrying it.
+            assert locker["took"] == "ok", result
+            assert locker["verify"] is True
+            assert locker["connect"][0] == "EgressBlocked"
+            assert locker["connect"][1].endswith("is not in the allow list")
+            assert locker["env state"] == "exact", result
+            assert locker["process env"] == locker["config"]
+
+            assert len(result["others"]) == others
+            for other in result["others"]:
+                # Nothing went wrong before the lock; from the first refusal
+                # on, every call is refused, and always at the door.
+                assert other["refusals"] == [
+                    [call, ["TetheredLocked", message]]
+                    for call, message in (
+                        [("activate", ACTIVATE_LOCKED), ("deactivate", DEACTIVATE_LOCKED)] * 4
+                    )[other["done"] % 2 :][:6]
+                ], result
+                # It keeps whatever its last transition left it with: an
+                # unlocked policy or none.  Either way it is outside the lock.
+                if other["config"] is not None:
+                    assert json.loads(other["config"])["global"]["locked"] is False
+                assert other["verify"] is False
+                assert other["connect"] == [
+                    "EgressBlocked",
+                    f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}",
+                ]
+
             assert result["main"] == [True, False]
 
     def test_events_from_an_interpreter_with_its_own_gil_while_the_lock_changes_hands(
