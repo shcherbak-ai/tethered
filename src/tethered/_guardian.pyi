@@ -1,5 +1,18 @@
 """Type stub for the C guardian extension."""
 
+from typing import final, type_check_only
+
+# The type of ``activation_claim``.  The module does not expose it by name.
+@final
+@type_check_only
+class _ActivationClaim:
+    def __enter__(self) -> None: ...
+    def __exit__(self, *exc_info: object) -> None: ...
+    def held(self) -> int: ...
+    def restore(self, held: int, /) -> None: ...
+
+activation_claim: _ActivationClaim
+
 def activate(
     core_namespace: dict[str, object],
     config: object,

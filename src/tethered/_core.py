@@ -219,9 +219,70 @@ _state_lock = threading.Lock()
 # environment variable always change together and describe the same policy
 # when either call returns.  Re-entrant: the environment writes made inside
 # a transition raise audit events that re-enter the hook on the same thread.
-# (_state_lock is not re-entrant; it is never held while this lock is being
-# acquired.)
+# The launch hook takes it as well, for the one write it makes itself
+# (_reassert_policy_env).  (_state_lock is not re-entrant; it is never held
+# while this lock is being acquired.)
 _lifecycle_lock = threading.RLock()
+
+
+class _UnsharedClaim:
+    """Stands in for the C guardian's activation claim where the extension is missing.
+
+    No policy can be locked then, and there is nowhere to keep a claim that
+    the other interpreters of the process would see.  This one makes the
+    threads of its own interpreter take turns and nothing more: it keeps no
+    count for ``held()`` / ``restore()``, so a ``with`` on it is as safe as
+    a ``with`` on any lock.
+    """
+
+    __slots__ = ("_lock",)
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+    def held(self) -> int:
+        return 0
+
+    def restore(self, held: int) -> None:
+        pass
+
+
+# What _lifecycle_lock is within one interpreter, this is across all the
+# interpreters of the process: whoever holds it is the one that may write
+# the child-policy variable and commit a policy.  The variable is shared by
+# every interpreter, and a write to it is under way from its audit event
+# until the environment is changed, with every audit hook running in
+# between.  Without the claim, an interpreter's write could land after
+# another interpreter had published its own policy and locked it.  The
+# claim lives in the C guardian (see "The activation claim" there); taking
+# it waits, with the GIL released, while another thread holds it, and the
+# holding thread may take it again.
+#
+# Order: _lifecycle_lock first, then the claim, everywhere (activate(),
+# deactivate(), and the launch hook in _reassert_policy_env).
+#
+# A claim that is never given up stops every later transition in every
+# interpreter, so each use is a ``with`` inside a ``try`` whose ``finally``
+# gives up whatever the thread holds beyond what it held before:
+#
+#     held = _activation_claim.held()
+#     try:
+#         with _lifecycle_lock, _activation_claim:
+#             ...
+#     finally:
+#         _activation_claim.restore(held)
+#
+# The ``with`` alone is not enough on every version.  Python 3.14 raises a
+# pending exception (a KeyboardInterrupt, one set from another thread)
+# after ``__enter__`` has returned and before the block is entered, and
+# then never calls ``__exit__``.
+_activation_claim = _UnsharedClaim() if _c_guardian is None else _c_guardian.activation_claim
 
 _config: _Config | None = None
 
@@ -2390,7 +2451,7 @@ def _handle_subprocess(
         state = _process_env_state(payload)
         if state != "exact":
             if not cfg.locked:
-                _propagate_policy_to_env(cfg)
+                _reassert_policy_env(cfg)
             elif state != "same-global":
                 _refuse_launch(
                     event, _describe_launch(event, args, launch_args), "os.environ", state
@@ -3068,7 +3129,11 @@ def activate(
             it (a hook that raises ``RuntimeError`` for the
             ``sys.addaudithook`` event makes Python drop a new hook without
             reporting an error): nothing would be enforced, so nothing is
-            activated.
+            activated.  Also if the call is made from inside an
+            ``activate()`` or ``deactivate()`` that the same thread is
+            running in another interpreter of the process (waiting for
+            that one would never end), or if another thread is in the
+            middle of one while Python is shutting down.
         TypeError: If ``lock_token`` is a singleton or an instance of an
             immutable built-in type.
         ValueError: If ``locked=True`` is used without ``lock_token``,
@@ -3088,7 +3153,11 @@ def activate(
 
     The call is all-or-nothing: whenever it raises, the previously active
     policy (or none), the lock, and the policy published to child processes
-    are exactly as they were.  Calls from several threads are serialized.
+    are exactly as they were.  Calls from several threads are serialized,
+    and so are calls from several interpreters of the process: a call waits
+    while another interpreter is in the middle of an ``activate()`` or
+    ``deactivate()``, and then goes by what it finds (``TetheredLocked`` if
+    that interpreter locked a policy).
     """
     global _config
 
@@ -3147,73 +3216,79 @@ def activate(
         "replace a locked policy."
     )
 
-    with _lifecycle_lock:
-        # The C guardian owns the lock: a locked policy exists only while the
-        # guardian is active (locked=True requires the extension), and only
-        # the guardian knows the token.  Without the extension nothing can
-        # be locked, so there is nothing to check.
-        if _c_guardian is not None and _c_guardian.is_active():
-            if not _c_guardian.check_token(lock_token):
-                if _is_idempotent_reactivation(serialized_payload):
-                    return
-                raise TetheredLocked(activate_locked_msg)
-            if not _c_guardian.verify():
-                raise TetheredLocked(_TAMPERED_POLICY_MSG)
+    # (The try around the with: see _activation_claim.)
+    held = _activation_claim.held()
+    try:
+        with _lifecycle_lock, _activation_claim:
+            # The C guardian owns the lock: a locked policy exists only while
+            # the guardian is active (locked=True requires the extension), and
+            # only the guardian knows the token.  Without the extension
+            # nothing can be locked, so there is nothing to check.  The
+            # question is asked with the claim held, so the answer stands
+            # until this call is over: an interpreter that waited here while
+            # another one locked a policy is refused now, before it has
+            # written anything.
+            if _c_guardian is not None and _c_guardian.is_active():
+                if not _c_guardian.check_token(lock_token):
+                    if _is_idempotent_reactivation(serialized_payload):
+                        return
+                    raise TetheredLocked(activate_locked_msg)
+                if not _c_guardian.verify():
+                    raise TetheredLocked(_TAMPERED_POLICY_MSG)
 
-        # Everything that can fail comes before anything is committed.
-        _install_hook()
-        snapshot = _build_integrity_snapshot(cfg) if locked else []
-        previous = _config
-        previous_env = os.environ.get(_CHILD_POLICY_ENV)
-        try:
-            # Publish the policy to spawn-mode child processes.  The
-            # tethered.pth shipped at the top of site-packages reads the
-            # variable in any Python interpreter that has tethered installed
-            # and re-engages tethered with the same policy.  (Fork-mode
-            # children inherit tethered state through the fork() copy.)
-            # This write is the step most likely to fail — Windows limits a
-            # variable to 32,767 characters — and, unlike the commit, it can
-            # be undone, so it goes first.
+            # Everything that can fail comes before anything is committed.
+            _install_hook()
+            snapshot = _build_integrity_snapshot(cfg) if locked else []
+            previous = _config
+            previous_env = os.environ.get(_CHILD_POLICY_ENV)
             try:
-                _propagate_policy_to_env(cfg)
-            except ValueError as exc:
-                msg = (
-                    f"tethered: activate() failed — the policy could not be written to "
-                    f"the {_CHILD_POLICY_ENV} environment variable for child processes "
-                    f"({exc}). The serialized policy is {len(serialized_payload)} "
-                    f"characters long; Windows limits an environment variable to 32,767. "
-                    f"Nothing was changed. Shorten the allow list, for example by "
-                    f"aggregating address ranges."
-                )
-                raise ValueError(msg) from exc
+                # Publish the policy to spawn-mode child processes.  The
+                # tethered.pth shipped at the top of site-packages reads the
+                # variable in any Python interpreter that has tethered
+                # installed and re-engages tethered with the same policy.
+                # (Fork-mode children inherit tethered state through the
+                # fork() copy.)  This write is the step most likely to fail —
+                # Windows limits a variable to 32,767 characters — and, unlike
+                # the commit, it can be undone, so it goes first.
+                try:
+                    _propagate_policy_to_env(cfg)
+                except ValueError as exc:
+                    msg = (
+                        f"tethered: activate() failed — the policy could not be written to "
+                        f"the {_CHILD_POLICY_ENV} environment variable for child processes "
+                        f"({exc}). The serialized policy is {len(serialized_payload)} "
+                        f"characters long; Windows limits an environment variable to 32,767. "
+                        f"Nothing was changed. Shorten the allow list, for example by "
+                        f"aggregating address ranges."
+                    )
+                    raise ValueError(msg) from exc
 
-            # Commit.  When the guardian is involved it rebinds _config
-            # itself, in the same uninterruptible step as its own state, so
-            # that no audit event on another thread can see a config and a
-            # guardian snapshot that belong to different policies.  Its
-            # deactivate() returns False, having done nothing, when no
-            # policy was locked; the rebinding is then left to us.
-            if _c_guardian is not None and locked:
-                _c_guardian.activate(globals(), cfg, lock_token, snapshot)
-            elif _c_guardian is None or not _c_guardian.deactivate(lock_token, cfg):
-                _config = cfg
-        except BaseException:
-            # _config tells whether the commit happened: if it did not, the
-            # previous policy is still the active one and its variable goes
-            # back.
-            if _config is not cfg:
-                _restore_policy_env(previous, previous_env)
-            raise
+                # Commit.  When the guardian is involved it rebinds _config
+                # itself, in the same uninterruptible step as its own state,
+                # so that no audit event on another thread can see a config
+                # and a guardian snapshot that belong to different policies.
+                # Its deactivate() returns False, having done nothing, when no
+                # policy was locked; the rebinding is then left to us.
+                if _c_guardian is not None and locked:
+                    _c_guardian.activate(globals(), cfg, lock_token, snapshot)
+                elif _c_guardian is None or not _c_guardian.deactivate(lock_token, cfg):
+                    _config = cfg
+            except BaseException:
+                # _config tells whether the commit happened: if it did not,
+                # the previous policy is still the active one and its variable
+                # goes back.
+                if _config is not cfg:
+                    _restore_policy_env(previous, previous_env)
+                raise
 
-        if locked:
-            _reclaim_policy_env(cfg)
-
-        # Mappings recorded under the previous policy are dropped.  Not part
-        # of the commit: an entry is a fact about DNS, and the new policy is
-        # consulted for whatever hostname it yields.
-        with _ip_map_lock:
-            _ip_to_hostname.clear()
-            _allowed_hostnames.clear()
+            # Mappings recorded under the previous policy are dropped.  Not
+            # part of the commit: an entry is a fact about DNS, and the new
+            # policy is consulted for whatever hostname it yields.
+            with _ip_map_lock:
+                _ip_to_hostname.clear()
+                _allowed_hostnames.clear()
+    finally:
+        _activation_claim.restore(held)
 
     # Surface a warning if no auto-propagation hook is in a directory that
     # site.py processes (see _compute_pth_path).  Without it, Python children
@@ -3252,36 +3327,48 @@ def deactivate(*, lock_token: object | None = None) -> None:
         TetheredLocked: If a locked policy is active and ``lock_token`` is
             not its token, or if the locked policy has failed its integrity
             check (it then stays in place until the process exits).
+        RuntimeError: When the call cannot wait for an ``activate()`` or
+            ``deactivate()`` that is under way, in the two cases named for
+            ``activate()``.
+
+    Like ``activate()``, the call is all-or-nothing and is serialized with
+    the ``activate()`` and ``deactivate()`` calls of other threads and of
+    other interpreters of the process.
     """
     global _config
 
-    with _lifecycle_lock:
-        # The C guardian owns the lock (see activate()); without the
-        # extension no policy can be locked.
-        if _c_guardian is not None and _c_guardian.is_active():
-            if not _c_guardian.check_token(lock_token):
-                raise TetheredLocked
-            if not _c_guardian.verify():
-                raise TetheredLocked(_TAMPERED_POLICY_MSG)
+    # (The try around the with: see _activation_claim.)
+    held = _activation_claim.held()
+    try:
+        with _lifecycle_lock, _activation_claim:
+            # The C guardian owns the lock (see activate()); without the
+            # extension no policy can be locked.
+            if _c_guardian is not None and _c_guardian.is_active():
+                if not _c_guardian.check_token(lock_token):
+                    raise TetheredLocked
+                if not _c_guardian.verify():
+                    raise TetheredLocked(_TAMPERED_POLICY_MSG)
 
-        previous = _config
-        previous_env = os.environ.get(_CHILD_POLICY_ENV)
-        try:
-            # As in activate(): the environment first, because that step
-            # can fail and can be undone, then the commit.  Clearing the
-            # variable keeps future child processes from inheriting a policy
-            # that is no longer active.
-            _clear_policy_from_env()
-            if _c_guardian is None or not _c_guardian.deactivate(lock_token, None):
-                _config = None
-        except BaseException:
-            if _config is not None:
-                _restore_policy_env(previous, previous_env)
-            raise
+            previous = _config
+            previous_env = os.environ.get(_CHILD_POLICY_ENV)
+            try:
+                # As in activate(): the environment first, because that step
+                # can fail and can be undone, then the commit.  Clearing the
+                # variable keeps future child processes from inheriting a
+                # policy that is no longer active.
+                _clear_policy_from_env()
+                if _c_guardian is None or not _c_guardian.deactivate(lock_token, None):
+                    _config = None
+            except BaseException:
+                if _config is not None:
+                    _restore_policy_env(previous, previous_env)
+                raise
 
-        with _ip_map_lock:
-            _ip_to_hostname.clear()
-            _allowed_hostnames.clear()
+            with _ip_map_lock:
+                _ip_to_hostname.clear()
+                _allowed_hostnames.clear()
+    finally:
+        _activation_claim.restore(held)
 
     logger.info("tethered: deactivated")
 
@@ -3637,11 +3724,13 @@ def _capture_local_hostname() -> str:
 def _propagate_policy_to_env(cfg: _Config) -> None:
     """Populate ``_TETHERED_CHILD_POLICY`` so child processes inherit the policy.
 
-    Also how the subprocess hook re-asserts the payload outside locked mode.
     The assignment updates ``os.environ`` and the native environment
     together, so it ends any divergence ``_env_dirty`` recorded.  The flag
     is cleared first: a foreign change racing with the write leaves it set.
-    Takes no lock and is safe to call from inside the audit hook.
+
+    The caller holds ``_activation_claim``: the variable is the whole
+    process's, and no interpreter writes it for tethered while another one
+    is publishing and committing a policy.
     """
     global _env_dirty
     token = _in_env_sync.set(True)
@@ -3652,41 +3741,43 @@ def _propagate_policy_to_env(cfg: _Config) -> None:
         _in_env_sync.reset(token)
 
 
-def _reclaim_policy_env(cfg: _Config) -> None:
-    """Make the variable carry ``cfg``'s policy again once ``cfg`` has been locked.
+def _reassert_policy_env(cfg: _Config) -> None:
+    """Put the payload of the unlocked policy ``cfg`` back into the variable.
 
-    ``activate()`` writes the variable before it takes the lock, and until
-    the lock is taken any interpreter may write it.  One that was locking a
-    policy of its own at the same moment, and lost, can have left its
-    payload there after ours — and cannot take it back, being refused the
-    variable from then on.  This interpreter holds the lock now, so no
-    other interpreter can change the variable any more: if the process no
-    longer carries this policy, it is written again.  (So it is after a
-    change made below Python in that same moment; one made later is not
-    repaired but met with a refusal, see :func:`_process_env_state`.)
+    For the subprocess hook, when a child would inherit an environment that
+    no longer carries the payload (an ordinary cleanup of ``os.environ``, a
+    native ``os.unsetenv``).  The write has to take its turn like the one
+    ``activate()`` makes, so this is the one place where the hook takes
+    locks: ``_lifecycle_lock`` and then the claim, in that order.  That can
+    mean waiting for a transition that is under way, in this interpreter or
+    in another one.
 
-    Not part of the commit, and never an error: left as it is, the variable
-    only makes this interpreter refuse the launches that would inherit it,
-    which is the safe side to fail on.  A no-op when the process carries
-    the policy, as it does unless something of the kind happened.
+    Nothing is written if ``cfg`` was replaced or deactivated during that
+    wait: the variable then says what the transition left there, and
+    ``cfg`` is no longer anybody's to publish.  The launch itself is still
+    judged by ``cfg``, the policy it was started under, like every launch
+    whose audit event comes just before a transition.
+
+    If another interpreter has locked a policy meanwhile, the write is
+    refused by the C guardian and the ``SubprocessBlocked`` it raises
+    refuses this launch, like every later launch from this interpreter.
     """
-    if not _process_env_differs(_canonical_payload(cfg)):
-        return
+    # (The try around the with: see _activation_claim.)
+    held = _activation_claim.held()
     try:
-        _propagate_policy_to_env(cfg)
-    except Exception:
-        logger.warning(
-            "tethered: %s did not carry this policy any more when it was locked (it was "
-            "changed from another interpreter or below Python meanwhile), and the policy "
-            "could not be written back; process launches that inherit the environment "
-            "will be refused",
-            _CHILD_POLICY_ENV,
-            exc_info=True,
-        )
+        with _lifecycle_lock, _activation_claim:
+            if _config is cfg:
+                _propagate_policy_to_env(cfg)
+    finally:
+        _activation_claim.restore(held)
 
 
 def _clear_policy_from_env() -> None:
-    """Remove ``_TETHERED_CHILD_POLICY`` so future children don't inherit a stale policy."""
+    """Remove ``_TETHERED_CHILD_POLICY`` so future children don't inherit a stale policy.
+
+    The caller holds ``_activation_claim``, as for
+    :func:`_propagate_policy_to_env`.
+    """
     global _env_dirty
     token = _in_env_sync.set(True)
     try:

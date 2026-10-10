@@ -2928,9 +2928,11 @@ out["before"] = [
     core._c_guardian.verify(),
 ]
 
-# Every reference to the extension module goes: the name in tethered._core
-# (which the snapshot pins), the package attribute, sys.modules.
+# Every reference to the extension module goes: the names in tethered._core
+# (which the snapshot pins; the activation claim is an object of the module
+# and keeps it alive), the package attribute, sys.modules.
 core._c_guardian = None
+core._activation_claim = None
 del tethered._guardian
 del sys.modules["tethered._guardian"]
 gc.collect()
@@ -2965,7 +2967,7 @@ print(json.dumps(out))
 class TestTheOwnerWithoutItsState:
     """The interpreter that took the lock lets go of every instance of the extension.
 
-    That takes rebinding a name the snapshot pins.  The guardian's state for
+    That takes rebinding names the snapshot pins.  The guardian's state for
     the interpreter goes with the module — and with it everything a guarded
     event could be verified against, and the token.  The lock is the
     process's and stays: the interpreter is refused what tethered guards,

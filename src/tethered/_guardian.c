@@ -48,6 +48,10 @@
  * operations tethered guards (other_interpreter_event), except that a
  * log-only policy refuses no connection or lookup anywhere.
  *
+ * What the process publishes to its children, the child-policy variable,
+ * is shared too, and an activation writes it before it commits.  The
+ * interpreters take turns at that: see "The activation claim".
+ *
  * Concurrency within one interpreter: the module does not declare
  * free-threading support, so on a free-threaded build CPython re-enables
  * the GIL when it is imported.  A struct is only read and written with its
@@ -84,6 +88,7 @@
 #  define OPEN_WRITE_BITS (_O_WRONLY | _O_RDWR | _O_TRUNC | _O_CREAT)
 #else
 #  include <sched.h>
+#  include <time.h>
 #  include <unistd.h>
 #  define OPEN_WRITE_BITS (O_WRONLY | O_RDWR | O_TRUNC | O_CREAT)
 #  ifdef HAVE_FORK
@@ -103,6 +108,7 @@
 #  define THREAD_LOCAL _Thread_local
 #else
 #  define THREAD_LOCAL  /* fallback: not thread-safe, but still functional */
+#  define THREAD_LOCAL_MISSING 1
 #endif
 
 /* ── Snapshot entry ──────────────────────────────────────────────── */
@@ -158,6 +164,28 @@ thread_yield(void)
     (void)SwitchToThread();
 #else
     (void)sched_yield();
+#endif
+}
+
+/* Let other threads run while this one waits for something that takes
+ * longer than a critical section: round after round (`round` counts them),
+ * first by yielding, which is how a wait of a millisecond or so is met
+ * without delay, and then by sleeping about a millisecond each time, so
+ * that a long wait does not keep a processor busy. */
+#define PAUSE_YIELDS 1000
+
+static void
+thread_pause(int round)
+{
+    if (round < PAUSE_YIELDS) {
+        thread_yield();
+        return;
+    }
+#ifdef _WIN32
+    Sleep(1);
+#else
+    struct timespec moment = {0, 1000000L};
+    (void)nanosleep(&moment, NULL);
 #endif
 }
 
@@ -526,6 +554,206 @@ close_window(int id)
     mutex_lock();
     window_chunks[chunk][bit / 8] |= (unsigned char)(1u << (bit % 8));
     mutex_unlock();
+}
+
+/* ── The activation claim ────────────────────────────────────────── */
+
+/*
+ * One interpreter at a time changes what the process hands its children.
+ *
+ * _TETHERED_CHILD_POLICY is one variable for the whole process.
+ * activate() and deactivate() write it before they commit, because the
+ * write is the step that can fail and the one that can be undone.  Within
+ * an interpreter _core._lifecycle_lock makes one transition of that; the
+ * lock is a Python object and means nothing to the next interpreter.  And
+ * a write is not one step: os.putenv() raises its audit event, every audit
+ * hook of the interpreter runs, and only then is the variable changed.  An
+ * interpreter could be anywhere in there while another one publishes a
+ * policy of its own and locks it.  Its event passed this module's hook
+ * when nothing was locked, and its value would land in the environment of
+ * a process whose lock it does not hold: the holder would then find a
+ * payload that is not its own and refuse its own launches.
+ *
+ * So whoever is about to write the variable on tethered's behalf takes the
+ * claim first and gives it up when its transition is committed, or has
+ * failed and been undone: activate() and deactivate(), locked or not, and
+ * the launch hook where it puts the payload of an unlocked policy back.
+ * No such write is under way while another interpreter publishes and
+ * commits, and the hook judges the event of a write by the lock state the
+ * write itself will meet.  An interpreter that waited for the claim looks
+ * again once it has it: if a policy was locked meanwhile, it is told so
+ * before it has written anything.
+ *
+ * Process-wide, so atomics:
+ *
+ * - claim_taken: the claim itself.
+ * - claim_interp: the interpreter whose thread holds it, so that it can be
+ *   given up for an interpreter that goes away holding it (forfeit_claim).
+ * - claim_serial: moves each time the claim is taken, and each time it is
+ *   given up on a holder's behalf.
+ *
+ * Which thread holds it is that thread's own knowledge (held_*).  It is
+ * believed only while claim_serial is what the thread recorded: the claim
+ * of an interpreter that went away, and one a fork() did not carry over,
+ * are given up without their thread.
+ *
+ * The holding thread may take the claim again (the writes inside a
+ * transition raise audit events, and a hook may launch a process or change
+ * the policy).  Every other thread waits, with its GIL released: the
+ * holder may be a thread of an interpreter that shares that GIL, and would
+ * never finish otherwise.  The wait has no time limit, like a wait for
+ * _lifecycle_lock.  It ends early when a signal handler raises (Python
+ * runs those in the main thread of the main interpreter only) and when the
+ * runtime shuts down.  One case cannot end and is refused instead: the
+ * holder is this same thread, in another interpreter, whose frames lie
+ * below the caller's.
+ *
+ * The order is _core._lifecycle_lock first, then the claim.  Nothing here
+ * is touched while state_mutex is held.
+ */
+#ifdef THREAD_LOCAL_MISSING
+#  error "the activation claim needs thread-local storage: without it every thread would pass for the holder"
+#endif
+
+static ATOMIC_INT claim_taken = 0;
+static ATOMIC_INT claim_interp = NO_INTERPRETER_ID;
+static ATOMIC_INT claim_serial = 0;
+
+static THREAD_LOCAL int held_depth = 0;   /* times this thread has taken it */
+static THREAD_LOCAL int held_interp = NO_INTERPRETER_ID;
+static THREAD_LOCAL int held_serial = 0;
+
+/* To be called by the holder, or with nobody able to take the claim. */
+static int
+next_claim_serial(void)
+{
+    int next = (int)((unsigned int)ATOMIC_LOAD(claim_serial) + 1u);
+
+    ATOMIC_STORE(claim_serial, next);
+    return next;
+}
+
+/* Does the calling thread hold the claim? */
+static int
+thread_holds_claim(void)
+{
+    if (held_depth == 0)
+        return 0;
+    if (ATOMIC_LOAD(claim_taken) && ATOMIC_LOAD(claim_serial) == held_serial)
+        return 1;
+    held_depth = 0; /* given up on this thread's behalf */
+    return 0;
+}
+
+/* Is the runtime shutting down?  Every thread but the one that finalizes
+ * it is then stopped the next time it needs a GIL.  (Py_IsFinalizing() is
+ * public from 3.13.  Before that, Py_FinalizeEx() marks the runtime as no
+ * longer initialised in the same step as it marks it as finalizing.) */
+static int
+runtime_is_finalizing(void)
+{
+#if PY_VERSION_HEX >= 0x030D0000
+    return Py_IsFinalizing();
+#else
+    return !Py_IsInitialized();
+#endif
+}
+
+/*
+ * Take the claim for interpreter `id` (the calling one), waiting for it if
+ * another thread holds it.  Returns 0, or -1 with an exception set and the
+ * claim not taken.
+ */
+static int
+take_claim(int id)
+{
+    if (thread_holds_claim()) {
+        if (held_interp != id) {
+            PyErr_SetString(PyExc_RuntimeError,
+                "tethered: this thread is in the middle of an activate() or "
+                "deactivate() in another interpreter of this process, which "
+                "cannot finish while a call made from inside it waits for it");
+            return -1;
+        }
+        held_depth++;
+        return 0;
+    }
+
+    int round = 0;
+    while (ATOMIC_EXCHANGE(claim_taken, 1)) {
+        /* A holder that the shutdown has stopped never gives it up, and
+         * the thread that finalizes the runtime must not wait for that. */
+        if (runtime_is_finalizing()) {
+            PyErr_SetString(PyExc_RuntimeError,
+                "tethered: another thread is in the middle of an activate() "
+                "or deactivate() and Python is shutting down, so this call "
+                "cannot wait for it");
+            return -1;
+        }
+        PyThreadState *tstate = PyEval_SaveThread();
+        thread_pause(round);
+        PyEval_RestoreThread(tstate);
+        if (round < PAUSE_YIELDS)
+            round++;
+        if (PyErr_CheckSignals() < 0)
+            return -1; /* e.g. KeyboardInterrupt */
+    }
+    held_serial = next_claim_serial();
+    held_interp = id;
+    held_depth = 1;
+    ATOMIC_STORE(claim_interp, id);
+    return 0;
+}
+
+/* How many times the calling thread holds the claim for interpreter `id`
+ * (the calling one): 0 if it does not hold it, or holds it in another
+ * interpreter. */
+static int
+claim_depth(int id)
+{
+    return (thread_holds_claim() && held_interp == id) ? held_depth : 0;
+}
+
+/* Undo one take_claim() of interpreter `id` (the calling one).  Returns
+ * -1, with RuntimeError set, if the calling thread does not hold the claim
+ * there: what a thread took in one interpreter is not another one's to
+ * give up. */
+static int
+give_up_claim(int id)
+{
+    if (claim_depth(id) == 0) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "tethered: this thread does not hold the activation claim");
+        return -1;
+    }
+    if (--held_depth == 0) {
+        /* (In this order: see forfeit_claim.) */
+        ATOMIC_STORE(claim_interp, NO_INTERPRETER_ID);
+        ATOMIC_STORE(claim_taken, 0);
+    }
+    return 0;
+}
+
+/*
+ * Interpreter `id` is going away, or has let go of this module: if a
+ * thread of it took the claim and never gave it up, give it up now, or
+ * every other interpreter would wait for good.
+ *
+ * Called with that interpreter's GIL held, which is also what its threads
+ * hold between taking the claim and writing claim_interp, and when they
+ * give it up; and an interpreter ID is never given out twice.  So if the
+ * claim is found under `id` here, no thread is about to release it and
+ * nobody else can have taken it.  The serial tells the thread that took
+ * it, should it still exist, that it holds nothing any more.
+ */
+static void
+forfeit_claim(int id)
+{
+    if (!ATOMIC_LOAD(claim_taken) || ATOMIC_LOAD(claim_interp) != id)
+        return;
+    (void)next_claim_serial();
+    ATOMIC_STORE(claim_interp, NO_INTERPRETER_ID);
+    ATOMIC_STORE(claim_taken, 0);
 }
 
 /* ── Per-interpreter state ───────────────────────────────────────── */
@@ -1920,7 +2148,10 @@ ensure_hook_installed(void)
  * thread of another interpreter was inside a critical section.  So the
  * forking thread takes the mutex before the fork, and both processes
  * release it after.  The child also forgets an installation of the hook
- * that a thread it does not have was in the middle of.
+ * that a thread it does not have was in the middle of, and an activation
+ * claim such a thread held: nobody would ever give that one up.  (The
+ * claim is not waited for before the fork, as the mutex is.  Its holder
+ * may need the GIL the forking thread holds.)
  */
 #ifdef GUARD_FORK
 static void
@@ -1941,6 +2172,11 @@ after_fork_in_child(void)
     mutex_unlock();
     if (!installing_here)
         ATOMIC_STORE(hook_installing, 0);
+    if (!thread_holds_claim()) {
+        (void)next_claim_serial();
+        ATOMIC_STORE(claim_interp, NO_INTERPRETER_ID);
+        ATOMIC_STORE(claim_taken, 0);
+    }
 }
 #endif
 
@@ -2607,7 +2843,9 @@ py_activate(PyObject *self, PyObject *args)
 
     /* The lock itself, which every interpreter sees.  Another interpreter
      * may have taken it since the question was asked: then nothing was
-     * changed here that is not put back. */
+     * changed here that is not put back.  (Not when both came through
+     * tethered.activate(), which takes turns: see "The activation claim".
+     * This is for callers of this function that hold no claim.) */
     mutex_lock();
     int active = ATOMIC_LOAD(guardian_active);
     int taken = active && ATOMIC_LOAD(guardian_owner_id) != id;
@@ -3133,6 +3371,145 @@ py_resolve(PyObject *self, PyObject *args)
     return result;
 }
 
+/* ── The activation claim, for Python ────────────────────────────── */
+
+/*
+ * `activation_claim`, an attribute of the module: the claim as a context
+ * manager, for `with` in _core.
+ *
+ * A claim that is taken and never given up stops every later transition
+ * in every interpreter, so what matters is the moment between taking it
+ * and entering the block that gives it up: an exception that arrives
+ * there (a KeyboardInterrupt, one set from another thread) must not get
+ * between the two.  A `with` on a C-level __enter__ leaves no such moment
+ * on most versions, and not on all: Python 3.14 looks for pending
+ * exceptions after __enter__ has returned and before the block is
+ * entered, and then never calls __exit__.  So _core does not rely on
+ * `with` alone.  It notes how often the thread holds the claim before the
+ * `with` (held()) and, in a `finally` around it, gives up whatever is held
+ * beyond that (restore()), which is nothing unless such an exception came.
+ *
+ * The object holds no state.  Its type is a heap type, made anew for each
+ * module instance: objects are not shared between interpreters.
+ */
+
+static PyObject *
+claim_enter(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    (void)self;
+    if (take_claim(current_interpreter_id()) < 0)
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+/* __exit__(exc_type, exc, traceback): returns None, so an exception raised
+ * inside the block goes on to the caller. */
+static PyObject *
+claim_exit(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    (void)self;
+    if (give_up_claim(current_interpreter_id()) < 0)
+        return NULL;
+    Py_RETURN_NONE;
+}
+
+/* held() -> int: how many times the calling thread holds the claim, in
+ * the calling interpreter. */
+static PyObject *
+claim_held(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    (void)self;
+    return PyLong_FromLong(claim_depth(current_interpreter_id()));
+}
+
+/* restore(held): give the claim up until the calling thread holds it
+ * `held` times, as it did when it asked held().  Does nothing if it holds
+ * it no more often than that, which is the ordinary case. */
+static PyObject *
+claim_restore(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    long held = PyLong_AsLong(arg);
+    if (held == -1 && PyErr_Occurred())
+        return NULL;
+
+    int id = current_interpreter_id();
+    while ((long)claim_depth(id) > held && claim_depth(id) > 0)
+        (void)give_up_claim(id);
+    Py_RETURN_NONE;
+}
+
+static int
+claim_traverse(PyObject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+
+static void
+claim_dealloc(PyObject *self)
+{
+    PyTypeObject *type = Py_TYPE(self);
+
+    PyObject_GC_UnTrack(self);
+    type->tp_free(self);
+    Py_DECREF(type);
+}
+
+static PyMethodDef claim_methods[] = {
+    {"__enter__", claim_enter, METH_NOARGS,
+     "Take the claim, waiting while a thread of another interpreter (or\n"
+     "another thread of this one) holds it.  The thread that holds it may\n"
+     "take it again."},
+    {"__exit__",  claim_exit,  METH_VARARGS,
+     "Give the claim up, once for each time it was taken."},
+    {"held",      claim_held,  METH_NOARGS,
+     "held() -> int: how many times the calling thread holds the claim, in\n"
+     "this interpreter."},
+    {"restore",   claim_restore, METH_O,
+     "restore(held): give the claim up until the calling thread holds it\n"
+     "`held` times.  For a `finally` around the `with`: an exception that\n"
+     "arrives between __enter__ and the block must not leave the claim taken."},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyType_Slot claim_slots[] = {
+    {Py_tp_doc, (void *)
+     "The process-wide claim on changing the policy published to child\n"
+     "processes: held by the interpreter that is in the middle of an\n"
+     "activate() or deactivate().  A context manager."},
+    {Py_tp_methods, claim_methods},
+    {Py_tp_traverse, claim_traverse},
+    {Py_tp_dealloc, claim_dealloc},
+    {0, NULL}
+};
+
+static PyType_Spec claim_spec = {
+    "tethered._guardian.ActivationClaim",
+    sizeof(PyObject),
+    0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE |
+        Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    claim_slots
+};
+
+/* Give `module` its `activation_claim`.  Returns -1 with an exception set. */
+static int
+add_activation_claim(PyObject *module)
+{
+    PyObject *type = PyType_FromModuleAndSpec(module, &claim_spec, NULL);
+    if (type == NULL)
+        return -1;
+    PyObject *claim = (PyObject *)PyObject_GC_New(PyObject, (PyTypeObject *)type);
+    Py_DECREF(type); /* the object, if there is one, keeps it */
+    if (claim == NULL)
+        return -1;
+    PyObject_GC_Track(claim);
+    int added = PyModule_AddObjectRef(module, "activation_claim", claim);
+    Py_DECREF(claim);
+    return added;
+}
+
 /* ── Module definition ───────────────────────────────────────────── */
 
 static PyMethodDef guardian_methods[] = {
@@ -3196,6 +3573,8 @@ guardian_exec(PyObject *module)
         return -1;
     }
     watch_forks();
+    if (add_activation_claim(module) < 0)
+        return -1;
 
     GuardianState *st = find_state(id);
     if (st != NULL) {
@@ -3308,6 +3687,10 @@ guardian_free(void *module)
         Py_ssize_t retired_count = 0;
         SnapshotEntry *retired = NULL;
         PyObject *config_key = st->config_key;
+
+        /* An interpreter that goes away in the middle of a transition does
+         * not keep the others waiting. */
+        forfeit_claim(ATOMIC_LOAD(st->interp_id));
 
         if (st->snapshot != NULL) {
             retired = detach_snapshot(st, &retired_count);

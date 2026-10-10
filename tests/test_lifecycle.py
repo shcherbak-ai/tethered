@@ -8,10 +8,13 @@ environment variable read by child processes.
 
 from __future__ import annotations
 
+import _thread
+import ctypes
 import inspect
 import json
 import os
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -449,6 +452,496 @@ class TestSerializedTransitions:
             tethered.activate(allow=["*.example.com"])
             tethered.deactivate()
         _assert_coherent()
+
+
+# ── Taking turns with the other interpreters of the process ────────
+# The policy variable belongs to the whole process, and a write to it is
+# under way from its audit event until the environment is changed.  So
+# whoever writes it for tethered first takes the C guardian's activation
+# claim, and keeps it until its transition is committed or undone; nobody
+# else publishes or commits meanwhile, in any interpreter.
+#
+# Here the claim is contended by threads of this interpreter, which is all
+# that coverage can see.  ``test_subinterpreters.py`` contends for it with
+# real interpreters.
+
+claim = _core._activation_claim
+
+
+class _Contender:
+    """A thread that takes the claim and gives it up again at once."""
+
+    def __init__(self) -> None:
+        self.took = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        with claim:
+            self.took.set()
+
+    def is_waiting(self, seconds: float = 0.2) -> bool:
+        """Has it still not got the claim after ``seconds``?"""
+        return not self.took.wait(seconds)
+
+    def finish(self) -> None:
+        assert self.took.wait(30), "the claim was never given up"
+        self._thread.join(30)
+
+
+def _assert_claim_is_free() -> None:
+    _Contender().finish()
+
+
+def _in_a_thread(call) -> tuple[threading.Thread, threading.Event, list[BaseException]]:
+    """Start ``call()`` in a thread; return it, the event set when it is over, and its errors."""
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, done, errors
+
+
+# What a child process reports when an object that is finalized while Python
+# shuts down asks for a claim that a daemon thread took and never gave up.
+_SHUTDOWN_WITH_THE_CLAIM_TAKEN = """
+import os, sys, threading, time
+
+import tethered._core as core
+
+claim = core._activation_claim
+held = threading.Event()
+
+
+def hold():
+    claim.__enter__()
+    held.set()
+    time.sleep(3600)  # stopped by the shutdown, with the claim
+
+
+threading.Thread(target=hold, daemon=True).start()
+assert held.wait(30)
+
+
+class AtTheEnd:
+    # (It brings what it needs: module globals may be gone when this runs.)
+    def __init__(self):
+        self.claim, self.write = claim, os.write
+
+    def __del__(self):
+        try:
+            with self.claim:
+                self.write(1, b"TOOK IT")
+        except RuntimeError as exc:
+            self.write(1, str(exc).encode())
+
+
+# Kept by the sys module, whose namespace is cleared late in the shutdown.
+# (This module's own is kept alive by the frame of the stopped thread.)
+sys.kept_until_the_end = AtTheEnd()
+"""
+
+
+class TestActivationClaim:
+    def test_it_is_the_guardians_context_manager(self):
+        assert claim is guardian.activation_claim
+        assert type(claim).__name__ == "ActivationClaim"
+        with pytest.raises(TypeError, match="cannot create"):
+            type(claim)()
+        with claim as entered:
+            assert entered is None
+        _assert_claim_is_free()
+
+    def test_another_thread_waits_and_then_proceeds(self):
+        with claim:
+            contender = _Contender()
+            assert contender.is_waiting()
+        contender.finish()
+
+    def test_the_holding_thread_may_take_it_again(self):
+        with claim:
+            with claim:
+                pass
+            contender = _Contender()
+            assert contender.is_waiting()  # taken twice, given up once
+        contender.finish()
+
+    def test_it_is_given_up_when_the_block_raises(self):
+        with pytest.raises(ZeroDivisionError), claim:
+            _ = 1 / 0
+        _assert_claim_is_free()
+
+    def test_giving_up_what_is_not_held_is_refused(self):
+        with pytest.raises(RuntimeError, match="does not hold the activation claim"):
+            claim.__exit__(None, None, None)
+        _assert_claim_is_free()
+
+    def test_held_counts_and_restore_gives_up_what_is_held_beyond_a_count(self):
+        assert claim.held() == 0
+        with claim:
+            assert claim.held() == 1
+            with claim:
+                assert claim.held() == 2
+            assert claim.held() == 1
+            claim.restore(1)  # held as often as before: nothing to do
+            assert claim.held() == 1
+            seen_elsewhere: list[int] = []
+            thread = threading.Thread(target=lambda: seen_elsewhere.append(claim.held()))
+            thread.start()
+            thread.join(30)
+            assert seen_elsewhere == [0]  # it counts for the calling thread
+        assert claim.held() == 0
+        claim.restore(0)  # not held: nothing to do
+        _assert_claim_is_free()
+
+        # What blocks that were never entered would leave behind.
+        for _ in range(3):
+            claim.__enter__()
+        claim.restore(1)
+        assert claim.held() == 1
+        contender = _Contender()
+        assert contender.is_waiting()
+        claim.restore(0)
+        contender.finish()
+        assert claim.held() == 0
+        with pytest.raises(TypeError):
+            claim.restore("once")
+
+    @pytest.mark.parametrize("call", ["activate", "deactivate", "the launch hook"])
+    def test_an_exception_that_arrives_as_the_claim_is_taken_does_not_leave_it_taken(self, call):
+        """Python 3.14 raises a pending exception between ``__enter__`` and the block.
+
+        It never calls ``__exit__`` then: a ``with`` alone would leave the
+        claim taken for good, for every interpreter.  The exception is set
+        on the thread while it waits for the claim, so that it is pending
+        at the moment the claim is taken.  Wherever a version raises it,
+        the claim and the lifecycle lock are free afterwards.
+        """
+
+        class Arrived(Exception):
+            pass
+
+        tethered.activate(allow=["prior.test"], external_subprocess_policy="allow")
+        cfg = _core._config
+        if call == "the launch hook":
+            del os.environ[POLICY_VAR]  # so that the hook has a payload to put back
+        calls = {
+            "activate": lambda: tethered.activate(allow=["new.test"]),
+            "deactivate": tethered.deactivate,
+            "the launch hook": lambda: _core._handle_subprocess(cfg, "os.system", ("echo hi",)),
+        }
+
+        with claim:
+            thread, done, errors = _in_a_thread(calls[call])
+            assert not done.wait(0.3)  # it waits for the claim
+            set_on = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(thread.ident), ctypes.py_object(Arrived)
+            )
+            assert set_on == 1
+        assert done.wait(30)
+        thread.join(30)
+
+        assert [type(error) for error in errors] == [Arrived]
+        _assert_claim_is_free()
+        assert _core._lifecycle_lock.acquire(timeout=30)
+        _core._lifecycle_lock.release()
+        # The transition did not happen: the policy is the one from before.
+        assert _core._config is cfg
+        if call != "the launch hook":
+            _assert_coherent()
+
+    def test_without_the_extension_a_lock_of_the_interpreters_own_stands_in(self):
+        stand_in = _core._UnsharedClaim()
+        took = threading.Event()
+
+        def take() -> None:
+            with stand_in:
+                took.set()
+
+        with stand_in, stand_in:  # the holding thread may take it again
+            thread = threading.Thread(target=take, daemon=True)
+            thread.start()
+            assert not took.wait(0.2)
+        assert took.wait(30)
+        thread.join(30)
+        # It keeps no count: nothing to report, nothing to give up.
+        assert stand_in.held() == 0
+        stand_in.restore(0)
+
+    def test_one_thread_cannot_give_up_what_another_holds(self):
+        holding, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with claim:
+                holding.set()
+                assert release.wait(30)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert holding.wait(30)
+        contender = _Contender()
+        try:
+            with pytest.raises(RuntimeError, match="does not hold the activation claim"):
+                claim.__exit__(None, None, None)
+            assert contender.is_waiting()  # the holder's claim is as it was
+        finally:
+            release.set()
+            holder.join(30)
+        contender.finish()
+
+    @pytest.mark.skipif(
+        threading.current_thread() is not threading.main_thread(),
+        reason="only the main thread handles signals",
+    )
+    def test_a_signal_ends_the_wait(self):
+        """Ctrl-C reaches a call that waits for the claim, and leaves the claim as it was."""
+        holding, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with claim:
+                holding.set()
+                assert release.wait(60)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert holding.wait(30)
+        interrupt = threading.Timer(0.2, _thread.interrupt_main)
+        give_up = threading.Timer(30, release.set)  # so that a failure is not a hang
+        give_up.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                # (Started in here: the interrupt must find this thread
+                # inside the block that expects it, however slow the day.)
+                interrupt.start()
+                with claim:
+                    pytest.fail("took a claim that another thread holds")
+            assert not release.is_set()
+            contender = _Contender()
+            assert contender.is_waiting()  # the holder still holds it
+        finally:
+            give_up.cancel()
+            release.set()
+            holder.join(30)
+            if interrupt.ident is not None:
+                interrupt.join(30)
+        contender.finish()
+
+    # ── activate() and deactivate() ────────────────────────────────────
+
+    @pytest.mark.parametrize("call", ["activate", "locked activate", "deactivate"])
+    def test_a_transition_waits_for_the_claim_and_changes_nothing_meanwhile(self, call):
+        secret = object()
+        if call == "deactivate":
+            tethered.activate(allow=["prior.test"])
+            transition = tethered.deactivate
+        else:
+
+            def transition() -> None:
+                tethered.activate(
+                    allow=["new.test"], locked=call == "locked activate", lock_token=secret
+                )
+
+        before = _observe(secret)
+        with claim:
+            thread, done, errors = _in_a_thread(transition)
+            assert not done.wait(0.3)
+            assert _observe(secret) == before
+        assert done.wait(30)
+        thread.join(30)
+        assert errors == []
+        assert _observe(secret) != before
+        _assert_coherent(secret)
+        _assert_claim_is_free()
+
+    @pytest.mark.parametrize("call", ["activate", "deactivate"])
+    def test_it_is_held_while_the_variable_is_written(self, call, monkeypatch):
+        """From before the write until the transition is over, and by nobody afterwards."""
+        writer = "_propagate_policy_to_env" if call == "activate" else "_clear_policy_from_env"
+        genuine = getattr(_core, writer)
+        waited: list[bool] = []
+        contenders: list[_Contender] = []
+
+        def write(*args: object) -> None:
+            contenders.append(_Contender())
+            waited.append(contenders[-1].is_waiting())
+            genuine(*args)
+            waited.append(contenders[-1].is_waiting(0.05))
+
+        tethered.activate(allow=["prior.test"])
+        monkeypatch.setattr(_core, writer, write)
+        if call == "activate":
+            tethered.activate(allow=["new.test"])
+        else:
+            tethered.deactivate()
+
+        assert waited == [True, True]
+        contenders[0].finish()
+        _assert_coherent()
+
+    @pytest.mark.parametrize(
+        "ending",
+        [
+            "committed",
+            "publishing refused by an audit hook",
+            "clearing refused by an audit hook",
+            "commit failed",
+            "refused at the door",
+            "identical policy: nothing to do",
+        ],
+    )
+    def test_it_is_given_up_however_a_transition_ends(self, ending, veto, monkeypatch):
+        secret = object()
+        if ending == "committed":
+            tethered.activate(allow=["a.test"], locked=True, lock_token=secret)
+            _assert_claim_is_free()
+            tethered.activate(allow=["b.test"], lock_token=secret)
+            _assert_claim_is_free()
+            tethered.deactivate()
+        elif ending == "publishing refused by an audit hook":
+            veto("os.putenv", OSError("environment is read-only"))
+            with pytest.raises(OSError, match="read-only"):
+                tethered.activate(allow=["a.test"])
+        elif ending == "clearing refused by an audit hook":
+            tethered.activate(allow=["a.test"])
+            veto("os.unsetenv", OSError("environment is read-only"))
+            with pytest.raises(OSError, match="read-only"):
+                tethered.deactivate()
+        elif ending == "commit failed":
+            monkeypatch.setattr(_core, "_build_integrity_snapshot", lambda cfg: [("not", "a pin")])
+            with pytest.raises(TypeError):
+                tethered.activate(allow=["a.test"], locked=True, lock_token=secret)
+        else:
+            tethered.activate(allow=["a.test"], locked=True, lock_token=secret)
+            if ending == "refused at the door":
+                with pytest.raises(tethered.TetheredLocked):
+                    tethered.activate(allow=["b.test"])
+                _assert_claim_is_free()
+                with pytest.raises(tethered.TetheredLocked):
+                    tethered.deactivate()
+            else:
+                tethered.activate(allow=["a.test"], locked=True, lock_token=object())
+        _assert_claim_is_free()
+        _assert_coherent(secret)
+
+    # ── The launch hook, where it puts the payload back ────────────────
+
+    @pytest.mark.parametrize("taken", ["the lifecycle lock", "the claim"])
+    def test_the_launch_hook_takes_its_turn_before_it_puts_the_payload_back(self, taken):
+        """It takes the lifecycle lock and then the claim, in the order a transition does."""
+        tethered.activate(allow=["a.test"], external_subprocess_policy="allow")
+        cfg = _core._config
+        payload = os.environ.pop(POLICY_VAR)  # an ordinary cleanup of the environment
+
+        with _core._lifecycle_lock if taken == "the lifecycle lock" else claim:
+            thread, done, errors = _in_a_thread(
+                lambda: _core._handle_subprocess(cfg, "os.system", ("echo hi",))
+            )
+            assert not done.wait(0.3)
+            assert POLICY_VAR not in os.environ
+            if taken == "the lifecycle lock":
+                # It is not sitting on the claim while it waits for the lock.
+                _assert_claim_is_free()
+        assert done.wait(30)
+        thread.join(30)
+        assert errors == []
+        assert os.environ[POLICY_VAR] == payload
+        _assert_coherent()
+        _assert_claim_is_free()
+
+    @pytest.mark.parametrize("meanwhile", ["replaced", "deactivated"])
+    def test_a_policy_that_went_while_the_hook_waited_is_not_published(self, meanwhile):
+        """The variable says what the transition left there, not what the hook set out with."""
+        tethered.activate(allow=["old.test"], external_subprocess_policy="allow")
+        stale = _core._config
+        del os.environ[POLICY_VAR]
+
+        # (Both, in their order, as a transition holds them.)
+        with _core._lifecycle_lock, claim:
+            thread, done, errors = _in_a_thread(
+                lambda: _core._handle_subprocess(stale, "os.system", ("echo hi",))
+            )
+            assert not done.wait(0.3)
+            # The transition the hook waits for.  (This thread holds the
+            # locks and takes them again.)
+            if meanwhile == "replaced":
+                tethered.activate(allow=["new.test"])
+            else:
+                tethered.deactivate()
+        assert done.wait(30)
+        thread.join(30)
+        assert errors == []
+        assert _core._config is not stale
+        _assert_coherent()
+        _assert_claim_is_free()
+
+    # ── When nobody is left to give it up ──────────────────────────────
+
+    def test_a_wait_does_not_outlast_the_shutdown_of_python(self):
+        """A daemon thread stopped with the claim would keep the exiting process waiting for it."""
+        env = {k: v for k, v in os.environ.items() if k != POLICY_VAR}
+        child = subprocess.run(  # nosec B603
+            [sys.executable, "-c", _SHUTDOWN_WITH_THE_CLAIM_TAKEN],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert child.returncode == 0, child.stderr
+        assert child.stdout == (
+            "tethered: another thread is in the middle of an activate() or deactivate() "
+            "and Python is shutting down, so this call cannot wait for it"
+        )
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+    # (Forking while another thread runs is the case under test.)
+    @pytest.mark.filterwarnings("ignore:.*multi-threaded, use of fork:DeprecationWarning")
+    @pytest.mark.parametrize("holder", ["another thread", "the forking thread"])
+    def test_a_forked_child_has_the_claim_only_if_its_one_thread_took_it(self, holder):
+        """A claim held by a thread the child does not have would never be given up there."""
+
+        def child_takes_and_gives_up() -> int:
+            pid = os.fork()
+            if pid == 0:
+                status = 1
+                try:
+                    signal.alarm(30)  # a wait that never ends is a failure, not a hang
+                    with claim:
+                        status = 0
+                finally:
+                    os._exit(status)
+            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+
+        if holder == "the forking thread":
+            with claim:
+                assert child_takes_and_gives_up() == 0
+        else:
+            holding, release = threading.Event(), threading.Event()
+
+            def hold() -> None:
+                with claim:
+                    holding.set()
+                    assert release.wait(60)
+
+            thread = threading.Thread(target=hold, daemon=True)
+            thread.start()
+            assert holding.wait(30)
+            try:
+                assert child_takes_and_gives_up() == 0
+                contender = _Contender()
+                assert contender.is_waiting()  # in the parent it is still held
+            finally:
+                release.set()
+                thread.join(30)
+            contender.finish()
+        _assert_claim_is_free()
 
 
 # ── R19: failure before commit leaves everything as it was ─────────
