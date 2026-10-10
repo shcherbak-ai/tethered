@@ -1,0 +1,13 @@
+description = "gunicorn with uvicorn's worker (uvicorn.workers and uvicorn-worker) and uvloop installed: with and without --preload, replaced workers; gunicorn's own asgi worker"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+apt = []
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["gunicorn", "uvicorn", "uvicorn-worker", "uvloop"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
