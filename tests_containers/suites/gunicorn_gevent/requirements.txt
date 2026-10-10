@@ -1,0 +1,8 @@
+# gunicorn with the gevent worker classes.  packaging is also a requirement of
+# pytest: keep the pin equal to harness/requirements.txt.
+gunicorn==26.2.0
+packaging==26.3
+gevent==26.9.0
+greenlet==3.5.6
+zope.event==6.2
+zope.interface==8.6
