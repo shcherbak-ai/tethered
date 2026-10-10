@@ -1,0 +1,4 @@
+# gunicorn with its built-in workers (sync, gthread).  packaging is also a
+# requirement of pytest: keep the pin equal to harness/requirements.txt.
+gunicorn==26.2.0
+packaging==26.3

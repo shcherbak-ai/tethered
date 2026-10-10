@@ -1,0 +1,5 @@
+# uvicorn without extras: no uvloop, no httptools.  The suite runs on the
+# standard asyncio event loop.
+uvicorn==0.54.0
+click==8.5.0
+h11==0.16.0

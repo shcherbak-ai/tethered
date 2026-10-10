@@ -1,0 +1,13 @@
+description = "uvicorn on the standard asyncio event loop: one process, --workers, a launcher that locks first"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+apt = []
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["uvicorn"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
