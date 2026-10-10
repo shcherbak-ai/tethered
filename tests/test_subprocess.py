@@ -3302,9 +3302,10 @@ class TestLockedEnvIsReadAsAMapping:
 
     @pytest.mark.parametrize(
         ("event", "prefix"),
-        [("os.exec", ()), ("os.posix_spawn", ()), ("os.spawn", (0,))],
+        [("os.posix_spawn", ()), ("os.spawn", (0,))],
     )
     def test_other_launch_apis_are_validated_the_same_way(self, event, prefix):
+        """(``os.exec*`` is the exception: see ``TestExecWithPolicy``.)"""
         env = _as_mapping("UserDict", {"PATH": "/usr/bin"})
         args = (*prefix, sys.executable, [sys.executable, "-c", "pass"], env)
         with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
@@ -4217,11 +4218,12 @@ class TestLaunchEnvEstablished:
             env = {_CHILD_POLICY_ENV: payload}
             _handle_subprocess(cfg, event, (*prefix, sys.executable, [sys.executable], env))
 
-    @pytest.mark.parametrize(("event", "prefix"), _ROUTES)
+    @pytest.mark.parametrize(("event", "prefix"), _ROUTES[1:])
     @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
     def test_route_without_a_frame_and_without_the_payload_is_external(
         self, event, prefix, policy, caplog
     ):
+        """(``os.exec*`` is given the payload all the same: see ``TestExecWithPolicy``.)"""
         cfg = _launch_cfg(external_subprocess_policy=policy)
         args = (*prefix, sys.executable, [sys.executable], {"PATH": "/usr/bin"})
         with caplog.at_level(logging.WARNING, logger="tethered"):
@@ -4409,6 +4411,165 @@ def _mean_microseconds(fn, iterations: int = 500) -> float:
     for _ in range(iterations):
         fn()
     return (time.perf_counter() - start) / iterations * 1_000_000
+
+
+class _Replaced(Exception):
+    """Raised by the stand-in for ``os.execve``, which really would not return."""
+
+
+_EXEC_PROBE_PARENT = """\
+import os, sys
+import tethered
+tethered.activate(allow=["*.example.com"], **{kwargs})
+clean = {{k: v for k, v in os.environ.items() if k.upper() != "_TETHERED_CHILD_POLICY"}}
+sys.stdout.flush()
+{call}
+"""
+
+
+class TestExecWithPolicy:
+    """An ``os.exec*`` of this interpreter is carried out with the policy in its environment.
+
+    The environment of an exec is converted before the audit event is raised,
+    so the hook cannot complete the caller's mapping.  Refusing, which is
+    what the other routes without a way to write the environment get, is
+    worse here than anywhere: the caller has usually just forked, and an
+    exception leaves a second copy of the parent running.  (gunicorn's
+    ``SIGUSR2`` upgrade passes the environment it saved at start-up; refused
+    under a locked policy, the copy stopped the workers of the server it
+    was to replace.)  But an exec does not return, so the hook can make the
+    call itself with a completed copy of the environment.
+    """
+
+    @pytest.fixture
+    def exec_calls(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def execve(path, argv, env):
+            calls.append((path, argv, env))
+            raise _Replaced
+
+        monkeypatch.setattr(os, "execve", execve)
+        return calls
+
+    def _exec(self, cfg, env, executable=sys.executable):
+        _handle_subprocess(cfg, "os.exec", (executable, [executable, "-c", "pass"], env))
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    def test_an_env_without_the_payload_is_completed(self, kind, policy, exec_calls, caplog):
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        env = _as_mapping(kind, {"PATH": "/usr/bin"})
+        with caplog.at_level(logging.WARNING, logger="tethered"), pytest.raises(_Replaced):
+            self._exec(cfg, env)
+        ((path, argv, new_env),) = exec_calls
+        assert (path, argv) == (sys.executable, [sys.executable, "-c", "pass"])
+        assert new_env == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        assert dict(env) == {"PATH": "/usr/bin"}  # the caller's mapping is not written to
+        assert caplog.records == []  # not external, and nothing to report outside a lock
+
+    @pytest.mark.parametrize("stale", [_PERMISSIVE_PAYLOAD, "{not json", "", '{"global": null}'])
+    def test_another_payload_is_replaced(self, stale, exec_calls):
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(_Replaced):
+            self._exec(cfg, {"PATH": "/usr/bin", _CHILD_POLICY_ENV: stale})
+        assert exec_calls[0][2] == {
+            "PATH": "/usr/bin",
+            _CHILD_POLICY_ENV: _core._canonical_payload(cfg),
+        }
+
+    def test_every_spelling_of_the_key_is_replaced_by_one(self, exec_calls):
+        cfg = _launch_cfg()
+        other = _CHILD_POLICY_ENV.lower() if sys.platform == "win32" else _CHILD_POLICY_ENV.encode()
+        with pytest.raises(_Replaced):
+            self._exec(cfg, {_CHILD_POLICY_ENV: "{}", other: "{}"})
+        assert exec_calls[0][2] == {_CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+
+    def test_an_env_carrying_the_payload_is_left_to_the_caller(self, exec_calls):
+        cfg = _launch_cfg(locked=True, external_subprocess_policy="block")
+        self._exec(cfg, {_CHILD_POLICY_ENV: _core._canonical_payload(cfg)})
+        assert exec_calls == []
+
+    def test_a_locked_policy_completes_an_env_that_lacks_the_variable(self, exec_calls, caplog):
+        cfg = _launch_cfg(locked=True, external_subprocess_policy="block")
+        with caplog.at_level(logging.WARNING, logger="tethered"), pytest.raises(_Replaced):
+            self._exec(cfg, {"PATH": "/usr/bin"})
+        assert exec_calls[0][2][_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+        (record,) = caplog.records
+        assert "os.exec*(" in record.getMessage()
+        assert "carried out with the locked policy added" in record.getMessage()
+
+    @pytest.mark.parametrize(
+        ("value", "reason"),
+        [(_PERMISSIVE_PAYLOAD, "substitution attempt"), ("{not json", "not valid JSON")],
+    )
+    def test_a_locked_policy_still_refuses_another_payload(self, value, reason, exec_calls):
+        cfg = _launch_cfg(locked=True)
+        with pytest.raises(tethered.SubprocessBlocked, match=reason):
+            self._exec(cfg, {_CHILD_POLICY_ENV: value})
+        assert exec_calls == []
+
+    def test_an_env_that_cannot_be_read_is_not_replaced(self, exec_calls):
+        with pytest.raises(tethered.SubprocessBlocked, match=r"cannot be rewritten"):
+            self._exec(_launch_cfg(external_subprocess_policy="block"), object())
+        with pytest.raises(tethered.SubprocessBlocked, match=r"could not be read as a mapping"):
+            self._exec(_launch_cfg(locked=True), object())
+        assert exec_calls == []
+
+    def test_another_program_is_not_given_the_payload(self, exec_calls, caplog):
+        cfg = _launch_cfg(external_subprocess_policy="warn")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._exec(cfg, {"PATH": "/usr/bin"}, executable="/bin/sh")
+        assert exec_calls == []
+        assert any("external subprocess launch detected" in r.message for r in caplog.records)
+
+    def test_a_failed_exec_fails_the_way_the_callers_own_would(self, monkeypatch):
+        """``os.execvp*`` relies on it to go on to the next directory of ``PATH``."""
+
+        def execve(path, argv, env):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(os, "execve", execve)
+        with pytest.raises(FileNotFoundError):
+            self._exec(_launch_cfg(external_subprocess_policy="block"), {"PATH": "/usr/bin"})
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"external_subprocess_policy": "block"},
+            {"locked": True, "lock_token": "TOKEN", "external_subprocess_policy": "block"},
+        ],
+        ids=["unlocked", "locked"],
+    )
+    @pytest.mark.parametrize(
+        "call",
+        [
+            "os.execve(sys.executable, [sys.executable, '-c', PROBE], clean)",
+            "os.execvpe(sys.executable, [sys.executable, '-c', PROBE], clean)",
+        ],
+        ids=["execve", "execvpe"],
+    )
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.exec* on Windows starts a second process, joins its argv unquoted, and "
+        "ends the caller with an access violation here with no tethered involved",
+    )
+    def test_a_real_exec_arrives_with_the_policy(self, kwargs, call, tmp_path):
+        """End to end: the program that replaces the process holds the caller's policy."""
+        text = repr(kwargs).replace("'TOKEN'", "object()")
+        script = tmp_path / "exec_parent.py"
+        script.write_text(
+            f"PROBE = {_CHILD_STATE_PROBE!r}\n" + _EXEC_PROBE_PARENT.format(kwargs=text, call=call),
+            encoding="utf-8",
+        )
+        r = subprocess.run(  # nosec B603
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+        )
+        assert "SubprocessBlocked" not in r.stderr, r.stderr
+        state = json.loads(r.stdout)
+        assert state["active"] is True
+        assert state["locked"] is kwargs.get("locked", False)
+        assert state["allow"] == ["*.example.com"]
 
 
 class TestLaunchEnvPerformance:

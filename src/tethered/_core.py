@@ -2372,6 +2372,48 @@ def _inject_launch_env(
     return None
 
 
+def _exec_with_policy(
+    cfg: _Config, args: tuple[Any, ...], pairs: list[tuple[Any, Any]], payload: str
+) -> None:
+    """Carry out an ``os.exec*`` of this interpreter with the policy in its environment.
+
+    An audit hook cannot change the arguments of the call it is asked about,
+    and the environment of an ``os.exec*`` has been converted by the time
+    the event is raised, so nothing written to the caller's mapping would
+    arrive.  But an exec does not return, which leaves a way no other route
+    has: the hook makes the same call itself, with the same program and
+    arguments and a copy of the environment that carries the payload.  If
+    it succeeds the process is replaced, as the caller asked.  If it fails,
+    the error is the one the caller's own call would have met, and it
+    leaves the hook as that call's exception (``os.execvp*`` goes on to the
+    next directory of ``PATH`` on it, as it always does).
+
+    Every other route that cannot be given the payload is refused in locked
+    mode and counts as external otherwise, and that is the wrong answer
+    here.  Whoever calls ``os.exec*`` has usually just forked, and an
+    exception at that point leaves a second copy of the parent running the
+    parent's code.  gunicorn's ``SIGUSR2`` upgrade passes the environment it
+    saved before the application activated a policy; refused under a locked
+    policy, the copy stopped the workers and removed the listening socket of
+    the server it was meant to replace.
+
+    Locked mode takes this way only for an environment that simply lacks
+    the variable, which is what a caller with a list of its own produces.
+    One that carries a different policy is still refused.
+    """
+    env = {key: value for key, value in pairs if not _is_policy_env_key(key)}
+    env[_CHILD_POLICY_ENV] = payload
+    if cfg.locked:
+        logger.warning(
+            "tethered: %s was given an environment without %s; carried out with the "
+            "locked policy added",
+            _describe_subprocess_launch("os.exec", args),
+            _CHILD_POLICY_ENV,
+        )
+    # The caller's own exec, program and arguments unchanged.
+    os.execve(args[0], args[1], env)  # nosec B606
+
+
 def _same_path(a: Any, b: Any) -> bool:
     """Return True if two ``str`` paths name the same file, compared lexically."""
     if not isinstance(a, str) or not isinstance(b, str):
@@ -2562,7 +2604,10 @@ def _handle_subprocess(
     #     'global' ("substitution") and more than one spelling of the key.
     #     A differing scope list is not refused: scopes can only narrow
     #     within the checked global ceiling, so they can't widen child
-    #     enforcement past the parent.
+    #     enforcement past the parent.  One route is not refused for
+    #     absence, in locked mode either: an ``os.exec*`` of this
+    #     interpreter is carried out with the payload added
+    #     (_exec_with_policy).
     #
     # The comparison never raises, so no stray exception escapes the audit
     # hook in place of ``SubprocessBlocked``.  Locked mode requires
@@ -2586,6 +2631,15 @@ def _handle_subprocess(
         pairs = _snapshot_env(env_value)
         state = "unreadable" if pairs is None else _launch_env_state(pairs, expected, payload)
         acceptable = state in ("exact", "same-global")
+        if (
+            event == "os.exec"
+            and is_python
+            and pairs is not None
+            and (state == "missing" or not (acceptable or cfg.locked))
+        ):
+            # The one route that is carried out here: it does not come back
+            # unless the exec itself fails, and then with that error.
+            _exec_with_policy(cfg, args, pairs, payload)
         if cfg.locked and not acceptable:
             _refuse_launch(event, _describe_launch(event, args, launch_args), "env", state)
         needs_rewrite = state != "exact"
