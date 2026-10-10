@@ -511,6 +511,37 @@ _proactor_warning_pending: bool = sys.platform == "win32"
 # through it — see _warn_if_uvloop.
 _uvloop_warning_pending: bool = sys.platform != "win32"
 
+# The ``import`` events at which loading uvloop is refused while a policy is
+# active — see _refuse_uvloop_import.  ``import uvloop`` raises one for the
+# package.  ``importlib.import_module("uvloop")`` raises none for it, only for
+# what the package's ``__init__`` imports, of which ``uvloop.loop`` is the
+# extension that holds the event loop.  Neither is raised again once uvloop is
+# loaded, so a uvloop that was imported before the policy is not touched here.
+_UVLOOP_IMPORT_NAMES = frozenset(("uvloop", "uvloop.loop"))
+
+# True until that refusal has been logged.  Servers that pick uvloop on their
+# own catch the ImportError and fall back to another loop without a word, so
+# the log line is the only sign of why they run on it.
+_uvloop_refusal_unlogged: bool = True
+
+_UVLOOP_IMPORT_REFUSED_MSG = (
+    "tethered: uvloop was not loaded — a policy is active, and a uvloop event loop does "
+    "its networking outside Python's socket module, where tethered sees none of it. Run "
+    "the application on the standard asyncio event loop, on which the policy is enforced; "
+    "a server that chooses uvloop automatically (uvicorn) does so on its own after this "
+    "error."
+)
+
+_UVLOOP_STRICT_MSG = (
+    "tethered: activate() refused — uvloop is loaded in this process. A uvloop event loop "
+    "does its networking outside Python's socket module and raises no audit event, so the "
+    "policy would not be applied to the connections, name lookups, datagrams and process "
+    "launches made through it, and locked=True / fail_closed=True ask for a policy that "
+    "is applied or nothing. Nothing was changed. Run the application on the standard "
+    "asyncio event loop (uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the "
+    "environment)."
+)
+
 # DNS resolution events to intercept outside getaddrinfo.
 #
 # ``socket.getnameinfo`` is deliberately absent.  Its audit event carries the
@@ -798,13 +829,24 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
             _handle_env_change(event, args)
         return
 
-    # Locked-mode-only tamper detection on FS access to tethered.pth.
-    # ``open`` fires constantly during normal program operation, so
-    # short-circuit on cfg.locked before doing any per-event work.
+    # What is left needs a policy.  ``open`` fires constantly during normal
+    # program operation, so nothing is done per event before that is known.
     cfg = _config
-    if cfg is None or not cfg.locked:
+    if cfg is None:
         return
-    if event in _PTH_FS_EVENTS:
+
+    # An event loop the hook cannot see into is not loaded under a policy.
+    # A log-only policy refuses nothing; it gets the warning instead, at the
+    # first socket uvloop creates (_warn_if_uvloop).
+    if event == "import":
+        if args and not cfg.log_only:
+            name = args[0]
+            if isinstance(name, str) and name in _UVLOOP_IMPORT_NAMES:
+                _refuse_uvloop_import()
+        return
+
+    # Locked-mode-only tamper detection on FS access to tethered.pth.
+    if cfg.locked and event in _PTH_FS_EVENTS:
         _handle_pth_fs_op(cfg, event, args)
 
 
@@ -879,6 +921,38 @@ def _warn_if_uvloop() -> None:
         "locked policy and inside a scope() as well. Run the application on the "
         "standard asyncio event loop for enforcement (uvicorn: --loop asyncio)."
     )
+
+
+def _refuse_uvloop_import() -> None:
+    """Raise ``ImportError`` for an import of uvloop made while a policy is active.
+
+    Nothing that goes through a uvloop event loop raises an audit event, so
+    a process that runs on one has a policy that is applied to none of its
+    asynchronous networking.  That cannot be put right once the loop runs,
+    but it can be prevented while uvloop is still to be loaded: the servers
+    that prefer uvloop (uvicorn and its gunicorn worker among them) take it
+    only if importing it works, and run on the standard asyncio event loop,
+    where the policy is enforced, when it does not.  Code that asks for
+    uvloop by name fails at that import, with the reason, in place of
+    running unprotected.
+
+    This is a guard against a deployment that would silently not be
+    enforced, not a barrier to code that is out to get around tethered:
+    such code can load any other extension that does its own networking.
+    A uvloop that is already loaded is the business of ``activate()``
+    (``_UVLOOP_STRICT_MSG``) and of ``_warn_if_uvloop``.
+    """
+    global _uvloop_refusal_unlogged
+    if _uvloop_refusal_unlogged:
+        # Cleared before logging: a log handler may itself import something.
+        _uvloop_refusal_unlogged = False
+        logger.warning(
+            "tethered: refused to load uvloop while a policy is active — nothing that goes "
+            "through a uvloop event loop is seen by tethered. A server that chooses its "
+            "event loop automatically now runs on the standard asyncio event loop, where "
+            "the policy is enforced; code that requires uvloop fails with ImportError."
+        )
+    raise ImportError(_UVLOOP_IMPORT_REFUSED_MSG, name="uvloop")
 
 
 def _hint_from_stack(scope_stack: tuple[_ScopeConfig, ...]) -> str | None:
@@ -3196,7 +3270,11 @@ def activate(
             it (a hook that raises ``RuntimeError`` for the
             ``sys.addaudithook`` event makes Python drop a new hook without
             reporting an error): nothing would be enforced, so nothing is
-            activated.  Also if the call is made from inside an
+            activated.  Also if ``locked`` or ``fail_closed`` is set, without
+            ``log_only``, while uvloop is loaded in the process: nothing that
+            goes through a uvloop event loop raises an audit event, so the
+            policy would not be applied to it (any other policy is
+            activated, with a warning).  Also if the call is made from inside an
             ``activate()`` or ``deactivate()`` that the same thread is
             running in another interpreter of the process (waiting for
             that one would never end), or if another thread is in the
@@ -3277,6 +3355,11 @@ def activate(
         _local_hostname=local_hostname,
     )
 
+    # A policy that asks to be applied or nothing is not put in place over an
+    # event loop it would not be applied to.  Any other policy is, with a
+    # warning; a log-only policy refuses nothing, this included.
+    if (locked or fail_closed) and not log_only and "uvloop" in sys.modules:
+        raise RuntimeError(_UVLOOP_STRICT_MSG)
     if _uvloop_warning_pending:
         _warn_if_uvloop()
 

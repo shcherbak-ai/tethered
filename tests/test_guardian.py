@@ -663,6 +663,7 @@ _UNPINNED_GLOBALS = {
         "_active_scope_count": "number of scopes entered anywhere in the process (int)",
         "_proactor_warning_pending": "cleared once the Proactor-loop warning has been logged",
         "_uvloop_warning_pending": "cleared once the uvloop warning has been logged",
+        "_uvloop_refusal_unlogged": "cleared once a refused import of uvloop has been logged",
         "_pth_path_cache": "bootstrap path cached for scope-only use (None until computed)",
         "_env_dirty": "set when the policy variable changed behind os.environ's back",
         **_MODULE_METADATA,
