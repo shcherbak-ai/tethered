@@ -332,9 +332,14 @@ def test_log_only_on_the_standard_loop_reports_what_uvloop_hides() -> None:
 
 
 class TestUvloopByName:
+    # "uvloop" is uvicorn's own name for it and ends in an "import uvloop"
+    # statement.  "uvloop:new_event_loop" is a loop factory given as an import
+    # string, which uvicorn loads with importlib.import_module(): that route
+    # raises no import event for the package itself, only for uvloop.loop.
+    @pytest.mark.parametrize("loop", ["uvloop", "uvloop:new_event_loop"])
     @pytest.mark.parametrize("policy", ["plain", "locked"])
-    def test_the_server_does_not_start(self, policy: str) -> None:
-        done = run_to_exit([*UVICORN_ONCE, "--loop=uvloop"], env={"TETH_ACTIVATE": policy})
+    def test_the_server_does_not_start(self, policy: str, loop: str) -> None:
+        done = run_to_exit([*UVICORN_ONCE, f"--loop={loop}"], env={"TETH_ACTIVATE": policy})
         assert done["returncode"] == 1, done
         output = done["output"]
         # The application was imported, the policy is active, and then
