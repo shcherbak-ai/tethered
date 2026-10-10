@@ -120,12 +120,12 @@ SECURITY.md            # Threat model, what tethered does/doesn't protect agains
 - Bandit handles security scanning. Configuration is in `pyproject.toml` under `[tool.bandit]`. Tests are excluded. Intentional suppressions use inline `# nosec BXXX` comments.
 - Interrogate enforces docstring coverage on public items in `src/`. Configuration is in `pyproject.toml` under `[tool.interrogate]`. Private/magic/init are excluded (consistent with the "no docstrings on private helpers" convention). `fail-under = 100`.
 - Lint: `uv run ruff check .` (auto-fix with `--fix`)
-- Format: `uv run ruff format .`
+- Format: `uv run ruff format .` (Python files only: Markdown is excluded in `[tool.ruff.format]`, because the examples in the docs are laid out by hand)
 - Type check: `uv run ty check src/ examples/`
 - Docstrings: `uv run interrogate src/ -v`
 - Security: `uv run bandit -c pyproject.toml -r src/`
 - Cppcheck runs C static analysis on `_guardian.c` via a Docker-based pre-commit hook (`scripts/cppcheck.sh`). Requires Docker. Also runs in the CI lint job via `apt-get install cppcheck`.
-- Pre-commit hooks run ruff, bandit, ty, interrogate, markdownlint, and cppcheck on every commit, and commitizen on commit messages. Ty and interrogate run as local hooks via `uv run`. Cppcheck runs via Docker (builds a `tethered-cppcheck` image from `ubuntu:24.04` on first use). Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. Third-party hooks are pinned by commit SHA for supply-chain integrity. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
+- Pre-commit hooks run ruff, bandit, ty, interrogate, markdownlint, and cppcheck on every commit, and commitizen on commit messages. Ruff, bandit, ty, interrogate and commitizen run as local hooks via `uv run`, so the hooks, the commands above and CI all use the one version of each that `uv.lock` pins; upgrade a tool with `uv lock --upgrade-package <name>`, not in `.pre-commit-config.yaml`. Cppcheck runs via Docker (builds a `tethered-cppcheck` image from `ubuntu:24.04` on first use). Tests run in CI only (not in pre-commit) to avoid conflicts with `uv.lock` during version bumps. The remaining third-party hooks (pre-commit-hooks, markdownlint-cli2) are pinned by commit SHA for supply-chain integrity, and `uv.lock` records the hash of every Python tool. Install with `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg`.
 - CI runs `pre-commit run --all-files` (lint job, includes ty), `cppcheck` on the C extension, and the full test matrix. The publish job uses `cibuildwheel` to build platform-specific wheels with the compiled C extension. GitHub Actions are pinned by commit SHA. The workflow uses `permissions: { contents: read }` for least privilege. A separate CodeQL workflow scans both Python and C/C++ code on push to main, on PRs, and weekly.
 
 ### What NOT to do

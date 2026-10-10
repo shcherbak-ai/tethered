@@ -41,7 +41,7 @@ uv run pytest tests_examples/ -v
 
 ## Linting and formatting
 
-Pre-commit hooks run all checks automatically on every commit, but you can also run them manually:
+Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, commitizen) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`:
 
 ```bash
 uv run pre-commit run --all-files

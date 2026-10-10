@@ -71,6 +71,11 @@ markers = ["requires_network: test needs external DNS resolution (dns.google)"]
 target-version = "py311"
 line-length = 100
 
+[tool.ruff.format]
+# The examples in the documentation are laid out by hand (aligned comments);
+# ruff would otherwise reformat the Python code blocks in Markdown files.
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 select = [
     "E",     # pycodestyle errors
