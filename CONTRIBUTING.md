@@ -135,7 +135,7 @@ On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` wi
 
 ## Code conventions
 
-- Zero runtime dependencies — stdlib only (including the C extension, which uses only the CPython C API).
+- Zero runtime dependencies — stdlib only (including the C extension, which uses the CPython C API, the C standard library and a few operating-system calls, and links against no external library).
 - `from __future__ import annotations` in all Python modules.
 - Private modules prefixed with `_`.
 - Type hints on all public functions.

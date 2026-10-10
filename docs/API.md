@@ -131,9 +131,10 @@ A host or address that tethered cannot read (for example a non-ASCII byte string
 Raised when tethered refuses a process launch or, in locked mode, a guarded operation. Subclass of `RuntimeError`. See [SUBPROCESS.md](SUBPROCESS.md) for the full behavior. It is raised:
 
 - for an external launch under `external_subprocess_policy="block"`;
-- in locked mode, for a launch whose environment fails the payload-integrity check or cannot be given the payload;
+- in locked mode, for a launch whose environment fails the payload-integrity check or cannot be given the payload; for a launch that inherits the environment, that includes a policy variable that was changed from another interpreter or below Python;
 - in locked mode, for a refused operation on `tethered.pth` (delete, rename, write-mode open, chmod, truncate);
-- in locked mode, by the C guardian for a launch, a guarded filesystem operation, or an `os.putenv` / `os.unsetenv` of the policy variable while the integrity check fails.
+- in locked mode, by the C guardian for a launch, a guarded filesystem operation, or an `os.putenv` / `os.unsetenv` of the policy variable while the integrity check fails;
+- in locked mode, by the C guardian in an interpreter that neither holds the lock nor has joined it, for every launch and every change to the bootstrap files or the policy variable, and in an interpreter that has joined it for a change to the policy variable (see [Locked mode](#locked-mode)).
 
 For launches it comes out of whichever call raised the audit event: `subprocess`, `os.system`, `os.exec*`, `os.spawn*`, `os.posix_spawn`, `os.startfile`, `multiprocessing` `Process.start()` and pool construction (Windows; POSIX from Python 3.14), and direct `_winapi.CreateProcess` calls (Windows).
 
@@ -146,7 +147,7 @@ Like `EgressBlocked`, it can be pickled and copied with its attributes.
 
 ## `tethered.TetheredLocked`
 
-Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token — except when `activate()` re-requests a policy identical to the active one, which is an idempotent no-op (see [Locked mode](#locked-mode)). Also raised, even with the correct token, when the locked policy has failed its integrity check. Subclass of `RuntimeError`.
+Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token — except when `activate()` re-requests a policy identical to the active one, which is an idempotent no-op (see [Locked mode](#locked-mode)). Also raised, even with the correct token, when the locked policy has failed its integrity check. Only the interpreter that took the lock can present its token, so in every other interpreter of the process `deactivate()` raises it while the lock is held, and so does `activate()` unless it is that no-op. Subclass of `RuntimeError`.
 
 ## Locked mode
 
@@ -164,7 +165,9 @@ Calling `activate()` or `deactivate()` without the correct `lock_token` raises `
 
 While a policy is locked, the C extension re-checks a snapshot of tethered's own code and of the active policy on every socket event, every process launch, and the guarded `tethered.pth` / policy-variable operations. If something it recorded has been replaced, those operations are refused (`EgressBlocked` for socket events, `SubprocessBlocked` for the others) until the original objects are back, and during that time the policy can be neither replaced nor deactivated, even with the token.
 
-The lock is process-wide. A subinterpreter can be created and can compute while a policy is locked, but it is refused every connection, lookup and process launch and any change to the bootstrap files or the policy variable (`EgressBlocked` / `SubprocessBlocked` when tethered is loaded there, otherwise `RuntimeError`), and `activate()` / `deactivate()` fail in it. `log_only` holds in every interpreter: under a locked log-only policy other interpreters' connections and lookups pass, while launches and the other guarded operations stay refused.
+The lock is held once per process, by the interpreter that called `activate(locked=True)`. An interpreter created while it is held (a subinterpreter, a `concurrent.futures.InterpreterPoolExecutor` worker) joins the lock as it starts, through the `tethered.pth` bootstrap. It gets its own locked copy of the policy, checked like the lock holder's: it reaches what the policy allows and gets `EgressBlocked` for the rest. It has no token, so `deactivate()` raises `TetheredLocked` there and `activate()` behaves as it does without the token: a no-op for the identical policy, `TetheredLocked` for any other. It cannot change the policy variable either.
+
+An interpreter that has not joined is refused every connection, lookup and process launch and any change to the bootstrap files or the policy variable for as long as the lock is held (`EgressBlocked` / `SubprocessBlocked` when tethered is loaded there, otherwise `RuntimeError`), and `activate()` / `deactivate()` fail in it. It can still be created and can compute. This is the case for an interpreter that existed before the lock was taken, for one that started without the bootstrap (tethered not installed in site-packages, or a process started with `-S`), and for one that joined a policy the lock holder has since replaced with a different one. So take the lock before creating subinterpreters or interpreter pools, and install tethered normally (not editable, not `--target`). `log_only` holds in every interpreter: under a locked log-only policy nobody's connections and lookups are refused, while an interpreter outside the lock is still refused launches and the other guarded operations. [SECURITY.md](../SECURITY.md#locked-mode--what-it-does-and-does-not-do) has the full rules: when a join is accepted, what it does and does not protect, and what happens when the lock is released or its holder is destroyed.
 
 Locked mode is not a sandbox. [SECURITY.md](../SECURITY.md#locked-mode--what-it-does-and-does-not-do) lists what is checked and what in-process Python code can still do. Two practical points from there: set `fail_closed=True` together with `locked=True`, and remember that a token reference you keep (`secret` above) can also be found by other code in the process — pass `lock_token=object()` without keeping it if the policy should never be unlocked.
 
