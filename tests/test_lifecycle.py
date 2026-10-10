@@ -75,10 +75,31 @@ def veto():
 
 @pytest.fixture
 def loopback_port():
-    """A listening TCP port on 127.0.0.1."""
+    """A listening TCP port on 127.0.0.1 that accepts and closes every connection.
+
+    The accept-and-close daemon is load-bearing.  A listener that only calls
+    ``listen()`` and never ``accept()`` stops completing handshakes once the
+    backlog fills — 64 pending connections here — after which the next
+    connect is refused (Windows) or blocks to its timeout (Linux).
+    ``test_many_threads`` probes with an unbounded connect loop whose
+    ``_try_connect`` catches only :class:`~tethered.EgressBlocked`, so such an
+    ``OSError`` would escape and fail the test intermittently, the more so
+    under load.  Draining keeps every allowed connect genuinely connectable,
+    which is what these tests mean to assert.
+    """
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(64)
+
+    def drain() -> None:
+        while True:
+            try:
+                conn, _ = server.accept()
+                conn.close()
+            except OSError:
+                return
+
+    threading.Thread(target=drain, daemon=True).start()
     yield server.getsockname()[1]
     server.close()
 
@@ -345,6 +366,19 @@ class TestSerializedTransitions:
         assert probes > 10
         _assert_coherent(secret)
         assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_loopback_fixture_serves_past_the_backlog(self, loopback_port):
+        """The loopback fixture must keep serving connects past ``listen()``'s backlog.
+
+        ``test_many_threads`` probes with an unbounded connect loop; if the
+        fixture's listener did not drain its accept queue it would refuse
+        (Windows) or time out (Linux) once the backlog of 64 filled, raising
+        an ``OSError`` that ``_try_connect`` does not catch and that would
+        surface as a spurious failure under load.  Many sequential connects —
+        well past the backlog — must all succeed.
+        """
+        for _ in range(200):
+            assert _try_connect(loopback_port) == "connected"
 
     def test_many_threads(self, loopback_port, capfd):
         """Lifecycle calls from several threads while another thread keeps connecting."""
