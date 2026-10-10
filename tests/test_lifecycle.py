@@ -86,21 +86,32 @@ def loopback_port():
     ``OSError`` would escape and fail the test intermittently, the more so
     under load.  Draining keeps every allowed connect genuinely connectable,
     which is what these tests mean to assert.
+
+    The daemon ends with the test.  Closing the socket does not wake an
+    ``accept()`` that another thread is blocked in on Linux, and a thread left
+    behind would make every later ``fork()`` in the session a fork of a
+    multi-threaded process.  So ``accept()`` waits with a timeout and the
+    thread is joined before the socket is closed.
     """
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(64)
+    server.settimeout(0.05)
+    done = threading.Event()
 
     def drain() -> None:
-        while True:
+        while not done.is_set():
             try:
                 conn, _ = server.accept()
-                conn.close()
-            except OSError:
-                return
+            except OSError:  # nothing to accept within the timeout
+                continue
+            conn.close()
 
-    threading.Thread(target=drain, daemon=True).start()
+    drainer = threading.Thread(target=drain, daemon=True)
+    drainer.start()
     yield server.getsockname()[1]
+    done.set()
+    drainer.join()
     server.close()
 
 
