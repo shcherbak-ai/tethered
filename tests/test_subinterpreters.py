@@ -89,15 +89,15 @@ TETHERED_LOCKED = "tethered._core.TetheredLocked"
 RUNTIME_ERROR = "builtins.RuntimeError"
 
 # What activate() and deactivate() say (TetheredLocked) in an interpreter
-# that does not hold the lock of its process.
-ACTIVATE_LOCKED = (
-    "tethered: activate() blocked — a locked policy is active and the requested policy "
-    "differs from it. Pass the original lock_token to replace a locked policy."
+# that is outside the lock of its process: neither its holder nor joined.
+_OUTSIDE_THE_LOCK = (
+    "blocked — a policy is locked by another interpreter of this process, and this "
+    "interpreter is outside that lock: it existed before the lock was taken, or did not "
+    "join it when it started. It can neither change nor release that policy, whatever "
+    "token it passes. Take the lock before the other interpreters of the process are created."
 )
-DEACTIVATE_LOCKED = (
-    "tethered: deactivate() blocked — policy is locked. "
-    "Pass the same lock_token to deactivate() to unlock."
-)
+ACTIVATE_LOCKED = f"tethered: activate() {_OUTSIDE_THE_LOCK}"
+DEACTIVATE_LOCKED = f"tethered: deactivate() {_OUTSIDE_THE_LOCK}"
 # What taking the activation claim says (RuntimeError) on a thread that
 # holds it in another interpreter.
 CANNOT_WAIT_FOR_ITSELF = (
@@ -1899,6 +1899,7 @@ class TestInterpretersSharingTheGil:
             guardian = core._c_guardian
             out["config locked"] = core._config.locked
             out["is_active"] = guardian.is_active()
+            out["holds_lock"] = guardian.holds_lock()
             out["check_token"] = guardian.check_token(object())
             out["check_token None"] = guardian.check_token(None)
             out["verify"] = guardian.verify()
@@ -1918,6 +1919,7 @@ class TestInterpretersSharingTheGil:
         )
         assert result["config locked"] is False
         assert result["is_active"] is True
+        assert result["holds_lock"] is False
         assert result["check_token"] is False
         assert result["check_token None"] is False
         assert result["verify"] is False

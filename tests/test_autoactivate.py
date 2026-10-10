@@ -1178,6 +1178,9 @@ class _LockHeldElsewhere:
     def is_active(self) -> bool:
         return self._payload is not None
 
+    def holds_lock(self) -> bool:
+        return False  # another interpreter does
+
     def locked_payload(self) -> str | None:
         return self._payload
 

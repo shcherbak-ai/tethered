@@ -255,6 +255,15 @@ class TestLockTokenHeldInC:
                 assert value is not secret, name
                 assert not (type(value) is int and value == id(secret)), name
 
+    def test_holds_lock_says_whether_this_interpreter_took_the_lock(self):
+        """(False in an interpreter that did not: ``test_subinterpreters.py``.)"""
+        token = object()
+        assert _core._c_guardian.holds_lock() is False
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        assert _core._c_guardian.holds_lock() is True
+        tethered.deactivate(lock_token=token)
+        assert _core._c_guardian.holds_lock() is False
+
     def test_reading_the_token_back_from_the_config_does_not_unlock(self):
         """The report's one-liner: deactivate(lock_token=_config.lock_token)."""
         tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())

@@ -286,6 +286,17 @@ _activation_claim = _UnsharedClaim() if _c_guardian is None else _c_guardian.act
 
 _config: _Config | None = None
 
+# What activate() / deactivate() say in an interpreter that neither took
+# the lock nor joined it.  The usual advice, to pass the lock token, would
+# send its user the wrong way: the token lives in another interpreter.
+_OUTSIDE_THE_LOCK_MSG = (
+    "tethered: {call} blocked — a policy is locked by another interpreter of this "
+    "process, and this interpreter is outside that lock: it existed before the lock "
+    "was taken, or did not join it when it started. It can neither change nor release "
+    "that policy, whatever token it passes. Take the lock before the other "
+    "interpreters of the process are created."
+)
+
 _TAMPERED_POLICY_MSG = (
     "tethered: the locked policy has failed its integrity check, so it can be "
     "neither replaced nor deactivated — re-activating would take a fresh snapshot "
@@ -3027,6 +3038,22 @@ def _build_integrity_snapshot(cfg: _Config) -> list[tuple[object, str, int]]:
     return entries
 
 
+def _locked_refusal(call: str, message: str | None) -> TetheredLocked:
+    """Word the refusal of ``call`` under a lock for where this interpreter stands.
+
+    ``message`` is what the interpreter that took the lock is told, and one
+    that joined it.  An interpreter outside the lock has no locked config of
+    its own and is not the holder.
+    """
+    cfg = _config
+    outside = (
+        _c_guardian is not None and not _c_guardian.holds_lock() and (cfg is None or not cfg.locked)
+    )
+    if outside:
+        return TetheredLocked(_OUTSIDE_THE_LOCK_MSG.format(call=call))
+    return TetheredLocked(message)
+
+
 def _is_idempotent_reactivation(requested_payload: str) -> bool:
     """Return True when a locked ``activate()`` re-requests the exact active policy.
 
@@ -3231,7 +3258,7 @@ def activate(
                 if not _c_guardian.check_token(lock_token):
                     if _is_idempotent_reactivation(serialized_payload):
                         return
-                    raise TetheredLocked(activate_locked_msg)
+                    raise _locked_refusal("activate()", activate_locked_msg)
                 if not _c_guardian.verify():
                     raise TetheredLocked(_TAMPERED_POLICY_MSG)
 
@@ -3344,7 +3371,7 @@ def deactivate(*, lock_token: object | None = None) -> None:
             # extension no policy can be locked.
             if _c_guardian is not None and _c_guardian.is_active():
                 if not _c_guardian.check_token(lock_token):
-                    raise TetheredLocked
+                    raise _locked_refusal("deactivate()", None)
                 if not _c_guardian.verify():
                     raise TetheredLocked(_TAMPERED_POLICY_MSG)
 

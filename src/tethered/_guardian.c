@@ -3162,6 +3162,20 @@ py_is_active(PyObject *self, PyObject *Py_UNUSED(ignored))
     return PyBool_FromLong(ATOMIC_LOAD(guardian_active));
 }
 
+/* holds_lock() → bool: is the calling interpreter the one that took the
+ * lock?  Lets the Python side tell a caller that the lock is another
+ * interpreter's, where passing a token could never help. */
+static PyObject *
+py_holds_lock(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    (void)self;
+    int id = current_interpreter_id();
+
+    return PyBool_FromLong(ATOMIC_LOAD(guardian_active) &&
+                           id != NO_INTERPRETER_ID &&
+                           id == ATOMIC_LOAD(guardian_owner_id));
+}
+
 static PyObject *
 py_check_token(PyObject *self, PyObject *args)
 {
@@ -3538,6 +3552,9 @@ static PyMethodDef guardian_methods[] = {
     {"is_active",   py_is_active,   METH_NOARGS,
      "Return True if the guardian is active: a policy is locked, by this\n"
      "interpreter or by another one of the process."},
+    {"holds_lock",  py_holds_lock,  METH_NOARGS,
+     "Return True if a policy is locked and this interpreter is the one\n"
+     "that took the lock."},
     {"check_token", py_check_token, METH_VARARGS,
      "Return True if the guardian is inactive or the object is the lock token.\n\n"
      "Always False in an interpreter that does not hold the lock."},
