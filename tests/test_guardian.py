@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _socket
 import builtins
+import codecs
 import contextlib
 import copy
 import functools
@@ -710,6 +711,13 @@ _TYPE_MANAGED_ATTRIBUTES = frozenset(
         "__annotations_cache__",
     )
 )
+
+
+# The codec ``getaddrinfo`` encodes a host name with, loaded before any test
+# tampers with tethered: its first use is an import, and the audit event of an
+# import goes through the very hook a test has just damaged, which may answer
+# with any error at all before the lookup the test is about is reached.
+codecs.lookup("idna")
 
 
 def _activate_locked(**kwargs: object) -> None:
