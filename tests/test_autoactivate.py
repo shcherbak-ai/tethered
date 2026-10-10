@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -1180,6 +1181,10 @@ class _LockHeldElsewhere:
     def locked_payload(self) -> str | None:
         return self._payload
 
+    def process_policy_env(self) -> str | None:
+        # What the process holds: in a test run, what os.environ shows.
+        return os.environ.get(_CHILD_POLICY_ENV)
+
     def join(self, namespace: dict, config: object, snapshot: list) -> None:
         self.joins.append((namespace, config, snapshot))
         if self._refusal is not None:
@@ -1620,3 +1625,105 @@ class TestBootstrapUnderALock:
         (warning,) = self._warnings(caplog)
         assert warning.startswith("tethered: auto-activation failed: ")
         assert _JOIN_WARNING not in warning
+
+
+class TestBootstrapTakesItsTurn:
+    """The bootstrap waits for an ``activate()`` / ``deactivate()`` under way elsewhere.
+
+    The variable is written before a policy is committed, so an interpreter
+    that starts in between would go by a state that never was.  It takes
+    the activation claim like those calls do.  (Between real interpreters:
+    ``test_subinterpreters.py``.)
+    """
+
+    @staticmethod
+    def _bootstrap_in_a_thread():
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                _autoactivate._autoactivate_from_env()
+            except BaseException as exc:  # handed to the test
+                errors.append(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, done, errors
+
+    def test_it_waits_and_then_establishes_the_policy(self, monkeypatch):
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"]))
+        with _core._activation_claim:
+            thread, done, errors = self._bootstrap_in_a_thread()
+            assert not done.wait(0.3)
+            assert _core._config is None
+        assert done.wait(30)
+        thread.join(30)
+        assert errors == []
+        assert _core._config.policy.is_allowed("api.example.com", 443)
+        assert _core._activation_claim.held() == 0
+
+    @pytest.mark.parametrize("meanwhile", ["replaced", "removed"])
+    def test_after_the_wait_it_goes_by_what_the_process_holds(self, meanwhile, monkeypatch):
+        """What it found when it started may be a policy that was never committed."""
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.first.com"]))
+        with _core._activation_claim:
+            thread, done, errors = self._bootstrap_in_a_thread()
+            assert not done.wait(0.3)
+            if meanwhile == "replaced":
+                monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.second.com"]))
+            else:
+                monkeypatch.delenv(_CHILD_POLICY_ENV)
+        assert done.wait(30)
+        thread.join(30)
+        assert errors == []
+        if meanwhile == "replaced":
+            assert _core._config.policy.is_allowed("api.second.com", 443)
+            assert not _core._config.policy.is_allowed("api.first.com", 443)
+        else:
+            assert _core._config is None
+
+    def test_where_it_cannot_wait_it_goes_by_what_it_found(self, monkeypatch):
+        """On a thread that is inside another interpreter's transition, or at shutdown."""
+        payload = _locked_payload_of(allow=["*.example.com"])
+
+        class _NoWaiting:
+            restored: int | None = None
+
+            def held(self) -> int:
+                return 0
+
+            def __enter__(self) -> None:
+                raise RuntimeError("tethered: this call cannot wait")
+
+            def __exit__(self, *exc_info: object) -> None:
+                raise AssertionError("never entered")
+
+            def restore(self, held: int) -> None:
+                self.restored = held
+
+        claim = _NoWaiting()
+        monkeypatch.setattr(_core, "_activation_claim", claim)
+        monkeypatch.setattr(_autoactivate, "_in_subinterpreter", lambda: True)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        _autoactivate._autoactivate_from_env()
+        assert _core._config is not None
+        assert _core._config.locked is False
+        assert not _core._config.policy.is_allowed("evil.test", 443)
+        assert claim.restored == 0
+
+    def test_an_error_after_the_wait_is_not_taken_for_a_wait_that_failed(self, monkeypatch):
+        calls = []
+
+        def fails(raw: str) -> None:
+            calls.append(raw)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(_autoactivate, "_bootstrap", fails)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _payload(allow=["*.example.com"]))
+        with pytest.raises(RuntimeError, match="boom"):
+            _autoactivate._autoactivate_from_env()
+        assert len(calls) == 1
+        assert _core._activation_claim.held() == 0

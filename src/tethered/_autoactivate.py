@@ -133,6 +133,49 @@ def _autoactivate_from_env() -> None:
     if raw is None:
         return
 
+    # An activate() or deactivate() may be under way in another interpreter
+    # of the process, with the variable written and nothing committed yet,
+    # or the other way round.  Wait for it, as those calls wait for each
+    # other, and then go by what the process holds: the bootstrap meets a
+    # transition before it or after it, never in the middle.
+    found = _claim_and_guardian()
+    if found is None:
+        _bootstrap(raw)  # tethered cannot be loaded here; reported there
+        return
+    claim, guardian = found
+    held = claim.held()
+    waited = False
+    # (The try around the with: see _core._activation_claim.)
+    try:
+        try:
+            with claim:
+                waited = True
+                settled = raw if guardian is None else guardian.process_policy_env()
+                if settled is not None:
+                    _bootstrap(settled)
+        except RuntimeError:
+            if waited:
+                raise
+            # Waiting could never end (this thread is inside the transition
+            # of another interpreter, or Python is shutting down): go by
+            # what this interpreter found when it started.
+            _bootstrap(raw)
+    finally:
+        claim.restore(held)
+
+
+def _claim_and_guardian() -> tuple | None:
+    """Return ``_core``'s activation claim and C guardian, or ``None`` if tethered cannot load."""
+    try:
+        import tethered._core as _core
+
+        return _core._activation_claim, _core._c_guardian
+    except Exception:
+        return None
+
+
+def _bootstrap(raw: str) -> None:
+    """Establish the policy for this interpreter: by joining a lock, or from ``raw``."""
     # Before the variable is read: what a locked process enforces is not
     # for the variable to say.
     joined = _join_locked_policy()

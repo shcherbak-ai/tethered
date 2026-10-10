@@ -3026,6 +3026,155 @@ class TestTakingTurns:
             "deactivate": ["TetheredLocked", DEACTIVATE_LOCKED],
         }
 
+    @pytest.mark.parametrize("shared_gil", GIL_KINDS)
+    def test_an_interpreter_created_during_a_replacement_joins_the_new_policy(
+        self, shared_gil, tmp_path
+    ):
+        """Its bootstrap waits for the transition and then joins what was committed.
+
+        Without the wait it joins the policy that is about to be replaced
+        (that is what the guardian still holds), and is outside the lock for
+        good a moment later.
+        """
+        result_file = tmp_path / "result.json"
+        env = {k: v for k, v in os.environ.items() if k != _CHILD_POLICY_ENV}
+        child = subprocess.run(  # nosec B603
+            [
+                sys.executable,
+                "-c",
+                _CREATED_DURING_A_REPLACEMENT,
+                str(result_file),
+                "shared" if shared_gil else "own",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert child.returncode == 0, child.stderr
+        assert TAMPER_ALERT not in child.stderr
+        out = json.loads(result_file.read_text())
+        assert out["created while the replacement was under way"] is False
+        found = out["interpreter"]
+        assert found["new"] == "connected"
+        assert found["old"].startswith("EgressBlocked: Blocked by tethered: 127.0.0.1:")
+        assert found["old"].endswith("is not in the allow list")
+        assert found["locked"] is True
+        assert found["verify"] is True
+
+
+# Child process of test_an_interpreter_created_during_a_replacement_joins_the_new_policy:
+# ``sys.argv`` holds the result file and the kind of interpreter to create.
+_CREATED_DURING_A_REPLACEMENT = '''
+import faulthandler, json, os, socket, sys, threading
+
+faulthandler.dump_traceback_later(120, exit=True)  # a hang is a failure, not a wait
+
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered
+
+result_file, kind = sys.argv[1:]
+
+def listener():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    def drain():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.close()
+    threading.Thread(target=drain, daemon=True).start()
+    return srv.getsockname()[1]
+
+old_port, new_port = listener(), listener()
+
+def create():
+    if sys.version_info >= (3, 13):
+        return interps.create("legacy" if kind == "shared" else "isolated")
+    if sys.version_info >= (3, 12):
+        return interps.create(isolated=kind != "shared")
+    return interps.create(isolated=False)
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+# When armed, holds back the lock holder's write of the variable: the
+# replacement is then under way, with its turn taken and nothing committed.
+armed, reached, go_on = threading.Event(), threading.Event(), threading.Event()
+
+def hold_the_write(event, args):
+    if event == "os.putenv" and armed.is_set() and not reached.is_set():
+        key = args[0].decode() if isinstance(args[0], bytes) else args[0]
+        if key.upper() == "_TETHERED_CHILD_POLICY":
+            reached.set()
+            go_on.wait(60)
+
+sys.addaudithook(hold_the_write)
+
+token = object()
+
+def lock(port):
+    tethered.activate(
+        allow=["127.0.0.1:%d" % port], allow_localhost=False, locked=True, lock_token=token
+    )
+
+lock(old_port)
+armed.set()
+replacing = threading.Thread(target=lock, args=(new_port,))
+replacing.start()
+assert reached.wait(60)
+
+created = []
+creating = threading.Thread(target=lambda: created.append(create()))
+creating.start()
+creating.join(1.0)
+out = {"created while the replacement was under way": not creating.is_alive()}
+go_on.set()
+replacing.join(60)
+creating.join(60)
+assert not replacing.is_alive() and not creating.is_alive()
+
+PROBE = """
+import json, socket
+import tethered._core as core
+
+def connect(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=5).close()
+    except RuntimeError as exc:
+        return type(exc).__name__ + ": " + str(exc)
+    return "connected"
+
+found = {
+    "old": connect(%d),
+    "new": connect(%d),
+    "locked": core._config is not None and core._config.locked,
+    "verify": core._c_guardian.verify(),
+}
+with open(%r, "w", encoding="utf-8") as f:
+    json.dump(found, f)
+""" % (old_port, new_port, result_file + ".interp")
+run(created[0], PROBE)
+with open(result_file + ".interp", encoding="utf-8") as f:
+    out["interpreter"] = json.load(f)
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(out, f)
+sys.stdout.flush()
+# (Not a normal exit: the interpreter was created on another thread, and
+# Python 3.12 cannot destroy it from this one.)
+os._exit(0)
+'''
+
 
 @pytest.mark.skipif(not OWN_GIL, reason="before Python 3.12 every interpreter shares one GIL")
 class TestConcurrency:
