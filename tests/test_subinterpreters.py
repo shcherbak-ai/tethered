@@ -2301,6 +2301,99 @@ class TestOtherStartupFailures:
         ]
 
 
+# Child process of test_interpreters_racing_for_the_first_lock_of_a_process:
+# ``sys.argv`` holds a directory for the racers' findings, their number, and
+# whether they all ask for the same policy ("same") or each for its own.
+_RACE_FOR_THE_LOCK = '''
+import faulthandler, json, os, sys, threading
+
+faulthandler.dump_traceback_later(120, exit=True)  # a hang is a failure, not a wait
+
+try:
+    import _interpreters as interps
+except ImportError:
+    import _xxsubinterpreters as interps
+import tethered._core as core  # loads the extension here; nothing is locked
+
+out_dir, racers, policies = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def create():
+    if sys.version_info >= (3, 13):
+        return interps.create("isolated")
+    return interps.create(isolated=True)
+
+def run(interp, code):
+    if hasattr(interps, "exec"):
+        failure = interps.exec(interp, code)
+        assert failure is None, getattr(failure, "formatted", failure)
+    else:
+        interps.run_string(interp, code)
+
+PREPARE = "import tethered\\nimport tethered._core\\n"
+
+RACE = """
+import json, sys
+import tethered
+import tethered._core as core
+
+def outcome(call, *args, **kwargs):
+    try:
+        call(*args, **kwargs)
+    except BaseException as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+found = {"took": outcome(
+    tethered.activate, allow=[%(allow)r], allow_localhost=False, locked=True,
+    lock_token=object(),
+)}
+found["config"] = None if core._config is None else core._config._serialized_payload
+found["verify"] = core._c_guardian.verify()
+found["connect"] = outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9))
+if found["took"] == "ok":
+    found["env state"] = core._process_env_state(found["config"])
+    found["process env"] = core._c_guardian.process_policy_env()
+with open(%(path)r, "w", encoding="utf-8") as f:
+    json.dump(found, f)
+"""
+
+start = threading.Barrier(racers)
+failures = []
+
+def race(n):
+    try:
+        interp = create()
+        try:
+            run(interp, PREPARE)
+            allow = "127.0.0.1:1" if policies == "same" else "127.0.0.1:%d" % (1000 + n)
+            code = RACE % {"allow": allow, "path": os.path.join(out_dir, "%d.json" % n)}
+            start.wait(timeout=60)
+            run(interp, code)
+        finally:
+            # By the thread that created it (see the concurrency test of joins).
+            interps.destroy(interp)
+    except BaseException as exc:
+        failures.append(repr(exc))
+
+threads = [threading.Thread(target=race, args=(n,)) for n in range(racers)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join(timeout=100)
+assert not failures, failures
+assert not any(thread.is_alive() for thread in threads)
+
+found = []
+for n in range(racers):
+    with open(os.path.join(out_dir, "%d.json" % n), encoding="utf-8") as f:
+        found.append(json.load(f))
+print(json.dumps({
+    "racers": found,
+    "main": [core._c_guardian.is_active(), core._c_guardian.verify()],
+}))
+'''
+
+
 class TestAJoinThatFails:
     """An interpreter that cannot join the lock starts all the same, outside it.
 
@@ -2466,6 +2559,71 @@ class TestConcurrency:
         assert arrived == [(True, False)] * len(results) + [(False, False)]
         assert TAMPER_ALERT not in capfd.readouterr().err
         assert _core._c_guardian.verify() is True
+
+    @pytest.mark.parametrize("policies", ["same", "different"])
+    def test_interpreters_racing_for_the_first_lock_of_a_process(self, policies, tmp_path):
+        """Several interpreters, each under its own GIL, lock a policy at the same moment.
+
+        Nothing has been locked in the process before, so they also race to
+        install the guardian's audit hook.  One of them gets the lock; the
+        others are told so and are left without a policy, outside the lock.
+
+        Run in child processes (a few, for a few races): the winner is
+        destroyed with its token, and its process stays locked.
+        """
+        racers = 6
+        for attempt in range(3):
+            out_dir = tmp_path / f"race-{attempt}"
+            out_dir.mkdir()
+            env = {k: v for k, v in os.environ.items() if k != _CHILD_POLICY_ENV}
+            child = subprocess.run(  # nosec B603
+                [sys.executable, "-c", _RACE_FOR_THE_LOCK, str(out_dir), str(racers), policies],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            assert child.returncode == 0, child.stderr
+            assert TAMPER_ALERT not in child.stderr
+            result = json.loads(child.stdout.splitlines()[-1])
+            found = result["racers"]
+            assert len(found) == racers
+
+            winners = [r for r in found if r["took"] == "ok"]
+            losers = [r for r in found if r["took"] != "ok"]
+            assert len(winners) == 1, found
+            (winner,) = winners
+            # The winner holds its policy, pinned and enforced.
+            assert winner["config"] is not None
+            assert winner["verify"] is True
+            assert winner["connect"][0] == "EgressBlocked"
+            assert winner["connect"][1].endswith("is not in the allow list")
+            # The variable carries the winner's policy, so a child of the
+            # winner inherits it.  A loser may have written its own payload
+            # there last, before the lock was there to refuse it (about every
+            # other race, when the policies differ): the winner puts its own
+            # back once it holds the lock.
+            assert winner["env state"] == "exact"
+            assert winner["process env"] == winner["config"]
+
+            for loser in losers:
+                kind, message = loser["took"]
+                # Told at the door (TetheredLocked), or — the usual case when
+                # they really start together — when it touches the variable:
+                # publishing its policy (os.putenv), or taking it back after
+                # losing at the guardian's commit (os.unsetenv).
+                assert kind == "TetheredLocked" or (
+                    kind == "SubprocessBlocked" and message.endswith(NO_VARIABLE_CHANGES)
+                ), loser["took"]
+                assert loser["config"] is None, loser
+                assert loser["verify"] is False
+                assert loser["connect"] == [
+                    "EgressBlocked",
+                    f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}",
+                ]
+
+            # The main interpreter took no part and is outside the lock too.
+            assert result["main"] == [True, False]
 
     def test_events_from_an_interpreter_with_its_own_gil_while_the_lock_changes_hands(
         self, subinterpreter

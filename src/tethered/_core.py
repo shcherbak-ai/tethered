@@ -3205,6 +3205,9 @@ def activate(
                 _restore_policy_env(previous, previous_env)
             raise
 
+        if locked:
+            _reclaim_policy_env(cfg)
+
         # Mappings recorded under the previous policy are dropped.  Not part
         # of the commit: an entry is a fact about DNS, and the new policy is
         # consulted for whatever hostname it yields.
@@ -3647,6 +3650,39 @@ def _propagate_policy_to_env(cfg: _Config) -> None:
         os.environ[_CHILD_POLICY_ENV] = _canonical_payload(cfg)
     finally:
         _in_env_sync.reset(token)
+
+
+def _reclaim_policy_env(cfg: _Config) -> None:
+    """Make the variable carry ``cfg``'s policy again once ``cfg`` has been locked.
+
+    ``activate()`` writes the variable before it takes the lock, and until
+    the lock is taken any interpreter may write it.  One that was locking a
+    policy of its own at the same moment, and lost, can have left its
+    payload there after ours — and cannot take it back, being refused the
+    variable from then on.  This interpreter holds the lock now, so no
+    other interpreter can change the variable any more: if the process no
+    longer carries this policy, it is written again.  (So it is after a
+    change made below Python in that same moment; one made later is not
+    repaired but met with a refusal, see :func:`_process_env_state`.)
+
+    Not part of the commit, and never an error: left as it is, the variable
+    only makes this interpreter refuse the launches that would inherit it,
+    which is the safe side to fail on.  A no-op when the process carries
+    the policy, as it does unless something of the kind happened.
+    """
+    if not _process_env_differs(_canonical_payload(cfg)):
+        return
+    try:
+        _propagate_policy_to_env(cfg)
+    except Exception:
+        logger.warning(
+            "tethered: %s did not carry this policy any more when it was locked (it was "
+            "changed from another interpreter or below Python meanwhile), and the policy "
+            "could not be written back; process launches that inherit the environment "
+            "will be refused",
+            _CHILD_POLICY_ENV,
+            exc_info=True,
+        )
 
 
 def _clear_policy_from_env() -> None:

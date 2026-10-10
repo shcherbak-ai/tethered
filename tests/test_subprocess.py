@@ -3755,6 +3755,101 @@ class TestProcessEnvironmentUnderALock:
         with pytest.raises(tethered.SubprocessBlocked, match=r"below Python"):
             _handle_subprocess(cfg, "subprocess.Popen", _popen_args(None))
 
+    # ── Taking the lock: the variable is this policy's from then on ──
+    # activate() writes the variable before the lock exists.  Until it does,
+    # another interpreter that is locking a policy of its own at the same
+    # moment can write the variable too, and if it loses it cannot take its
+    # value back (it is refused by then).  ``test_subinterpreters.py`` races
+    # for real; here the other interpreter's write is made below Python,
+    # right after activate()'s own.
+
+    @staticmethod
+    def _publishing(monkeypatch, *, then=None, fail_on_call=None) -> list[str]:
+        """Wrap ``_propagate_policy_to_env``; return the list of payloads it was asked to write.
+
+        ``then`` runs after the first genuine write; call number
+        ``fail_on_call`` raises instead of writing.
+        """
+        genuine = _core._propagate_policy_to_env
+        written: list[str] = []
+
+        def publish(cfg):
+            written.append(_core._canonical_payload(cfg))
+            if len(written) == fail_on_call:
+                raise OSError("the variable cannot be written")
+            genuine(cfg)
+            if then is not None and len(written) == 1:
+                then()
+
+        monkeypatch.setattr(_core, "_propagate_policy_to_env", publish)
+        return written
+
+    def test_the_lock_is_taken_with_one_write_of_the_variable(self, monkeypatch):
+        """Nothing was left behind: nothing is written twice."""
+        written = self._publishing(monkeypatch)
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        assert written == [_core._config._serialized_payload]
+        tethered.deactivate(lock_token=token)
+
+    def test_a_value_left_behind_by_another_interpreter_is_replaced(
+        self, monkeypatch, below_python
+    ):
+        stray = '{"global": {"allow": ["0.0.0.0/0"], "locked": true}, "scopes": []}'
+        written = self._publishing(monkeypatch, then=lambda: below_python(stray))
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        payload = _core._config._serialized_payload
+
+        assert written == [payload, payload]  # published, then put back
+        assert _core._c_guardian.process_policy_env() == payload
+        assert os.environ[_CHILD_POLICY_ENV] == payload
+        assert _core._process_env_state(payload) == "exact"
+        assert _core._env_dirty is False
+        state = _launch_probe()  # a child inherits this policy, locked
+        assert state["locked"] is True
+        assert state["allow"] == ["*.example.com"]
+        tethered.deactivate(lock_token=token)
+
+    def test_if_it_cannot_be_put_back_the_launches_that_inherit_it_are_refused(
+        self, monkeypatch, below_python, caplog
+    ):
+        """The lock is taken all the same — activate() is past its commit — and fails closed."""
+        stray = '{"global": {"allow": ["0.0.0.0/0"], "locked": true}, "scopes": []}'
+        written = self._publishing(monkeypatch, then=lambda: below_python(stray), fail_on_call=2)
+        token = object()
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        payload = _core._config._serialized_payload
+
+        assert len(written) == 2
+        assert _core._config.locked is True
+        assert _core._c_guardian.is_active() is True
+        assert _core._c_guardian.verify() is True
+        assert [r.getMessage() for r in caplog.records if "written back" in r.getMessage()] == [
+            f"tethered: {_CHILD_POLICY_ENV} did not carry this policy any more when it was "
+            "locked (it was changed from another interpreter or below Python meanwhile), "
+            "and the policy could not be written back; process launches that inherit the "
+            "environment will be refused"
+        ]
+        assert _core._c_guardian.process_policy_env() == stray
+        assert _core._process_env_state(payload) == "foreign"
+        with pytest.raises(tethered.SubprocessBlocked, match=r"below Python"):
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"], capture_output=True, timeout=30
+            )
+        tethered.deactivate(lock_token=token)
+
+    def test_an_unlocked_activation_does_not_ask_about_the_process_environment(
+        self, monkeypatch, below_python
+    ):
+        """Without a lock anyone may write the variable at any time: there is nothing to settle."""
+        stray = '{"global": null, "scopes": []}'
+        written = self._publishing(monkeypatch, then=lambda: below_python(stray))
+        tethered.activate(allow=["*.example.com"])
+        assert written == [_core._config._serialized_payload]
+        assert _core._c_guardian.process_policy_env() == stray
+
 
 # A payload an attacker would like the child to read instead of the parent's.
 _PERMISSIVE_PAYLOAD = json.dumps(
