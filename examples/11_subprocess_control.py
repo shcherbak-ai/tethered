@@ -68,7 +68,7 @@ print(result.stdout.strip())
 
 # Non-Python launch (os.system → /bin/sh or cmd.exe) is now blocked:
 try:
-    os.system("echo this won't run")  # ty: ignore[deprecated]  # nosec B605 B607
+    os.system("echo this won't run")  # nosec B605 B607
     print("os.system: allowed (unexpected)")
 except tethered.SubprocessBlocked as e:
     print(f"Non-Python launch blocked: {e}")

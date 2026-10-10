@@ -48,7 +48,7 @@ dev = [
     "interrogate>=1.7",
     "httpx>=0.28.1",
     "setuptools>=83.0.0",
-    "ty>=0.0.32",
+    "ty>=0.0.86",
 ]
 
 [tool.setuptools.packages.find]
