@@ -661,6 +661,7 @@ _UNPINNED_GLOBALS = {
         "_hook_installed": "flips False -> True when the audit hook is installed",
         "_active_scope_count": "number of scopes entered anywhere in the process (int)",
         "_proactor_warning_pending": "cleared once the Proactor-loop warning has been logged",
+        "_uvloop_warning_pending": "cleared once the uvloop warning has been logged",
         "_pth_path_cache": "bootstrap path cached for scope-only use (None until computed)",
         "_env_dirty": "set when the policy variable changed behind os.environ's back",
         **_MODULE_METADATA,

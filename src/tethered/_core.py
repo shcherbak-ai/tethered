@@ -505,6 +505,12 @@ _CONNECT_EVENTS = frozenset(
 # costs nothing on other platforms and nothing once the warning is out.
 _proactor_warning_pending: bool = sys.platform == "win32"
 
+# The same for uvloop, which does not exist on Windows: its event loop does
+# its networking in libuv, below Python's socket module, and raises no audit
+# event for the connections, lookups, datagrams and process launches made
+# through it — see _warn_if_uvloop.
+_uvloop_warning_pending: bool = sys.platform != "win32"
+
 # DNS resolution events to intercept outside getaddrinfo.
 #
 # ``socket.getnameinfo`` is deliberately absent.  Its audit event carries the
@@ -761,8 +767,11 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
             _handle_connect(cfg, scope_stack, event, args)
         elif event in _DNS_EVENTS:
             _handle_dns_lookup(cfg, scope_stack, event, args)
-        elif _proactor_warning_pending and event == "socket.__new__":
-            _warn_if_proactor_loop()
+        elif event == "socket.__new__":
+            if _proactor_warning_pending:
+                _warn_if_proactor_loop()
+            if _uvloop_warning_pending:
+                _warn_if_uvloop()
         return
 
     # Subprocess launches: parent-side enforcement (warn/block), locked-mode
@@ -839,6 +848,36 @@ def _warn_if_proactor_loop() -> None:
         "raw-IP destinations, port rules and scope() connect checks are NOT "
         "enforced. Run the event loop as asyncio.SelectorEventLoop for full "
         "enforcement."
+    )
+
+
+def _warn_if_uvloop() -> None:
+    """Warn, once, that what goes through a uvloop event loop is not seen.
+
+    Called when a policy is activated, when a scope is entered, and for a
+    ``socket.__new__`` event while either is active.  uvloop is the loop
+    uvicorn picks whenever it is installed, and under it a policy, locked
+    or not, is silently not applied to anything the loop itself does:
+    there is no audit event for tethered to act on, and an audit hook
+    cannot add one.  The gap cannot be closed here, so it is at least made
+    visible.
+
+    uvloop is looked up in ``sys.modules``, never imported.  That it is
+    loaded is taken as the sign that it is in use: servers import it only
+    when they are going to run on it.
+    """
+    global _uvloop_warning_pending
+    if "uvloop" not in sys.modules:
+        return
+    # Cleared before logging: a log handler may itself create a socket.
+    _uvloop_warning_pending = False
+    logger.warning(
+        "tethered: uvloop is loaded in this process. A uvloop event loop does its "
+        "networking outside Python's socket module and raises no audit event, so "
+        "tethered sees none of the connections, name lookups, datagrams and process "
+        "launches made through it: they are neither blocked nor reported, under a "
+        "locked policy and inside a scope() as well. Run the application on the "
+        "standard asyncio event loop for enforcement (uvicorn: --loop asyncio)."
     )
 
 
@@ -2839,6 +2878,8 @@ class scope:
             msg = "tethered.scope: this instance is already entered; create a new scope() instance"
             raise RuntimeError(msg)
         _install_hook()
+        if _uvloop_warning_pending:
+            _warn_if_uvloop()
         _push_scope(self._scope_cfg)
         self._entered = True
         logger.debug("tethered: entered %s", self._scope_cfg.label)
@@ -3235,6 +3276,9 @@ def activate(
         _pth_path=pth_path,
         _local_hostname=local_hostname,
     )
+
+    if _uvloop_warning_pending:
+        _warn_if_uvloop()
 
     activate_locked_msg = (
         "tethered: activate() blocked — a locked policy is active and the "

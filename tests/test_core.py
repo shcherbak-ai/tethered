@@ -3794,6 +3794,82 @@ def _scoped_generator(label: str):
         yield 2
 
 
+def _uvloop_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "uvloop is loaded" in r.getMessage()]
+
+
+class TestUvloopWarning:
+    """uvloop does its networking below Python's ``socket`` module.
+
+    Nothing that goes through its event loop raises an audit event, so a
+    policy is silently not applied to it.  tethered cannot close that; it
+    says so once, when a policy is activated or a scope is entered with
+    uvloop loaded, or at the first new socket afterwards.  uvloop itself is
+    never needed here: a stand-in module in ``sys.modules`` is what the check
+    looks for.  (The flag starts clear on Windows, where uvloop does not
+    exist; the tests set it.)
+    """
+
+    @pytest.fixture
+    def uvloop_loaded(self, monkeypatch):
+        monkeypatch.setattr(_core, "_uvloop_warning_pending", True)
+        monkeypatch.setitem(sys.modules, "uvloop", types.ModuleType("uvloop"))
+
+    def test_activate_warns_once(self, uvloop_loaded, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+            tethered.activate(allow=["*.example.org"])
+        (message,) = _uvloop_warnings(caplog)
+        assert "raises no audit event" in message
+        assert "neither blocked nor reported" in message
+        assert "under a locked policy and inside a scope() as well" in message
+        assert "uvicorn: --loop asyncio" in message
+        assert _core._uvloop_warning_pending is False
+
+    def test_entering_a_scope_warns(self, uvloop_loaded, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"), tethered.scope(allow=[]):
+            pass
+        assert len(_uvloop_warnings(caplog)) == 1
+
+    def test_a_new_socket_warns_when_uvloop_was_loaded_after_activation(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_uvloop_warning_pending", True)
+        monkeypatch.delitem(sys.modules, "uvloop", raising=False)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+            _audit_hook(*_NEW_SOCKET_EVENT)
+            assert _uvloop_warnings(caplog) == []
+            assert _core._uvloop_warning_pending is True  # still to be checked later
+            monkeypatch.setitem(sys.modules, "uvloop", types.ModuleType("uvloop"))
+            _audit_hook(*_NEW_SOCKET_EVENT)
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        assert len(_uvloop_warnings(caplog)) == 1
+
+    def test_no_warning_when_nothing_is_active(self, uvloop_loaded, caplog):
+        _core._install_hook()
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook(*_NEW_SOCKET_EVENT)
+        assert _uvloop_warnings(caplog) == []
+        assert _core._uvloop_warning_pending is True
+
+    def test_no_check_at_all_once_the_flag_is_clear(self, monkeypatch):
+        """Windows, and elsewhere after the warning: the lookup never runs."""
+
+        def must_not_run() -> None:
+            raise AssertionError("the uvloop check ran with the flag clear")
+
+        monkeypatch.setattr(_core, "_uvloop_warning_pending", False)
+        monkeypatch.setattr(_core, "_warn_if_uvloop", must_not_run)
+        tethered.activate(allow=["*.example.com"])
+        _audit_hook(*_NEW_SOCKET_EVENT)
+        with tethered.scope(allow=[]):
+            pass
+
+    def test_flag_starts_clear_only_on_windows(self):
+        """uvloop is not available on Windows."""
+        if sys.platform == "win32":
+            assert _core._uvloop_warning_pending is False
+
+
 class TestScopeExitOutOfOrder:
     """A scope's exit removes its own entry, whatever was entered or exited since.
 
