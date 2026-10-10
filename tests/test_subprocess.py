@@ -1099,8 +1099,12 @@ class TestLockedPayloadIntegrity:
     and the inherited-env path (env=None → child reads os.environ).  The latter
     catches Python-level os.environ mutation by checking os.environ at launch
     time.  os.environ is a cache: os.putenv / os.unsetenv are covered by the
-    dirty flag (TestNativeEnvChangeTracking) and ctypes-level setenv/unsetenv
-    is not seen at all.
+    dirty flag (TestNativeEnvChangeTracking).  A change made below Python
+    (ctypes-level setenv/unsetenv) or by another interpreter is not in the
+    cache; it is caught only while a policy is locked, when the C guardian
+    reads the process environment itself (TestProcessEnvironmentUnderALock).
+    These tests use hand-built configs with no lock taken, so only the cache
+    is consulted here.
     """
 
     _GLOBAL_DICT: ClassVar[dict[str, object]] = {
@@ -1178,7 +1182,8 @@ class TestLockedPayloadIntegrity:
         """If os.environ has been mutated to a different value, env=None inheritance is blocked.
 
         This catches Python-level os.environ mutation.  A ctypes-level
-        setenv does not update os.environ and is not seen.
+        setenv does not update os.environ: that takes the guardian, under a
+        lock (TestProcessEnvironmentUnderALock).
         """
         monkeypatch.setenv(_CHILD_POLICY_ENV, '{"allow": ["evil.test"]}')
         cfg = self._locked_cfg()
@@ -3486,6 +3491,269 @@ class TestNativeEnvChangeTracking:
         assert state["active"] is True
         assert state["allow"] == ["*.example.com"]
         assert _core._env_dirty is False
+
+
+def _change_process_env_below_python(value: str | None) -> None:
+    """Set (or, ``None``, remove) the policy variable the way a C library would.
+
+    No audit event is raised and ``os.environ`` is not told: this is what a
+    change made through ``ctypes`` looks like from Python — and, to any one
+    interpreter, what a change made by another interpreter looks like.
+    """
+    if sys.platform == "win32":
+        set_variable = ctypes.windll.kernel32.SetEnvironmentVariableW
+        set_variable.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p)
+        set_variable.restype = ctypes.c_int
+        assert set_variable(_CHILD_POLICY_ENV, value) or value is None
+    else:
+        libc = ctypes.CDLL(None)
+        if value is None:
+            assert libc.unsetenv(_CHILD_POLICY_ENV.encode()) == 0
+        else:
+            assert libc.setenv(_CHILD_POLICY_ENV.encode(), value.encode(), 1) == 0
+
+
+class _GuardianStandIn:
+    """Stands in for the C guardian where only the process environment is asked about."""
+
+    def __init__(self, *, active: bool, inherited: str | None) -> None:
+        self._active = active
+        self._inherited = inherited
+        self.asked = 0
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def process_policy_env(self) -> str | None:
+        self.asked += 1
+        return self._inherited
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestProcessEnvironmentUnderALock:
+    """A locked launch that inherits the environment checks the environment itself.
+
+    ``os.environ`` is a copy each interpreter makes when it starts.  It does
+    not show a change another interpreter made to the variable — which every
+    interpreter's child processes inherit — nor one made below Python; and
+    the audit events that set ``_env_dirty`` are only seen by the
+    interpreter that raised them.  While a policy is locked, the C guardian
+    is asked for the variable as the process holds it.
+    """
+
+    @pytest.fixture
+    def below_python(self):
+        """Yields the function that changes the variable; puts the process right again."""
+        yield _change_process_env_below_python
+        # conftest clears the variable through os.environ, which does nothing
+        # for a value os.environ never saw.
+        _change_process_env_below_python(None)
+        assert _core._c_guardian.process_policy_env() is None
+
+    @staticmethod
+    def _child_sees() -> str | None:
+        """The variable as a real child process, given no environment of its own, inherits it."""
+        child = subprocess.run(  # nosec B603
+            [
+                sys.executable,
+                "-S",
+                "-c",
+                f"import os; print(os.environ.get({_CHILD_POLICY_ENV!r}))",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert child.returncode == 0, child.stderr
+        seen = child.stdout.strip()
+        return None if seen == "None" else seen
+
+    def test_the_guardian_reports_what_a_child_inherits(self, below_python):
+        """Not what ``os.environ`` shows.  (No policy is active here: nothing is enforced.)"""
+        guardian = _core._c_guardian
+        assert _CHILD_POLICY_ENV not in os.environ
+        assert guardian.process_policy_env() is None
+        assert self._child_sees() is None
+
+        below_python("set below Python")
+        assert _CHILD_POLICY_ENV not in os.environ
+        assert guardian.process_policy_env() == "set below Python"
+        assert self._child_sees() == "set below Python"
+
+        below_python(None)
+        assert guardian.process_policy_env() is None
+        assert self._child_sees() is None
+
+    def test_it_is_the_published_payload_after_an_activation(self):
+        guardian = _core._c_guardian
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        published = _core._config._serialized_payload
+        assert guardian.process_policy_env() == os.environ[_CHILD_POLICY_ENV] == published
+        tethered.activate(allow=["*.other.com", "10.0.0.0/8:5432"], locked=True, lock_token=token)
+        assert guardian.process_policy_env() == _core._config._serialized_payload != published
+        tethered.deactivate(lock_token=token)
+        assert guardian.process_policy_env() is None
+
+    @pytest.mark.parametrize(
+        "left_behind",
+        [None, _core._build_env_payload(None, ()), '{"global": {"allow": ["0.0.0.0/0"]}}', "{"],
+        ids=["removed", "no-policy", "another-policy", "not-json"],
+    )
+    def test_a_locked_parent_refuses_a_launch_after_a_change_below_python(
+        self, left_behind, below_python
+    ):
+        """End to end.  Neither ``os.environ`` nor the dirty flag knows of the change."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        published = _core._config._serialized_payload
+        assert _launch_probe()["locked"] is True
+
+        below_python(left_behind)
+        assert os.environ[_CHILD_POLICY_ENV] == published
+        assert _core._env_dirty is False
+        assert _core._process_env_state(published) == "foreign"
+        with pytest.raises(
+            tethered.SubprocessBlocked,
+            match=r"changed from another interpreter or below Python",
+        ) as excinfo:
+            subprocess.run(  # nosec B603
+                [sys.executable, "-c", "print('ran')"], capture_output=True, timeout=30
+            )
+        assert excinfo.value.event == "subprocess.Popen"
+        with pytest.raises(tethered.SubprocessBlocked, match=r"below Python"):
+            os.system("exit 0")  # nosec B605 B607 — refused before anything runs
+
+        # The payload put back the same way: nothing stands in the way again.
+        below_python(published)
+        assert _core._process_env_state(published) == "exact"
+        assert _launch_probe()["locked"] is True
+
+    def test_an_explicit_environment_does_not_depend_on_it(self, below_python):
+        """The child gets the mapping, not the process environment."""
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        below_python(None)
+        state = _launch_probe(env=dict(os.environ))
+        assert state["active"] is True
+        assert state["locked"] is True
+
+    @pytest.mark.parametrize(
+        ("event", "args"),
+        [
+            ("subprocess.Popen", _popen_args(None)),
+            ("os.exec", (sys.executable, [sys.executable], None)),
+            ("os.system", ("echo hi",)),
+        ],
+    )
+    def test_every_inheriting_launch_is_refused(self, event, args, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        payload = _core._canonical_payload(cfg)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        stand_in = _GuardianStandIn(active=True, inherited=payload)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        _handle_subprocess(cfg, event, args)  # the process holds the payload: allowed
+        assert stand_in.asked == 1
+
+        monkeypatch.setattr(_core, "_c_guardian", _GuardianStandIn(active=True, inherited=None))
+        with pytest.raises(tethered.SubprocessBlocked, match=r"below Python") as excinfo:
+            _handle_subprocess(cfg, event, args)
+        assert excinfo.value.event == event
+        assert "os.putenv / os.unsetenv" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ("inherited", "differs"),
+        [
+            ("canonical", False),
+            ("reformatted", False),  # the same global in other words
+            ("with a scope", False),  # scopes only narrow
+            (None, True),
+            ("", True),
+            ("{", True),
+            ('{"global": null, "scopes": []}', True),
+            ('{"global": {"allow": ["0.0.0.0/0"], "locked": true}, "scopes": []}', True),
+        ],
+        ids=[
+            "canonical",
+            "reformatted",
+            "scoped",
+            "unset",
+            "empty",
+            "not-json",
+            "no-policy",
+            "another-policy",
+        ],
+    )
+    def test_what_counts_as_a_difference(self, inherited, differs, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        payload = _core._canonical_payload(cfg)
+        scoped = json.loads(payload)
+        scoped["scopes"] = [{"allow": ["api.example.com"], "label": "launch-site"}]
+        named = {
+            "canonical": payload,
+            "reformatted": json.dumps(json.loads(payload), indent=1),
+            "with a scope": json.dumps(scoped),
+        }
+        stand_in = _GuardianStandIn(active=True, inherited=named.get(inherited, inherited))
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        assert _core._process_env_differs(payload) is differs
+        assert _core._process_env_state(payload) == ("foreign" if differs else "exact")
+
+    def test_the_dirty_flag_is_reported_first(self, monkeypatch):
+        """A change this interpreter saw is named as such."""
+        cfg = _launch_cfg(locked=True)
+        payload = _core._canonical_payload(cfg)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        stand_in = _GuardianStandIn(active=True, inherited=None)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.setattr(_core, "_env_dirty", True)
+        assert _core._process_env_state(payload) == "diverged"
+        assert stand_in.asked == 0
+
+    def test_what_os_environ_already_shows_is_not_asked_about(self, monkeypatch):
+        cfg = _launch_cfg(locked=True)
+        payload = _core._canonical_payload(cfg)
+        stand_in = _GuardianStandIn(active=True, inherited=payload)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        assert _core._process_env_state(payload) == "missing"
+        monkeypatch.setenv(_CHILD_POLICY_ENV, '{"global": {"allow": ["evil.test"]}}')
+        assert _core._process_env_state(payload) == "substituted"
+        assert stand_in.asked == 0
+
+    def test_without_a_lock_the_process_environment_is_not_consulted(self, monkeypatch):
+        """Such a change is then not seen: the payload is re-asserted from the cache alone."""
+        cfg = _launch_cfg()
+        payload = _core._canonical_payload(cfg)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        stand_in = _GuardianStandIn(active=False, inherited=None)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        assert _core._process_env_differs(payload) is False
+        assert _core._process_env_state(payload) == "exact"
+        assert stand_in.asked == 0
+
+    def test_without_the_extension_there_is_nothing_to_ask(self, monkeypatch):
+        cfg = _launch_cfg()
+        payload = _core._canonical_payload(cfg)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        monkeypatch.setattr(_core, "_c_guardian", None)
+        assert _core._process_env_differs(payload) is False
+        assert _core._process_env_state(payload) == "exact"
+
+    def test_a_variable_that_cannot_be_read_counts_as_different(self, monkeypatch):
+        """Nothing can be said for it — and the hook lets no stray exception out."""
+
+        class CannotRead(_GuardianStandIn):
+            def process_policy_env(self) -> str | None:
+                raise MemoryError
+
+        cfg = _launch_cfg(locked=True)
+        payload = _core._canonical_payload(cfg)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, payload)
+        monkeypatch.setattr(_core, "_c_guardian", CannotRead(active=True, inherited=payload))
+        assert _core._process_env_differs(payload) is True
+        assert _core._process_env_state(payload) == "foreign"
+        with pytest.raises(tethered.SubprocessBlocked, match=r"below Python"):
+            _handle_subprocess(cfg, "subprocess.Popen", _popen_args(None))
 
 
 # A payload an attacker would like the child to read instead of the parent's.

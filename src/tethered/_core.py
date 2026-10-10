@@ -2022,16 +2022,50 @@ def _process_env_state(payload: str) -> str:
     ``os.putenv()`` / ``os.unsetenv()``.  :func:`_handle_env_change` records
     such a change to the policy variable in ``_env_dirty``; while it is set a
     matching cache entry proves nothing, which is reported as ``"diverged"``.
-    Changes made below Python (``ctypes`` calling libc ``setenv`` /
-    ``unsetenv``) raise no audit event and are not seen at all.
+
+    The cache is also one interpreter's: it shows nothing of what another
+    interpreter of the process does to the variable, and nothing of a
+    change made below Python (``ctypes`` calling libc ``setenv`` /
+    ``unsetenv``), which raises no audit event.  While a policy is locked,
+    a matching cache entry is therefore held against the process
+    environment itself (:func:`_process_env_differs`); a difference is
+    reported as ``"foreign"``.  Without a lock such changes are not seen.
     """
     value = os.environ.get(_CHILD_POLICY_ENV)
     if value is None:
         return "missing"
     state = _classify_payload(value, payload, payload)
-    if _env_dirty and state in ("exact", "same-global"):
-        return "diverged"
+    if state in ("exact", "same-global"):
+        if _env_dirty:
+            return "diverged"
+        if _process_env_differs(payload):
+            return "foreign"
     return state
+
+
+def _process_env_differs(payload: str) -> bool:
+    """Return True if, under a lock, a child would not inherit ``payload``'s policy.
+
+    Asks the C guardian for the variable as the process itself holds it,
+    which is what a child that is given no environment of its own receives,
+    and judges it like any other value (:func:`_classify_payload`).  It
+    matters once a process has more than one interpreter with a locked
+    policy: each one launches children, each has its own ``os.environ``,
+    and only the interpreter that makes a change sees the audit event for
+    it.  Always ``False`` when no policy is locked.
+
+    Never raises (it runs inside the audit hook, where only
+    ``SubprocessBlocked`` should come out of a refused launch): a variable
+    that cannot be read is one nothing can be said for, and counts as
+    different.
+    """
+    if _c_guardian is None or not _c_guardian.is_active():
+        return False
+    try:
+        inherited = _c_guardian.process_policy_env()
+    except Exception:
+        return True
+    return _classify_payload(inherited, payload, payload) not in ("exact", "same-global")
 
 
 def _handle_env_change(event: str, args: tuple[Any, ...]) -> None:
@@ -2082,6 +2116,12 @@ def _refuse_launch(event: str, desc: str, source: str, state: str) -> None:
             "unverifiable policy env",
             f"{_CHILD_POLICY_ENV} was changed through os.putenv / os.unsetenv, "
             "so os.environ no longer shows what the child would inherit",
+        ),
+        "foreign": (
+            "policy env changed outside this interpreter",
+            f"the environment of the process no longer carries the {_CHILD_POLICY_ENV} "
+            "value os.environ shows (it was changed from another interpreter or below "
+            "Python), so the child would not inherit the locked policy",
         ),
         "unreadable": ("unreadable env", f"{source} could not be read as a mapping"),
     }[state]
@@ -2325,10 +2365,12 @@ def _handle_subprocess(
     #     child gets the native process environment.  ``os.environ`` shows
     #     Python-level mutation (os.environ.pop / __setitem__ / __delitem__)
     #     and ``_env_dirty`` covers os.putenv() / os.unsetenv(), which bypass
-    #     it.  Changes made below Python (ctypes → libc setenv / unsetenv)
-    #     raise no audit event and are NOT caught.  Locked mode refuses;
-    #     otherwise the payload is re-asserted, which also repairs an
-    #     ordinary whitelist cleanup of ``os.environ``.
+    #     it.  Changes made by another interpreter or below Python (ctypes →
+    #     libc setenv / unsetenv) raise no audit event here; while a policy
+    #     is locked the process environment itself is read, otherwise they
+    #     are NOT caught.  Locked mode refuses; otherwise the payload is
+    #     re-asserted, which also repairs an ordinary whitelist cleanup of
+    #     ``os.environ``.
     #   - Explicit: read once through the mapping interface, whatever the
     #     type (dict, UserDict, MappingProxyType, os.environ ...), so the
     #     check sees what the launch API will read.  Locked mode refuses
