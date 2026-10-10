@@ -1,0 +1,2 @@
+# Nothing beyond the harness's own requirements: the server under test here
+# is made of the standard library (tiny_server.py).

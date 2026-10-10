@@ -1,0 +1,23 @@
+# The build context of base.Dockerfile is the repository root.  Everything is
+# left out except what the image is made of: the package sources and this
+# directory tree.
+
+*
+
+!pyproject.toml
+!setup.py
+!MANIFEST.in
+!README.md
+!LICENSE
+!src
+!tests_containers
+
+# Nothing compiled or cached on the host goes into the image.
+**/__pycache__
+**/*.py[cod]
+**/*.so
+**/*.egg-info
+**/.pytest_cache
+**/.ruff_cache
+**/*.log
+src/**/build
