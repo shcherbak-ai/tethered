@@ -1,0 +1,14 @@
+description = "uWSGI: master and forked workers, --lazy-apps, threads, recycling, harakiri, a virtualenv, mounted applications"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+apt = []
+# uWSGI is distributed as source only: pip compiles it against the image's Python.
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["uwsgi"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
