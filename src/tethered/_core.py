@@ -3309,10 +3309,14 @@ def activate(
 
             # Mappings recorded under the previous policy are dropped.  Not
             # part of the commit: an entry is a fact about DNS, and the new
-            # policy is consulted for whatever hostname it yields.
-            with _ip_map_lock:
-                _ip_to_hostname.clear()
-                _allowed_hostnames.clear()
+            # policy is consulted for whatever hostname it yields.  A call
+            # that puts the same policy in place again drops nothing: a
+            # thread that has looked a name up and is about to connect
+            # would be refused the address it was just given.
+            if previous is None or previous._serialized_payload != serialized_payload:
+                with _ip_map_lock:
+                    _ip_to_hostname.clear()
+                    _allowed_hostnames.clear()
     finally:
         _activation_claim.restore(held)
 

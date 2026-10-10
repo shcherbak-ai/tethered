@@ -2751,6 +2751,22 @@ class TestDeactivateReactivate:
         with _ip_map_lock:
             assert "198.51.100.1" not in _ip_to_hostname
 
+    def test_ip_map_kept_when_the_same_policy_is_activated_again(self):
+        """A thread between its lookup and its connect must not lose the address.
+
+        Dropping the map on a call that changes nothing refused connections
+        to an allowed host whenever another thread re-activated the policy.
+        """
+        tethered.activate(allow=["*.stripe.com"])
+        with _ip_map_lock:
+            _ip_to_hostname["198.51.100.1"] = ("api.stripe.com",)
+
+        tethered.activate(allow=["*.stripe.com"])
+
+        with _ip_map_lock:
+            assert _ip_to_hostname["198.51.100.1"] == ("api.stripe.com",)
+        _audit_hook("socket.connect", (None, ("198.51.100.1", 443)))
+
     def test_ip_map_cleared_on_reactivate_without_deactivate(self):
         """activate() -> activate() (no deactivate) must clear the IP map."""
         tethered.activate(allow=["*.stripe.com"])
