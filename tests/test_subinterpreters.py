@@ -2710,8 +2710,21 @@ class TestConcurrency:
             # there last, before the lock was there to refuse it (about every
             # other race, when the policies differ): the winner puts its own
             # back once it holds the lock.
-            assert winner["env state"] == "exact"
-            assert winner["process env"] == winner["config"]
+            #
+            # That narrows the race and cannot close it.  A loser's write that
+            # passed the guardian's hook before the lock was committed can
+            # still reach the environment after the winner has looked (a few
+            # races in a hundred under load).  The winner then sees a foreign
+            # payload, which fails closed: _refuse_launch() refuses every
+            # launch of its that would inherit the environment.
+            if policies == "same" or winner["env state"] == "exact":
+                assert winner["env state"] == "exact"
+                assert winner["process env"] == winner["config"]
+            else:
+                assert winner["env state"] == "foreign"
+                left_behind = json.loads(winner["process env"])["global"]
+                assert left_behind["locked"] is True
+                assert left_behind["allow"] != json.loads(winner["config"])["global"]["allow"]
 
             for loser in losers:
                 kind, message = loser["took"]
