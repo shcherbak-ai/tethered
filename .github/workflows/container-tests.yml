@@ -1,0 +1,83 @@
+name: Container tests
+
+# Real application servers in Docker, with no network: tests_containers/.
+# See tests_containers/README.md.  Pull requests run the pinned requirements;
+# the weekly run installs the latest release of everything, to notice when a
+# server or a framework changes under tethered.
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "src/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - "tests_containers/**"
+      - ".github/workflows/container-tests.yml"
+  workflow_dispatch:
+    inputs:
+      python:
+        description: "Python version, e.g. 3.13 (empty: every supported version)"
+        required: false
+        default: ""
+      suite:
+        description: "Suite, e.g. uvicorn (empty: every suite)"
+        required: false
+        default: ""
+      unpinned:
+        description: "Install the latest release of every requirement"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  matrix:
+    name: Find the suites
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      # run.py needs Python 3.11+ and nothing else: the runner's own python3 will do.
+      - name: List suite and Python combinations
+        id: list
+        env:
+          PYTHON_INPUT: ${{ inputs.python }}
+          SUITE_INPUT: ${{ inputs.suite }}
+        run: |
+          args=(--list --json)
+          if [ -n "$PYTHON_INPUT" ]; then args+=(--python "$PYTHON_INPUT"); fi
+          if [ -n "$SUITE_INPUT" ]; then args+=(--suite "$SUITE_INPUT"); fi
+          python3 tests_containers/run.py "${args[@]}" | tee matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+
+  suite:
+    name: ${{ matrix.suite }} / Python ${{ matrix.python }}
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Build the image and run the suite
+        env:
+          SUITE: ${{ matrix.suite }}
+          PYTHON: ${{ matrix.python }}
+          UNPINNED: ${{ github.event_name == 'schedule' || inputs.unpinned == true }}
+        run: |
+          args=(--suite "$SUITE" --python "$PYTHON" --jobs 1)
+          if [ "$UNPINNED" = "true" ]; then args+=(--unpinned); fi
+          python3 tests_containers/run.py "${args[@]}"
