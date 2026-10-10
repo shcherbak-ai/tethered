@@ -24,7 +24,7 @@
   <a href="https://github.com/astral-sh/ty"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json" alt="ty"></a>
 </p>
 
-tethered is a lightweight, in-process policy check that hooks into Python's own socket layer to enforce your allow list before a connection is opened. Use `activate()` to set a process-wide ceiling, and `scope()` to tighten individual code paths — request handlers, background jobs, library calls, AI-generated code. Everything runs locally within your process — works with requests, httpx, aiohttp, Django, Flask, FastAPI, and any library built on Python sockets.
+tethered is a lightweight, in-process policy check that hooks into Python's own socket layer to enforce your allow list before a connection is opened. Use `activate()` to set a process-wide ceiling, and `scope()` to tighten individual code paths — request handlers, background jobs, library calls, AI-generated code. Everything runs locally within your process — works with requests, httpx, aiohttp, Django, Flask, FastAPI, and any library built on Python sockets. Under asyncio that means the standard event loop: [not uvloop](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against), which uvicorn uses by default when it is installed.
 
 ```python
 import tethered
@@ -87,6 +87,8 @@ app = create_app()
 ```
 
 This pattern works the same for Django, Flask, FastAPI, scripts, and AI-assisted workflows — activate tethered before your application and its dependencies start making connections. Existing connections (e.g., connection pools) established before `activate()` continue to work — tethered intercepts at connect time, not at read/write time.
+
+**Under asyncio, enforcement needs the standard event loop.** Under uvloop, which uvicorn uses by default whenever it is installed (`uvicorn[standard]`, `fastapi run`, gunicorn's `UvicornWorker`), tethered sees nothing that goes through the event loop — connections, lookups and `asyncio` subprocess launches are neither blocked nor logged there, even with `locked=True`, and all tethered can do is warn once that uvloop is loaded — so start uvicorn with `--loop asyncio` ([details](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against), [server setup](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#servers-and-interpreter-pools)).
 
 On Windows, asyncio's default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there. Run the loop as `asyncio.SelectorEventLoop` for full enforcement ([details](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against)).
 
@@ -189,15 +191,15 @@ import stripe
 
 This combination:
 
-- **Propagates the policy** to Python children of the same interpreter (multiprocessing workers, `subprocess.run`, `asyncio.create_subprocess_exec`). A child that cannot establish the locked policy refuses to start.
+- **Propagates the policy** to Python children of the same interpreter (multiprocessing workers, `subprocess.run`, and `asyncio.create_subprocess_exec` on the standard event loop). A child that cannot establish the locked policy refuses to start.
 - **Refuses external launches** (`curl`, `wget`, `bash`, other interpreters) made through Python's launch APIs — the "shell out to a binary that does the egress" route.
 - **Refuses the tampering it can see** — a launch whose environment lacks or alters `_TETHERED_CHILD_POLICY`, and Python-level deletion or overwrite of `tethered.pth`, raise `SubprocessBlocked`. Once tethered's own functions or policy objects have been replaced, socket operations and launches are refused until they are restored. Replacing or deactivating the policy requires the token, which is deliberately not kept here: a reference held in a module global can be found by other code in the process. Keep one only if you need to unlock.
 
-Activate **before** importing any third-party code — anything that runs in the unprotected window (e.g., during a malicious package's `__init__.py`) is unprotected. tethered does not protect against `ctypes` / `cffi` raw syscalls, and locked mode is not a sandbox: Python code written against tethered can still defeat it ([what it does and does not do](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do)). Pair with OS-level controls (seccomp, containers, network namespaces) for hard isolation.
+Activate **before** importing any third-party code — anything that runs in the unprotected window (e.g., during a malicious package's `__init__.py`) is unprotected. None of these settings reaches what goes through a [uvloop event loop](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against): run asyncio applications on the standard loop. tethered does not protect against `ctypes` / `cffi` raw syscalls, and locked mode is not a sandbox: Python code written against tethered can still defeat it ([what it does and does not do](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do)). Pair with OS-level controls (seccomp, containers, network namespaces) for hard isolation.
 
 ## Defense-in-depth
 
-> tethered is a **guardrail at the Python audit-event layer, not a sandbox**. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it. For hardened environments combine with OS-level controls (containers, seccomp, network namespaces). See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for the full threat model.
+> tethered is a **guardrail at the Python audit-event layer, not a sandbox**. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it, and uvloop's event loop is such an extension. For hardened environments combine with OS-level controls (containers, seccomp, network namespaces). See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for the full threat model.
 
 ## Performance
 
@@ -217,7 +219,7 @@ Numbers vary by hardware, OS, and Python version. Reproduce with [`python benchm
 - [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md) — full API reference (`activate`, `scope`, `deactivate`, exceptions, locked mode, log-only)
 - [docs/SUBPROCESS.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md) — subprocess auto-propagation, scope propagation, `external_subprocess_policy`
 - [docs/ARCHITECTURE.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/ARCHITECTURE.md) — how the audit hook works, scope mechanics, C guardian
-- [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md) — handling blocked connections in Django, Celery, retry decorators
+- [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md) — handling blocked connections in Django, FastAPI, Celery and retry decorators; running under uvicorn, gunicorn and mod_wsgi; interpreter pools
 - [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) — threat model, what tethered does and does not protect against
 - [examples/](https://github.com/shcherbak-ai/tethered/tree/main/examples) — runnable scripts for every feature
 
