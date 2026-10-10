@@ -1,4 +1,4 @@
-description = "uvicorn on the standard asyncio event loop: one process, --workers, a launcher that locks first"
+description = "uvicorn with uvloop installed: the standard loop by name and the loop left to uvicorn; one process, --workers, launchers"
 
 # tests_containers/images/<image>.Dockerfile
 image = "base"
@@ -6,7 +6,7 @@ image = "base"
 apt = []
 compiler = false
 # The packages whose versions the runner prints in its summary.
-key_packages = ["uvicorn"]
+key_packages = ["uvicorn", "uvloop"]
 
 # Python versions the suite does not run on, each with the reason:
 #   "3.15" = "no wheel yet for ..."

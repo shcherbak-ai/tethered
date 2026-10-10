@@ -1,5 +1,9 @@
-# uvicorn without extras: no uvloop, no httptools.  The suite runs on the
-# standard asyncio event loop.
+# uvicorn with uvloop and httptools, as "uvicorn[standard]" installs them:
+# with these present uvicorn's default loop is uvloop and its default HTTP
+# parser is httptools.  test_uvicorn.py names the standard loop on every
+# command line; test_default_loop.py leaves the choice to uvicorn.
 uvicorn==0.54.0
 click==8.5.0
 h11==0.16.0
+httptools==0.9.0
+uvloop==0.23.0

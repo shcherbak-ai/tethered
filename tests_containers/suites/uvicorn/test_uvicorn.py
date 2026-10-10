@@ -2,8 +2,9 @@
 
 Every command line here names the loop (``--loop asyncio``), and the first
 test of each group checks which loop the application really runs on: the
-audit hook sees what asyncio's own loops do.  What uvicorn picks by default,
-and uvloop, are not this suite's subject.
+audit hook sees what asyncio's own loops do.  uvloop is installed in the
+image, and never asked for here.  What uvicorn picks when the loop is left
+to it is the subject of ``test_default_loop.py``.
 
 The application is ``probe_asgi:app`` from ``harness/apps``; it allows
 ``allowed.test:9001``.  Each test asserts what the application reported and
