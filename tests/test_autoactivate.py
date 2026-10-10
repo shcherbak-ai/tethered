@@ -903,7 +903,7 @@ class _FakeInterpreters:
 
 
 class _InterpreterID:
-    """Like the ``InterpreterID`` objects of Python 3.10 - 3.12: read through ``int()``."""
+    """Like the ``InterpreterID`` objects of Python 3.11 - 3.12: read through ``int()``."""
 
     def __init__(self, value: int) -> None:
         self._value = value
@@ -935,7 +935,7 @@ class TestInSubinterpreter:
             ((0, 5), (0, 1), False),  # the ID decides, not the whence
             (0, 0, False),
             (7, 0, True),
-            (_InterpreterID(0), _InterpreterID(0), False),  # Python 3.10 - 3.12
+            (_InterpreterID(0), _InterpreterID(0), False),  # Python 3.11 - 3.12
             (_InterpreterID(7), _InterpreterID(0), True),
         ],
         ids=repr,

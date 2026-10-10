@@ -331,7 +331,7 @@ class TestAsyncSockets:
                 asyncio.open_connection("127.0.0.1", 1),
                 timeout=0.5,
             )
-        except (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError):
+        except (ConnectionError, TimeoutError, OSError):
             pass  # Connection refused/timeout is fine — EgressBlocked would be wrong
 
     @requires_network

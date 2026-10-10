@@ -1991,7 +1991,7 @@ class TestFrameMutationHelpers:
             observed["ok"] = ok
             # Re-read env from the local; should be the new dict (env is
             # rebound by the helper via f_locals write-through proxy on 3.13+
-            # or PyFrame_LocalsToFast on 3.10-3.12).
+            # or PyFrame_LocalsToFast on 3.11-3.12).
             observed["after"] = dict(env)
 
         target()
@@ -2087,7 +2087,7 @@ class TestFrameMutationHelpers:
         )
 
     def test_inject_scope_env_handles_ctypes_failure(self, monkeypatch, caplog):
-        """If PyFrame_LocalsToFast raises (3.10-3.12 path), returns False and warns."""
+        """If PyFrame_LocalsToFast raises (3.11-3.12 path), returns False and warns."""
         if sys.version_info >= (3, 13):
             pytest.skip("PyFrame_LocalsToFast path not used on 3.13+")
 
@@ -2573,10 +2573,10 @@ class TestScopeSubprocessPropagation:
             )
 
     @pytest.mark.skipif(
-        sys.version_info >= (3, 13), reason="PyFrame_LocalsToFast path is 3.10-3.12 only"
+        sys.version_info >= (3, 13), reason="PyFrame_LocalsToFast path is 3.11-3.12 only"
     )
     def test_inject_scope_env_pyframe_localstofast_path(self):
-        """The PyFrame_LocalsToFast path runs on Python 3.10-3.12 only."""
+        """The PyFrame_LocalsToFast path runs on Python 3.11-3.12 only."""
 
         def target():
             env = {"original": "value"}
@@ -4571,7 +4571,7 @@ class TestLaunchesThatBypassPopen:
         [
             pytest.param((None, '"C:\\tools\\curl.exe" evil.test', None), "C:\\tools\\curl.exe"),
             pytest.param((None, "curl evil.test", None), "curl"),
-            # What CPython 3.10-3.15 actually deliver for the command line: a
+            # What CPython 3.11-3.15 actually deliver for the command line: a
             # character or two of garbage.  It must not reach the log.
             pytest.param((None, "\x03", None), "<unknown>", id="garbage-command-line"),
             pytest.param((None, None, None), "<unknown>", id="nothing"),

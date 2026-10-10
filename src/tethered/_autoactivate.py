@@ -281,7 +281,7 @@ def _in_subinterpreter() -> bool:
 
     Python offers no public way to ask before 3.14, so the private stdlib
     modules are used: ``_interpreters`` (3.13+) or ``_xxsubinterpreters``
-    (3.10 to 3.12).  Their ``get_current()`` and ``get_main()`` return an
+    (3.11 and 3.12).  Their ``get_current()`` and ``get_main()`` return an
     interpreter ID, from 3.13 as an ``(id, whence)`` pair.  A build without
     either module, or any failure, counts as the main interpreter: a locked
     policy is then established or startup refused, as in any child process.

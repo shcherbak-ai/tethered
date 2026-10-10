@@ -2,7 +2,7 @@
 
 ## Setup
 
-**Prerequisites:** Python 3.10+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook).
+**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook).
 
 ```bash
 git clone https://github.com/shcherbak-ai/tethered.git
@@ -139,7 +139,7 @@ On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` wi
 - `from __future__ import annotations` in all Python modules.
 - Private modules prefixed with `_`.
 - Type hints on all public functions.
-- Python 3.10+ only — no syntax from 3.12+ (`type` statement) or 3.11+ (`except*`).
+- Python 3.11+ only — no syntax from 3.12+ (`type` statement).
 
 ## Testing conventions
 

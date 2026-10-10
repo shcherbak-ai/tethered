@@ -1576,9 +1576,8 @@ _SITE_BYPASS_FLAG_CHARS = "S"
 _USER_SITE_BYPASS_FLAG_CHARS = "sI"
 
 # CPython's interpreter options (``SHORT_OPTS`` and ``longopts`` in
-# ``Python/getopt.c``; the same for 3.10-3.15 except that ``-P`` and the
-# ``--help-*`` forms are new in 3.11).  A flag stands alone or in a cluster
-# (``-IS``).  A value option takes the rest of its token (``-Wdefault``) or,
+# ``Python/getopt.c``; the same for 3.11-3.15).  A flag stands alone or in a
+# cluster (``-IS``).  A value option takes the rest of its token (``-Wdefault``) or,
 # when it ends the token, the whole next token — which is therefore never an
 # option, whatever it looks like.  ``-c`` and ``-m`` also end the options.
 # The interpreter rejects every other option with a usage error (bar one
@@ -1967,7 +1966,7 @@ def _inject_scope_env(frame: Any, new_env: dict[str, Any]) -> bool:
     except Exception:
         logger.warning("tethered: scope env injection failed (f_locals write)", exc_info=True)
         return False
-    if sys.version_info < (3, 13):  # pragma: no cover — only on 3.10-3.12
+    if sys.version_info < (3, 13):  # pragma: no cover — only on 3.11-3.12
         try:
             import ctypes
 
@@ -2277,7 +2276,7 @@ def _resolve_winapi_launch(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], dict
     is unknown and the launch is treated as inheriting the process
     environment.
 
-    The command line cannot be relied on either.  CPython 3.10 to 3.15 format
+    The command line cannot be relied on either.  CPython 3.11 to 3.15 format
     the event's ``command_line`` argument, a Python object, as a C wide
     string, so what arrives is a character or two of garbage and not the
     command line.  Interpreter options such as ``-S`` are therefore not

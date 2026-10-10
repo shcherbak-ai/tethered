@@ -125,9 +125,6 @@ class TestEgressBlockedRoundTrip:
 
         _assert_same_exception(clone, original, _EGRESS_ATTRS)
 
-    @pytest.mark.skipif(
-        not hasattr(BaseException, "add_note"), reason="exception notes need Python 3.11+"
-    )
     def test_notes_survive(self):
         original = _full_egress_blocked()
         original.add_note("while fetching the weather forecast")

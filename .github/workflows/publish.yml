@@ -62,7 +62,7 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@adba99c781d3746d38b3a09b1cf797965bcb7fe6  # v4.3.0
         env:
-          CIBW_BUILD: cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*
+          CIBW_BUILD: cp311-* cp312-* cp313-* cp314-* cp315-*
           CIBW_SKIP: "*-musllinux_i686"
           CIBW_ARCHS_LINUX: "auto"
           # Verifies the C extension imports, tethered.pth landed in

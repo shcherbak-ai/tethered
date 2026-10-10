@@ -43,7 +43,7 @@ try:
     import _interpreters as _interps  # Python 3.13+
 except ImportError:
     try:
-        import _xxsubinterpreters as _interps  # Python 3.10 - 3.12
+        import _xxsubinterpreters as _interps  # Python 3.11 - 3.12
     except ImportError:
         _interps = None
 

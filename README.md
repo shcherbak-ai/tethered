@@ -66,7 +66,7 @@ Or with pip:
 pip install tethered
 ```
 
-Requires Python 3.10+. Zero runtime dependencies. Pre-built wheels are available for Linux, macOS, and Windows. Source installs require a C compiler (the package includes a C extension for tamper-resistant locked mode).
+Requires Python 3.11+. Zero runtime dependencies. Pre-built wheels are available for Linux, macOS, and Windows. Source installs require a C compiler (the package includes a C extension for tamper-resistant locked mode).
 
 ## Quick start
 
