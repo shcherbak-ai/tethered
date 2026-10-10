@@ -48,8 +48,8 @@ pytestmark = [
 ]
 
 # From Python 3.12 an interpreter can have its own GIL, and that is the kind
-# the stdlib creates by default.  The C extension cannot be loaded there; it
-# can in one that shares the main GIL ("legacy"), the only kind before 3.12.
+# the stdlib creates by default.  Before 3.12 every interpreter shares the
+# main GIL ("legacy").  The C extension loads in both kinds.
 OWN_GIL = sys.version_info >= (3, 12)
 
 ELSEWHERE = "a locked tethered policy is active in another interpreter of this process"
@@ -1014,9 +1014,9 @@ class TestLockedLogOnlyPolicy:
     def test_names_are_still_mapped_to_addresses(self, shared_gil, listener, subinterpreter):
         """Otherwise its log-only policy would report every connection made by hostname.
 
-        Loopback is allowed here only by name.  An interpreter that shares the
-        GIL resolves through the guardian, which serves a caller that does not
-        hold the lock from that interpreter's own resolver.
+        Loopback is allowed here only by name.  The interpreter resolves
+        through the guardian, which serves a caller that does not hold the
+        lock from that interpreter's own resolver.
         """
         _lock(allow=["localhost"], allow_localhost=False, log_only=True)
         port = listener.getsockname()[1]
@@ -1054,11 +1054,11 @@ class TestLockedLogOnlyPolicy:
         assert result["by name warnings"] == []
         assert result["elsewhere"] == "ok"
         assert result["warnings"] == ["tethered: blocked connect to 203.0.113.9:443"]
-        assert result["through the guardian"] is (shared_gil or not OWN_GIL)
-        if result["through the guardian"]:
-            assert result["resolve"] == ["127.0.0.1"]
-            # A failed lookup is the resolver's own error, not a refusal.
-            assert result["resolve failure"]["type"] == "socket.gaierror"
+        # The extension loads in an interpreter of either kind.
+        assert result["through the guardian"] is True
+        assert result["resolve"] == ["127.0.0.1"]
+        # A failed lookup is the resolver's own error, not a refusal.
+        assert result["resolve failure"]["type"] == "socket.gaierror"
 
     def test_the_owner_is_still_refused_everything_once_tampered_with(
         self, log_only_lock, listener, subinterpreter, monkeypatch, capfd

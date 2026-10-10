@@ -2563,6 +2563,458 @@ class TestHookInstallation:
         assert out["second"] == ["locked", []]
         assert out["by name"] == [[_PROBE], True, True]
 
+    def test_a_hook_that_locks_a_policy_while_being_asked_is_refused(self):
+        """One thread at a time installs the guardian's hook — the same thread included.
+
+        Another audit hook, asked about the guardian's hook, tries to lock a
+        policy of its own: that would install the hook from inside its own
+        installation.  It is refused, and the installation it interrupted
+        goes on to complete, once.
+        """
+        out = _run_beside_a_vetoing_hook(
+            """
+            inner = []
+
+            def locking_hook(event, args):
+                if event == "sys.addaudithook" and not inner:
+                    inner.append("asked")
+                    try:
+                        guardian.activate(vars(core), None, object(), [])
+                    except Exception as exc:
+                        inner.append([type(exc).__name__, str(exc)])
+                    else:
+                        inner.append("locked")
+
+            sys.addaudithook(locking_hook)
+            token = object()
+            out["outer"] = [lock(token), list(seen), enforced()]
+            out["inner"] = inner
+            out["state"] = [guardian.is_active(), guardian.check_token(token)]
+            tethered.deactivate(lock_token=token)
+            out["again"] = [lock(token), list(seen), enforced()]
+            """
+        )
+        assert out["inner"] == [
+            "asked",
+            [
+                "RuntimeError",
+                "tethered: a policy cannot be locked from inside an audit hook that is "
+                "being asked about tethered's own audit hook",
+            ],
+        ]
+        # The lock that was being taken is taken, by the caller that asked for it ...
+        assert out["outer"] == ["locked", [_ADD, _PROBE], True]
+        assert out["state"] == [True, True]
+        # ... and the hook was added once: nothing is installed again later.
+        assert out["again"] == ["locked", [], True]
+
+
+# ── The lock as other interpreters meet it: join() and locked_payload() ──
+# Seen here from the main interpreter, which is either the owner or has
+# nothing to join.  ``test_subinterpreters.py`` joins for real.
+
+_CANNOT_JOIN = "tethered: cannot join the locked policy: "
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestJoinIsNotForTheOwner:
+    def test_nothing_to_join_without_a_lock(self):
+        guardian = _core._c_guardian
+        with pytest.raises(RuntimeError) as excinfo:
+            guardian.join(vars(_core), object(), [])
+        assert str(excinfo.value) == _CANNOT_JOIN + "no policy is locked in this process"
+        assert _core._config is None
+        assert guardian.is_active() is False
+
+    def test_the_interpreter_that_holds_the_lock_cannot_join_it(self, capfd):
+        """Else ``join()`` would be a way to swap the owner's pinned config for another."""
+        guardian = _core._c_guardian
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        held = _core._config
+        permissive = _core._Config(
+            policy=AllowPolicy(["0.0.0.0/0"]), _serialized_payload=held._serialized_payload
+        )
+        for offered in (permissive, held, None):
+            with pytest.raises(RuntimeError) as excinfo:
+                guardian.join(vars(_core), offered, [])
+            assert str(excinfo.value) == (
+                _CANNOT_JOIN + "this interpreter is the one that holds the lock"
+            )
+
+        # Nothing moved: the same config, intact, still the token's to release.
+        assert _core._config is held
+        assert guardian.verify() is True
+        assert guardian.check_token(token) is True
+        with pytest.raises(tethered.EgressBlocked, match="is not in the allow list"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+        tethered.deactivate(lock_token=token)
+        assert guardian.is_active() is False
+
+    @pytest.mark.parametrize(
+        "args",
+        [(), (None, None, []), ([], None, []), ({}, None), ({}, None, [], "extra")],
+        ids=["none", "namespace-none", "namespace-list", "too-few", "too-many"],
+    )
+    def test_arguments_are_checked_before_anything_else(self, args):
+        with pytest.raises(TypeError):
+            _core._c_guardian.join(*args)
+        assert _core._config is None
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestLockedPayload:
+    """``locked_payload()``: the guardian's own copy of what is locked."""
+
+    def test_none_while_nothing_is_locked(self):
+        assert _core._c_guardian.locked_payload() is None
+        tethered.activate(allow=["*.example.com"])  # active, not locked
+        assert _core._c_guardian.locked_payload() is None
+
+    def test_it_is_the_locked_configs_payload_and_follows_the_lock(self):
+        guardian = _core._c_guardian
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        first = _core._config._serialized_payload
+        assert guardian.locked_payload() == first == os.environ[_core._CHILD_POLICY_ENV]
+
+        tethered.activate(allow=["*.other.com"], log_only=True, locked=True, lock_token=token)
+        second = _core._config._serialized_payload
+        assert second != first
+        assert guardian.locked_payload() == second
+
+        tethered.activate(allow=["*.unlocked.com"], lock_token=token)  # replaced by an unlocked one
+        assert guardian.locked_payload() is None
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        assert guardian.locked_payload() == first
+        tethered.deactivate(lock_token=token)
+        assert guardian.locked_payload() is None
+
+    def test_it_is_a_copy_nothing_in_python_reaches(self):
+        """Not the config's own string: rewriting the config's slot changes nothing here."""
+        guardian = _core._c_guardian
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+        published = _core._config._serialized_payload
+        forged = published.replace("*.example.com", "*")
+        object.__setattr__(_core._config, "_serialized_payload", forged)
+        try:
+            assert _core._config._serialized_payload == forged
+            assert guardian.locked_payload() == published
+            assert guardian.locked_payload() is not published
+        finally:
+            object.__setattr__(_core._config, "_serialized_payload", published)
+        assert guardian.verify() is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [None, 7, b'{"global": null}', "lone surrogate \udc80", ...],
+        ids=["None", "int", "bytes", "unencodable", "missing"],
+    )
+    def test_a_lock_without_a_usable_payload_has_none(self, payload):
+        """As when the guardian is exercised on its own: nobody can join such a lock."""
+        guardian = _core._c_guardian
+        token = object()
+        fields = {} if payload is ... else {"_serialized_payload": payload}
+        stand_in = types.SimpleNamespace(locked=True, log_only=False, **fields)
+        guardian.activate(vars(_core), stand_in, token, [])
+        try:
+            assert guardian.is_active() is True
+            assert guardian.locked_payload() is None
+        finally:
+            guardian.deactivate(token)
+
+    def test_a_payload_of_any_text_is_returned_unchanged(self):
+        guardian = _core._c_guardian
+        token = object()
+        text = '{"global": "é中\U0001f600", "scopes": []}' + " " * 5000
+        stand_in = types.SimpleNamespace(locked=True, log_only=False, _serialized_payload=text)
+        guardian.activate(vars(_core), stand_in, token, [])
+        try:
+            assert guardian.locked_payload() == text
+        finally:
+            guardian.deactivate(token)
+        assert guardian.locked_payload() is None
+
+
+# ── One state per interpreter, however many module objects ──────────
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestModuleInstances:
+    """The extension can be imported again after it is removed from ``sys.modules``.
+
+    That gives a second module object in the same interpreter.  Both must
+    work on the same state: a fresh, empty one would be an interpreter with
+    no lock to honour.
+    """
+
+    @pytest.fixture
+    def second(self, monkeypatch):
+        """Another instance of the extension module, not the one ``_core`` uses."""
+        import importlib
+
+        first = sys.modules["tethered._guardian"]
+        monkeypatch.delitem(sys.modules, "tethered._guardian")
+        again = importlib.import_module("tethered._guardian")
+        monkeypatch.setitem(sys.modules, "tethered._guardian", first)
+        # (importing a submodule also rebinds the package attribute)
+        monkeypatch.setattr(tethered, "_guardian", first, raising=False)
+        assert again is not first
+        assert _core._c_guardian is first
+        return again
+
+    def test_a_second_instance_sees_the_same_lock(self, second, capfd):
+        first = _core._c_guardian
+        token = object()
+        assert second.is_active() is False
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+
+        assert second.is_active() is True
+        assert second.verify() is True
+        assert second.check_token(token) is True
+        assert second.check_token(object()) is False
+        assert second.locked_payload() == first.locked_payload()
+        # It is no way around the token ...
+        with pytest.raises(RuntimeError, match="requires correct lock_token"):
+            second.deactivate(object())
+        with pytest.raises(RuntimeError, match="requires correct lock_token"):
+            second.activate(vars(_core), _core._config, object(), [])
+        with pytest.raises(RuntimeError, match="holds the lock"):
+            second.join(vars(_core), _core._config, [])
+        assert first.is_active() is True
+        assert first.verify() is True
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+        # ... and with the token it releases the one lock there is.
+        assert second.deactivate(token) is True
+        assert first.is_active() is False
+        assert _core._config is None
+
+    def test_dropping_a_second_instance_changes_nothing(self, capfd):
+        """It is freed while the first one is in use, with a policy locked."""
+        import importlib
+
+        first = sys.modules["tethered._guardian"]
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+
+        del sys.modules["tethered._guardian"]
+        try:
+            again = importlib.import_module("tethered._guardian")
+        finally:
+            sys.modules["tethered._guardian"] = first
+            tethered._guardian = first
+        assert again is not first
+        assert again.is_active() is True
+        watcher = weakref.ref(again)
+        del again
+        gc.collect()
+        assert watcher() is None, "the second instance was expected to be freed"
+
+        assert _core._c_guardian is first
+        assert _core._c_guardian.is_active() is True
+        assert _core._c_guardian.verify() is True
+        assert _core._c_guardian.check_token(token) is True
+        with pytest.raises(tethered.EgressBlocked, match="is not in the allow list"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        sys.audit("socket.connect", None, ("127.0.0.1", 443))
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+        tethered.deactivate(lock_token=token)
+        assert _core._c_guardian.is_active() is False
+
+    def test_a_lock_taken_through_the_second_instance_is_the_same_lock(self, second):
+        """It is the interpreter that holds a lock, not a module object."""
+        token = object()
+        stand_in = types.SimpleNamespace(locked=True, log_only=False)
+        second.activate(vars(_core), stand_in, token, [])
+        try:
+            assert _core._c_guardian.is_active() is True
+            assert _core._c_guardian.check_token(token) is True
+            assert _core._c_guardian.verify() is True
+        finally:
+            assert _core._c_guardian.deactivate(token) is True
+        assert second.is_active() is False
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestWhatTheCollectorIsTold:
+    """The module tells the garbage collector what the guardian holds — but not the token.
+
+    It has to tell: the snapshot pins ``tethered._core``'s namespace, which
+    names the module, and a cycle the collector cannot see would outlive
+    the interpreter.  Whatever it tells, ``gc.get_referents()`` repeats to
+    anyone.
+    """
+
+    class _Token:
+        """A token the collector tracks, so that it could turn up in a traversal."""
+
+        def __init__(self) -> None:
+            self.cycle = self
+
+    def test_the_token_is_not_among_the_modules_referents(self):
+        guardian = _core._c_guardian
+        token = self._Token()
+        assert gc.is_tracked(token)
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        cfg = _core._config
+
+        told = gc.get_referents(guardian)
+        # The collector is told about what is pinned (so this is not vacuous) ...
+        assert any(obj is cfg for obj in told)
+        assert any(obj is vars(_core) for obj in told)
+        # ... and not about the token: neither directly nor one step on.
+        assert not any(obj is token for obj in told)
+        for obj in told:
+            if obj is not token.__dict__ and gc.is_tracked(obj) and not isinstance(obj, dict):
+                assert not any(inner is token for inner in gc.get_referents(obj)), obj
+        # Asking who refers to the token does not name the guardian either.
+        assert not any(obj is guardian for obj in gc.get_referrers(token))
+
+        assert guardian.check_token(token) is True
+        tethered.deactivate(lock_token=token)
+
+    def test_a_collection_leaves_a_locked_policy_as_it_is(self, capfd):
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        for _ in range(3):
+            gc.collect()
+        assert _core._c_guardian.is_active() is True
+        assert _core._c_guardian.verify() is True
+        assert _core._c_guardian.check_token(token) is True
+        with pytest.raises(tethered.EgressBlocked, match="is not in the allow list"):
+            sys.audit("socket.connect", None, ("203.0.113.9", 443))
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_nothing_is_held_once_the_lock_is_released(self):
+        guardian = _core._c_guardian
+        token = object()
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=token)
+        cfg = _core._config
+        # (A _Config has slots and takes no weak reference: ask the collector.)
+        assert any(obj is guardian for obj in gc.get_referrers(cfg))
+        assert any(obj is guardian for obj in gc.get_referrers(cfg.policy))
+        tethered.deactivate(lock_token=token)
+        assert not any(obj is guardian for obj in gc.get_referrers(cfg))
+        assert not any(obj is guardian for obj in gc.get_referrers(cfg.policy))
+        assert not any(obj is cfg for obj in gc.get_referents(guardian))
+        # The namespace of tethered._core is let go of as well.
+        assert not any(obj is vars(_core) for obj in gc.get_referents(guardian))
+
+
+# Child process of TestTheOwnerWithoutItsState: the lock taken there is never released.
+_LOSE_THE_STATE = """
+import gc, json, sys
+
+import tethered
+import tethered._core as core
+
+out = {}
+
+def outcome(call, *args):
+    try:
+        call(*args)
+    except RuntimeError as exc:
+        return [type(exc).__name__, str(exc)]
+    return "ok"
+
+token = object()
+tethered.activate(allow=["127.0.0.1"], locked=True, lock_token=token)
+out["before"] = [
+    outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9)),
+    core._c_guardian.verify(),
+]
+
+# Every reference to the extension module goes: the name in tethered._core
+# (which the snapshot pins), the package attribute, sys.modules.
+core._c_guardian = None
+del tethered._guardian
+del sys.modules["tethered._guardian"]
+gc.collect()
+
+out["after"] = {
+    "connect": outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9)),
+    "new socket": outcome(sys.audit, "socket.__new__", None, 2, 1, 0),
+    "launch": outcome(sys.audit, "os.system", "prog"),
+    "other file": outcome(sys.audit, "open", "data/other.txt", "w", 0),
+    "the bootstrap": outcome(sys.audit, "open", "site-packages/tethered.pth", "w", 0),
+    "other variable": outcome(sys.audit, "os.putenv", "PATH", "x"),
+    "unguarded": outcome(sys.audit, "tethered.test.unguarded"),
+}
+
+# Importing it again gives the interpreter a new, empty state: no way back.
+import tethered._guardian as again
+out["again"] = {
+    "is_active": again.is_active(),
+    "verify": again.verify(),
+    "check_token": again.check_token(token),
+    "activate": outcome(again.activate, vars(core), None, token, []),
+    "deactivate": outcome(again.deactivate, token),
+    "join": outcome(again.join, vars(core), None, []),
+    "resolve": outcome(again.resolve, "localhost", 80, 0, 0, 0, 0),
+    "connect": outcome(sys.audit, "socket.connect", None, ("127.0.0.1", 9)),
+}
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestTheOwnerWithoutItsState:
+    """The interpreter that took the lock lets go of every instance of the extension.
+
+    That takes rebinding a name the snapshot pins.  The guardian's state for
+    the interpreter goes with the module — and with it everything a guarded
+    event could be verified against, and the token.  The lock is the
+    process's and stays: the interpreter is refused what tethered guards,
+    for good.
+
+    Run in a child process, which stays locked until it exits.
+    """
+
+    def test_it_is_refused_everything_guarded_and_cannot_unlock(self):
+        env = {k: v for k, v in os.environ.items() if k != _core._CHILD_POLICY_ENV}
+        child = subprocess.run(  # nosec B603
+            [sys.executable, "-c", _LOSE_THE_STATE],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert child.returncode == 0, child.stderr
+        out = json.loads(child.stdout.splitlines()[-1])
+        assert out["before"] == ["ok", True]
+
+        violation = "Blocked by tethered (integrity violation): "
+        assert out["after"] == {
+            "connect": ["RuntimeError", violation + "127.0.0.1"],
+            "new socket": ["RuntimeError", violation + "unknown"],
+            "launch": ["RuntimeError", violation + "os.system"],
+            "other file": "ok",
+            "the bootstrap": ["RuntimeError", violation + "open"],
+            "other variable": "ok",
+            "unguarded": "ok",
+        }
+        gone = (
+            "tethered: this interpreter locked the policy, but the guardian's state "
+            "for it is gone, so the lock can be neither replaced nor released"
+        )
+        assert out["again"] == {
+            "is_active": True,
+            "verify": False,
+            "check_token": False,
+            "activate": ["RuntimeError", gone],
+            "deactivate": ["RuntimeError", gone],
+            "join": [
+                "RuntimeError",
+                _CANNOT_JOIN + "this interpreter is the one that holds the lock",
+            ],
+            "resolve": ["RuntimeError", violation + "unauthorized _guardian.resolve() call"],
+            "connect": ["RuntimeError", violation + "127.0.0.1"],
+        }
+        # Said once, however many events are refused.
+        assert child.stderr.count("TAMPER DETECTED") == 1
+
 
 class TestTetheredLockedException:
     def test_message(self):
