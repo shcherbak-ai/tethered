@@ -13,7 +13,7 @@ policy allows every port of ``allowed.test``.
 from __future__ import annotations
 
 import pytest
-from harness import ALLOWED_NAME, OTHER_PORT, arrivals, scopes
+from harness import scopes
 from test_celery import Stack, start_stack
 
 POOLS = ["prefork", "threads", "solo", "gevent", "eventlet"]
@@ -54,28 +54,8 @@ class TestAScopeInsideATask:
             pytest.skip("one task at a time in each process of this pool")
         scopes.overlapping(stack.probe)
 
-    def test_a_python_child_launched_inside_the_scope_is_held_to_it(
-        self, stack: Stack, pool: str
-    ) -> None:
-        if pool == "gevent":
-            pytest.skip("gevent launches with a Popen of its own: see the next test")
-        # Under eventlet too: its launches go through the standard library's Popen, which is
-        # where tethered hands a scope on.
+    def test_a_python_child_launched_inside_the_scope_is_held_to_it(self, stack: Stack) -> None:
+        # In every pool: through the standard library's Popen, and under gevent, whose Popen
+        # forks and calls os.exec* itself, through the exec that tethered's hook carries out.
         child = scopes.child_is_held_to_the_scope(stack.probe)
         assert child["locked"] is True, child
-
-    def test_under_gevent_a_python_child_is_not_held_to_the_scope(
-        self, stack: Stack, pool: str
-    ) -> None:
-        """Limit: gevent's ``Popen`` forks and calls ``os.exec*`` from Python, and a scope
-        reaches a child only through the standard library's ``Popen``.  The child holds the
-        policy of the worker and not the scope of the task: it reaches what the scope refuses.
-        """
-        if pool != "gevent":
-            pytest.skip("the gevent pool only")
-        launched = stack.probe("child", ALLOWED_NAME, OTHER_PORT, scope=scopes.SCOPE)
-        scopes.assert_reached(launched)
-        child = launched["child"]
-        assert child["locked"] is True, launched
-        scopes.assert_reached(child)
-        assert arrivals() == {scopes.at(OTHER_PORT): 1}

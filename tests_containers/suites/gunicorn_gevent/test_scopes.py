@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 from harness import (
     ALLOWED_NAME,
+    ALLOWED_PORT,
     FORBIDDEN_NAME,
     OTHER_PORT,
     Server,
@@ -95,23 +96,18 @@ class TestWaysOutOfTheScope:
         scopes.assert_refused_by_the_policy(report)
         assert arrivals() == {scopes.at(OTHER_PORT): 1}
 
-    def test_a_python_child_launched_inside_the_scope_is_not_held_to_it(
-        self, server: Server
-    ) -> None:
-        """Limit: gevent's ``Popen`` forks and calls ``os.exec*`` from Python, and a scope
-        reaches a child only through the standard library's ``Popen``.  The child holds the
-        policy of the process and not the scope: it reaches what the scope refuses.
+    def test_a_python_child_launched_inside_the_scope_is_held_to_it(self, server: Server) -> None:
+        """gevent's ``Popen`` forks and calls ``os.exec*`` from Python, so there is no frame of
+        the standard library's ``Popen`` to hand the scope on through.  tethered's hook in the
+        forked child carries the exec out with the scope in its environment.  (Before that,
+        the child held the policy of the process and reached what the scope refuses.)
         """
-        launched = server.probe("child", ALLOWED_NAME, OTHER_PORT, scope=scopes.SCOPE)
-        scopes.assert_reached(launched)
-        child = launched["child"]
-        assert child["locked"] is True, launched
-        scopes.assert_reached(child)
-        assert arrivals() == {scopes.at(OTHER_PORT): 1}
-
+        child = scopes.child_is_held_to_the_scope(server.probe)
+        assert child["locked"] is True, child
+        # What the scope allows and the policy refuses stays refused.
         launched = server.probe("child", FORBIDDEN_NAME, OTHER_PORT, scope=scopes.SCOPE)
-        scopes.assert_refused_by_the_policy(launched["child"])
-        assert arrivals() == {scopes.at(OTHER_PORT): 1}
+        assert launched["child"]["outcome"] == "blocked", launched
+        assert arrivals() == {scopes.at(ALLOWED_PORT): 1, scopes.at(OTHER_PORT): 1}
 
 
 @pytest.fixture(scope="class")
@@ -160,3 +156,10 @@ class TestAScopeWithoutAPolicy:
     ) -> None:
         scopes.narrows(unrestricted.probe, op)
         scopes.assert_reached(unrestricted.probe(op, FORBIDDEN_NAME, OTHER_PORT))
+
+    def test_a_python_child_launched_inside_the_scope_is_held_to_it(
+        self, unrestricted: Server
+    ) -> None:
+        child = scopes.child_is_held_to_the_scope(unrestricted.probe)
+        # No policy of the process: the scope is what the child was given.
+        assert child["active"] is False, child
