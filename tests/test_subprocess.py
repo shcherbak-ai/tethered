@@ -4532,6 +4532,144 @@ def _mean_microseconds(fn, iterations: int = 500) -> float:
     return (time.perf_counter() - start) / iterations * 1_000_000
 
 
+class TestWhyALaunchIsExternal:
+    """A launch of ``sys.executable`` that is treated as external says why.
+
+    The warning used to read ``external subprocess launch detected:
+    subprocess.Popen(/usr/bin/python3.13)`` and nothing more, for the very
+    interpreter tethered runs in: the reader could not tell ``-S`` from a
+    missing bootstrap.  The reason now ends the log line and the refusal.
+    """
+
+    @staticmethod
+    def _popen(*options: str, executable: str = sys.executable, argv0: str = sys.executable):
+        return (executable, [argv0, *options, "-c", "pass"], None, None)
+
+    def test_a_python_child_that_inherits_has_no_reason(self):
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", self._popen()) is True
+
+    @pytest.mark.parametrize(
+        ("args", "event"),
+        [
+            (("/bin/sh", ["/bin/sh", "-c", "true"], None, None), "subprocess.Popen"),
+            (("echo hi",), "os.system"),
+            ((), "subprocess.Popen"),
+        ],
+        ids=["another-program", "no-interpreter-launch", "short-args"],
+    )
+    def test_something_else_needs_no_explanation(self, args, event):
+        assert _core._launch_exclusion(event, args) == ""
+        assert _is_auto_inheriting_python_launch(event, args) is False
+
+    def test_site_disabled(self):
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen("-S"))
+        assert reason.startswith("-S skips site.py and the tethered.pth bootstrap")
+        assert reason.endswith("the child holds no policy")
+
+    def test_options_that_cannot_be_parsed(self):
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen("--no-such-option"))
+        assert reason == "its interpreter options could not be parsed"
+
+    def test_user_site_skipped_when_the_bootstrap_is_there(self, monkeypatch):
+        monkeypatch.setattr(_core, "_is_user_site_pth", lambda path: True)
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen("-s"))
+        assert reason.startswith("-s / -I skip the per-user site-packages")
+        assert _core._has_site_bypass_flag([sys.executable, "-s"], "anywhere") is True
+
+    def test_no_bootstrap_at_all(self, monkeypatch):
+        monkeypatch.setattr(_core, "_bootstrap_pth_path", lambda: "")
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen())
+        assert reason == "no tethered.pth is in a directory this interpreter's site.py processes"
+
+    def test_another_argv0(self):
+        """POSIX layout: the child reads which installation it is from ``argv[0]``."""
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen(argv0="python"))
+        assert reason.startswith("its argv[0] is not sys.executable")
+
+    @pytest.mark.parametrize("policy", ["warn", "block"])
+    def test_the_reason_ends_the_warning_and_the_refusal(self, policy, caplog):
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(tethered.SubprocessBlocked, match=r" — -S skips site\.py"):
+                    _handle_subprocess(cfg, "subprocess.Popen", self._popen("-S"))
+            else:
+                _handle_subprocess(cfg, "subprocess.Popen", self._popen("-S"))
+        (record,) = caplog.records
+        assert "external subprocess launch" in record.getMessage()
+        assert record.getMessage().endswith(": the child holds no policy")
+
+    def test_another_program_is_reported_as_before(self, caplog):
+        cfg = _launch_cfg(external_subprocess_policy="warn")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _handle_subprocess(cfg, "subprocess.Popen", ("/bin/sh", ["/bin/sh"], None, None))
+        (record,) = caplog.records
+        assert record.getMessage() == (
+            "tethered: external subprocess launch detected: subprocess.Popen(/bin/sh)"
+        )
+
+
+class TestSysExecutableThatIsNotPython:
+    """Where Python is embedded, ``sys.executable`` may be the embedding program.
+
+    Under uWSGI it is the uwsgi binary: ``[sys.executable, "x.ini"]`` starts
+    uWSGI again and no Python at all.  tethered took that for a Python child
+    that inherits the policy: under ``external_subprocess_policy="block"`` it
+    was not refused, and uWSGI ran a command from the file it was given.
+    """
+
+    @pytest.mark.parametrize(
+        ("orig_argv", "executable", "expected"),
+        [
+            (["python", "-c", "pass"], "/usr/bin/python3.13", True),
+            (["anything"], "/opt/app/bin/renamed", True),  # started as an interpreter
+            ([], "/usr/bin/python3.13", True),  # embedded, a real python (mod_wsgi)
+            ([], r"C:\\Python313\\pythonw.exe", True),
+            ([], "/usr/bin/pypy3", True),
+            ([], "/usr/local/bin/uwsgi", False),  # embedded, the host program
+            ([], "", False),
+            ([], None, False),
+        ],
+    )
+    def test_embedded_and_not_named_like_an_interpreter(
+        self, monkeypatch, orig_argv, executable, expected
+    ):
+        monkeypatch.setattr(sys, "orig_argv", orig_argv)
+        monkeypatch.setattr(sys, "executable", executable)
+        assert _core._sys_executable_is_python() is expected
+
+    def test_this_process_is_an_interpreter(self):
+        assert _core._SYS_EXECUTABLE_IS_PYTHON is True
+
+    def test_a_launch_of_it_is_not_a_python_child(self, monkeypatch):
+        monkeypatch.setattr(_core, "_SYS_EXECUTABLE_IS_PYTHON", False)
+        args = (sys.executable, [sys.executable, "app.ini"], None, None)
+        assert _core._launch_exclusion("subprocess.Popen", args).startswith(
+            "sys.executable is the program that embeds Python here, not an interpreter"
+        )
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", args) is False
+        with pytest.raises(tethered.SubprocessBlocked, match="embeds Python here"):
+            _handle_subprocess(
+                _launch_cfg(external_subprocess_policy="block"), "subprocess.Popen", args
+            )
+
+    def test_activate_says_that_no_python_child_is_recognized(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_SYS_EXECUTABLE_IS_PYTHON", False)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        (message,) = [
+            r.getMessage() for r in caplog.records if "embeds Python here" in r.getMessage()
+        ]
+        assert message.startswith(f"tethered: sys.executable is {sys.executable}, ")
+        assert "--py-sys-executable" in message
+
+    def test_activate_says_nothing_in_an_interpreter(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        assert not [r for r in caplog.records if "embeds Python here" in r.getMessage()]
+
+
 class _Replaced(Exception):
     """Raised by the stand-in for ``os.execve``, which really would not return."""
 

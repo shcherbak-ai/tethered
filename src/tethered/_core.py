@@ -1976,10 +1976,27 @@ def _has_site_bypass_flag(argv: Any, pth_path: str = "") -> bool:
     ``-S`` after the script path, or as the value of another option, is not
     one.
     """
+    return bool(_site_bypass_reason(argv, pth_path))
+
+
+def _site_bypass_reason(argv: Any, pth_path: str = "") -> str:
+    """Say why ``argv`` does not provably leave the bootstrap enabled ("" if it does).
+
+    The text ends the log line and the exception of a launch that is
+    treated as external for it, so that it says what was wrong with a
+    launch of the very interpreter tethered runs in.
+    """
     flags = _interpreter_flags(argv)
-    if flags is None or any(c in flags for c in _SITE_BYPASS_FLAG_CHARS):
-        return True
-    return any(c in flags for c in _USER_SITE_BYPASS_FLAG_CHARS) and _is_user_site_pth(pth_path)
+    if flags is None:
+        return "its interpreter options could not be parsed"
+    if any(c in flags for c in _SITE_BYPASS_FLAG_CHARS):
+        return "-S skips site.py and the tethered.pth bootstrap with it: the child holds no policy"
+    if any(c in flags for c in _USER_SITE_BYPASS_FLAG_CHARS) and _is_user_site_pth(pth_path):
+        return (
+            "-s / -I skip the per-user site-packages, where tethered.pth is: "
+            "the child holds no policy"
+        )
+    return ""
 
 
 def _normalize_exe_path(value: Any) -> str | None:
@@ -2137,8 +2154,49 @@ def _join_windows_argv(argv: Any) -> str | None:
     return " ".join(parts)
 
 
+def _sys_executable_is_python() -> bool:
+    """Return False where ``sys.executable`` names a program that embeds Python.
+
+    tethered recognizes a Python child by ``sys.executable``.  A program
+    that embeds the interpreter may leave its own path there: under uWSGI
+    it is the uwsgi binary, so ``[sys.executable, "x.ini"]`` starts uWSGI
+    again, with a configuration file, and no Python at all.  An interpreter
+    that was started by its own executable has its command line in
+    ``sys.orig_argv``; an embedded one has none.  Embedded and not named
+    like an interpreter is taken for "not Python" (mod_wsgi is embedded
+    too, and leaves the path of a real ``python`` there).
+    """
+    if sys.orig_argv:
+        return True
+    name = os.path.basename(sys.executable or "").lower()
+    return name.startswith(("python", "pypy"))
+
+
+# Evaluated once: a host sets ``sys.executable`` before it runs any Python.
+_SYS_EXECUTABLE_IS_PYTHON = _sys_executable_is_python()
+
+_NOT_AN_INTERPRETER_REASON = (
+    "sys.executable is the program that embeds Python here, not an interpreter, "
+    "so this starts that program"
+)
+
+
 def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool:
     """Return True if a subprocess launch will be covered by ``tethered.pth`` auto-inherit.
+
+    The decision is :func:`_launch_exclusion`'s, which also says why not.
+    """
+    return _launch_exclusion(event, args) is None
+
+
+def _launch_exclusion(event: str, args: tuple[Any, ...]) -> str | None:
+    """Return ``None`` if a launch auto-inherits the policy, else why it does not.
+
+    The reason is empty for a launch that is simply something else (another
+    program, an event that starts no interpreter), and a short text for a
+    launch of ``sys.executable`` that is not covered all the same: that
+    text ends the warning or the refusal, which would otherwise name this
+    very interpreter as an "external" launch and leave the reader guessing.
 
     A launch auto-inherits when:
 
@@ -2167,10 +2225,13 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
     :func:`_parse_windows_cmdline`; the launched image is ``executable``
     when given, else the command line's first token.
 
+    4. ``sys.executable`` is a Python interpreter at all
+       (:func:`_sys_executable_is_python`).
+
     Used by ``_handle_subprocess`` to skip ``external_subprocess_policy``
-    enforcement on launches that auto-inherit handles.  Returns False for
-    events that don't directly launch a Python interpreter
-    (``os.system``, ``os.startfile``).
+    enforcement on launches that auto-inherit handles.  Events that don't
+    directly launch a Python interpreter (``os.system``, ``os.startfile``)
+    are never covered.
     """
     # Identify executable + argv based on the event's audit-arg layout.
     if event in ("subprocess.Popen", "os.exec", "os.posix_spawn") and len(args) >= 2:
@@ -2178,43 +2239,51 @@ def _is_auto_inheriting_python_launch(event: str, args: tuple[Any, ...]) -> bool
     elif event == "os.spawn" and len(args) >= 3:
         executable, argv = args[1], args[2]
     else:
-        return False
+        return ""
 
     # ``os.spawn`` is raised on Windows only; ``os.exec`` on every platform.
     if event == "os.spawn" or (event == "os.exec" and _WINDOWS):
         argv = _join_windows_argv(argv)
 
+    this_interpreter = _normalize_exe_path(sys.executable)
+    argv0_names_it = True
     if isinstance(argv, str):
         parsed = _parse_windows_cmdline(argv)
         if parsed is None:
-            return False
+            return ""
         program, argv = parsed
         if executable is None:
             executable = program
-    elif (
-        not isinstance(argv, (list, tuple))
-        or not argv
-        or _normalize_exe_path(argv[0]) != _normalize_exe_path(sys.executable)
-    ):
+    else:
         # POSIX hands the child ``argv`` as is, and an interpreter works out
         # which installation or venv it belongs to from argv[0], not from the
         # file that was executed: started as "python" it looks that name up
         # on PATH and can come up outside this venv, where no tethered.pth is
         # processed.  (On Windows the executable itself decides.)
-        return False
+        argv0_names_it = (
+            isinstance(argv, (list, tuple))
+            and bool(argv)
+            and _normalize_exe_path(argv[0]) == this_interpreter
+        )
 
     exe_norm = _normalize_exe_path(executable)
-    if exe_norm is None:
-        return False
+    if exe_norm is None or exe_norm != this_interpreter:
+        return ""
 
-    if exe_norm != _normalize_exe_path(sys.executable):
-        return False
-
+    # From here on the launch names this interpreter, and the reader of the
+    # log is owed the reason why it is not treated as a child of it.
+    if not _SYS_EXECUTABLE_IS_PYTHON:
+        return _NOT_AN_INTERPRETER_REASON
+    if not argv0_names_it:
+        return (
+            "its argv[0] is not sys.executable, so the interpreter may come up "
+            "outside this environment"
+        )
     pth_path = _bootstrap_pth_path()
     if not pth_path:
-        return False
+        return "no tethered.pth is in a directory this interpreter's site.py processes"
 
-    return not _has_site_bypass_flag(argv, pth_path)
+    return _site_bypass_reason(argv, pth_path) or None
 
 
 # Maximum frames to walk back from the audit hook to find ``_execute_child``.
@@ -2766,7 +2835,8 @@ def _handle_subprocess(
     # Auto-inheriting Python child launches are covered by tethered.pth →
     # _autoactivate — provided their environment carries the payload, which
     # is what the rest of this function establishes.
-    is_python = _is_auto_inheriting_python_launch(launch_event, launch_args)
+    exclusion = _launch_exclusion(launch_event, launch_args)
+    is_python = exclusion is None
     _has_env, env_value = _extract_subprocess_env(launch_event, launch_args)
 
     # ── The environment the child will actually receive ────────────────
@@ -2847,7 +2917,7 @@ def _handle_subprocess(
     # can't reach: non-Python children, different interpreters, ``-S``) —
     # unless the payload cannot be put in place, which makes the launch one
     # auto-inherit can't reach.
-    reason = ""
+    reason = f" — {exclusion}" if exclusion else ""
     if is_python:
         if popen:
             if not needs_rewrite:
@@ -3730,6 +3800,16 @@ def activate(
                 if locked
                 else ""
             ),
+        )
+    if not _SYS_EXECUTABLE_IS_PYTHON:
+        logger.warning(
+            "tethered: sys.executable is %s, the program that embeds Python here, not a "
+            "Python interpreter. tethered recognizes a Python child by sys.executable, so it "
+            "recognizes none: every launch counts as external (external_subprocess_policy "
+            "applies), a child started with the real interpreter included, although that "
+            "one still inherits the policy. Give the server the interpreter's path (uWSGI: "
+            "--py-sys-executable /path/to/python).",
+            sys.executable,
         )
     if _fork_server_warning_pending:
         _warn_if_fork_server_runs()
