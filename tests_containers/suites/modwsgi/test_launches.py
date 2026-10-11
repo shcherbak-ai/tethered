@@ -102,12 +102,15 @@ class TestTheHolderAndAJoinedInterpreter:
         assert arrivals() == {}
         warning.wait_log(r"external subprocess launch detected: subprocess\.Popen\(python3\)")
 
-    def test_a_child_given_an_environment_without_the_policy_is_not_launched(
+    def test_a_child_given_an_environment_without_the_policy_gets_the_lock_all_the_same(
         self, warning: Server, mount: str
     ) -> None:
+        # The lock keeps its promise by adding the variable to the child's
+        # environment (it used to refuse the launch).
         report = launch(warning, mount, "clean_env")
-        refused(report, SUBPROCESS_BLOCKED)
-        assert "env strips _TETHERED_CHILD_POLICY" in report["message"], report
+        reached(report)
+        assert report["child"]["locked"] is True, report
+        refused(report["child"])
         assert arrivals() == {}
 
     def test_a_child_started_without_site_is_warned_about_and_holds_no_policy(
@@ -131,17 +134,19 @@ class TestTheHolderAndAJoinedInterpreter:
         assert arrivals() == {AT_FORBIDDEN: 1}
         warning.wait_log(r"external subprocess launch detected: subprocess\.Popen\(bash\)")
 
+    @pytest.mark.parametrize("how", ["executable", "clean_env"])
     def test_under_block_a_child_started_with_sys_executable_is_launched_and_inherits(
-        self, blocking: Server, mount: str
+        self, blocking: Server, mount: str, how: str
     ) -> None:
-        report = launch(blocking, mount, "executable")
+        # With or without the policy in the environment it is given.
+        report = launch(blocking, mount, how)
         reached(report)
         assert report["child"]["locked"] is True, report
         assert report["child"]["external_subprocess_policy"] == "block", report
         refused(report["child"])
         assert arrivals() == {}
 
-    @pytest.mark.parametrize("how", ["path_python", "no_site", "clean_env", None])
+    @pytest.mark.parametrize("how", ["path_python", "no_site", None])
     def test_under_block_nothing_else_is_launched(
         self, blocking: Server, mount: str, how: str | None
     ) -> None:
@@ -201,13 +206,13 @@ class TestForkAndExec:
                 "carried out with the locked policy added"
             )
 
-    def test_the_same_environment_given_to_subprocess_is_refused_under_a_lock(self) -> None:
-        # Only an exec is completed.  subprocess with that environment is
-        # refused under a lock, here as in the subinterpreters above.
+    def test_the_same_environment_given_to_subprocess_is_completed_under_a_lock(self) -> None:
+        # subprocess is given the variable too, here as in the subinterpreters above.
         site = Site()
         shop = site.script("shop", activate="locked")
         server = site.start(IN_THE_MAIN_INTERPRETER.format(shop=shop))
         report = ask(server, "/shop", "child", FORBIDDEN_NAME, OTHER_PORT, how="clean_env")
-        refused(report, SUBPROCESS_BLOCKED)
-        assert "env strips _TETHERED_CHILD_POLICY" in report["message"], report
+        reached(report)
+        assert report["child"]["locked"] is True, report
+        refused(report["child"])
         assert arrivals() == {}
