@@ -303,8 +303,9 @@ class TestLaunchesUnderWarn:
     ) -> None:
         """Under gevent this launch is an ``os.exec*`` of the same interpreter, which tethered
         carries out with the policy added, under a lock too.  (Under gunicorn's sync worker the
-        same code is a ``subprocess.Popen`` event and a locked policy refuses it.)  Under a lock
-        tethered says so, in the forked child: the line is in the stderr the application captures.
+        same code is a ``subprocess.Popen`` event, and the child is given the variable through
+        the copy of its environment, with nothing logged.)  Under a lock tethered says so, in
+        the forked child: the line is in the stderr the application captures.
         """
         report = launch(warning, "clean_env")
         child = child_of(report)

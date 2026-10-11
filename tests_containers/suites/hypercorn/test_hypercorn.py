@@ -8,10 +8,11 @@ policy.  What the three worker classes come to:
 * ``asyncio``: the standard event loop; everything is seen and enforced.
 * ``trio``: not asyncio at all, but trio does its networking through Python's
   ``socket`` module and its launches through ``subprocess``, so everything is
-  seen and enforced.  ``probe_trio.py`` is the probe application for it.  One
-  limit: trio cannot be imported once a locked policy is in place
-  (``TestImportingTrioUnderAPolicy``), so the policy has to be activated by
-  the application, which the worker imports after trio.
+  seen and enforced.  ``probe_trio.py`` is the probe application for it.
+  Importing trio launches ``ldconfig``; a locked policy used to refuse that
+  launch and now gives it the policy variable
+  (``TestImportingTrioUnderAPolicy``), so the lock can be taken before trio
+  is imported, in the master too.
 * ``uvloop``: the worker imports uvloop before it imports the application, so
   ``activate()`` refuses and the server does not start.  When the master holds
   the policy the worker cannot import uvloop and does not start either.  Only
