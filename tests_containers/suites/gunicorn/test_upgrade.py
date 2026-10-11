@@ -249,7 +249,13 @@ def test_sigusr2_starts_a_new_master_whose_workers_enforce_the_policy(
         server.send_signal(signal.SIGTERM)
         wait_until(lambda: not server.running, "the old master exits after SIGTERM")
         server.wait_log("Master has been promoted")
-        wait_until(lambda: not new_pid_file.exists(), "the new master takes over the pid file")
+        # gunicorn removes the new master's own pid file first and writes this one after.
+        wait_until(
+            lambda: (
+                not new_pid_file.exists() and pid_file.exists() and pid_file.read_text().strip()
+            ),
+            "the new master takes over the pid file",
+        )
         assert int(pid_file.read_text()) == new_master
         # The old master left the unix socket in place for its successor.
         assert socket_path.is_socket()
