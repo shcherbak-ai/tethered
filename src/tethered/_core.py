@@ -168,8 +168,8 @@ class EgressBlocked(RuntimeError):
         else:
             # Literal text, here and in SubprocessBlocked, not the constants
             # the readers above use: the guardian builds these exceptions
-            # when it refuses over a tampered module, and that has to work
-            # whatever the module's names are bound to by then.
+            # when it refuses over a tampered module, and their text must
+            # not depend on what those constants are bound to by then.
             msg = f"Blocked by tethered: {host}"
             if port is not None:
                 # An IPv6 address is written the way an allow rule writes
