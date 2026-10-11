@@ -1,0 +1,2 @@
+# Nothing beyond the harness's own requirements: supervisord is a Debian
+# package here (suite.toml), not a package of the Python under test.
