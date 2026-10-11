@@ -10,11 +10,11 @@ A test asks for a job through the front end (``front.py``, a producer that
 holds no policy) and asserts what the job reported, what the producer and
 the worker's log say about a refused job, and what arrived in the world.
 
-On Python 3.12 and later none of that works today: asyncio writes to its
-sockets with ``socket.sendmsg`` there, tethered refuses ``sendmsg`` on a
-connected socket, and the worker loses its connection to Redis.  The tests
-of that limit (``TestAsyncioWritesFromPython312``) run on those versions and
-all the others on Python 3.11.
+From Python 3.12 asyncio writes to its sockets with ``socket.sendmsg``, and
+redis-py's asyncio client, which arq uses, writes every command that way.
+tethered once refused ``sendmsg`` on a connected socket, so on those versions
+the worker could not talk to Redis at all; this suite found it, and
+``TestAsyncioWritesWithSendmsg`` keeps it found.
 
 Not covered: arq with uvloop (nothing that goes through a uvloop loop raises
 an audit event; tethered refuses to load uvloop under a policy) and
@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import re
 import socket
-import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -59,21 +58,6 @@ REFUSED_NAME = f"Blocked by tethered: {FORBIDDEN_NAME} is not in the allow list"
 
 AT_ALLOWED = f"{ALLOWED_ADDR}:{ALLOWED_PORT}/tcp"
 AT_FORBIDDEN = f"{FORBIDDEN_ADDR}:{OTHER_PORT}/tcp"
-
-#: From Python 3.12 asyncio's socket transports write with socket.sendmsg:
-#: writelines() always, and write() for what one send() could not take.  The
-#: audit event of sendmsg on a connected socket carries no address, and
-#: tethered refuses what it cannot read.  redis-py's asyncio client, which arq
-#: uses, writes every command with writelines().
-SENDMSG_REFUSED = sys.version_info >= (3, 12)
-works = pytest.mark.skipif(
-    SENDMSG_REFUSED,
-    reason="asyncio writes with sendmsg from Python 3.12 and tethered refuses it: "
-    "see TestAsyncioWritesFromPython312",
-)
-REFUSED_SENDMSG = (
-    "tethered: blocked sendmsg for <unreadable None> (cannot be checked against the allow list)"
-)
 
 #: The ways a job opens a connection: blocking in the loop, with asyncio's
 #: streams, in a thread, and with urllib (blocking).
@@ -173,7 +157,6 @@ def stack(where: str, mode: str) -> Stack:
     return start_stack(mode, where)
 
 
-@works
 class TestWorker:
     def test_jobs_run_in_the_standard_event_loop_of_the_worker_under_the_policy(
         self, stack: Stack, mode: str
@@ -248,7 +231,6 @@ class TestWorker:
 # ── Jobs nobody enqueued, and blocked launches ────────────────────────
 
 
-@works
 class TestCronJobs:
     @pytest.mark.parametrize("where", ["import", "on_startup"])
     def test_a_cron_job_runs_under_the_policy(self, where: str) -> None:
@@ -262,7 +244,6 @@ class TestCronJobs:
         stack.worker.wait_log(r"cron:tick")
 
 
-@works
 class TestBlockingExternalLaunches:
     def test_the_worker_starts_and_works_and_a_tool_is_not_launched(self) -> None:
         stack = start_stack(env={"TETH_ESP": "block"})
@@ -278,7 +259,7 @@ class TestBlockingExternalLaunches:
         assert stack.probe("connect", ALLOWED_NAME, ALLOWED_PORT)["outcome"] == "reached"
 
 
-# ── Python 3.12 and later ─────────────────────────────────────────────
+# ── The control, and what asyncio writes with ─────────────────────────
 
 
 class TestWithoutTethered:
@@ -292,62 +273,23 @@ class TestWithoutTethered:
         assert arrivals() == {AT_FORBIDDEN: 1}
 
 
-@pytest.mark.skipif(
-    not SENDMSG_REFUSED, reason="asyncio does not write with sendmsg before Python 3.12"
-)
-class TestAsyncioWritesFromPython312:
-    def log_of_a_worker_that_ends(self, where: str) -> str:
-        """Start a worker under a locked policy, wait until it has given up; returns its log."""
+class TestAsyncioWritesWithSendmsg:
+    @pytest.mark.parametrize("where", ["import", "on_startup"])
+    def test_the_worker_keeps_talking_to_redis_under_a_locked_policy(self, where: str) -> None:
+        """From Python 3.12 asyncio writes with ``sendmsg()`` on the connected socket.
 
-        def accepting(server: Server) -> bool:
-            socket.create_connection((LOOPBACK_ADDR, server.port), timeout=1.0).close()
-            return True
-
-        redis = start_server(REDIS, ready=accepting)
-        started: list[Server] = []
-
-        def never(server: Server) -> bool:
-            started.append(server)
-            return False
-
-        # The worker ends by itself, and start_server says with which status.
-        with pytest.raises(AssertionError, match="exited with status 1 while starting"):
-            start_server(
-                ["arq", "arq_tasks.WorkerSettings"],
-                env={"REDIS_PORT": str(redis.port), "TETH_ACTIVATE": "locked", "TETH_WHERE": where},
-                ready=never,
-                timeout=60,
-            )
-        return started[0].log
-
-    def test_a_worker_that_holds_the_policy_from_the_start_cannot_talk_to_redis(self) -> None:
-        """Limit: on Python 3.12+ an arq worker under a policy never gets its Redis connection.
-
-        Redis is on loopback, which the policy allows, and the connection
-        itself is made.  The first command is written with ``sendmsg`` and
-        refused; asyncio closes the transport, arq retries five times and
-        gives up.
+        redis-py's asyncio client writes every command with ``writelines()``,
+        which is ``sendmsg()`` there.  tethered once refused that as a
+        destination it could not read: a worker that held the policy from
+        the start never got its Redis connection, and one that activated in
+        ``on_startup`` lost the connection it had.  Both exited with status 1.
         """
-        log = self.log_of_a_worker_that_ends("import")
-        assert REFUSED_SENDMSG in log
-        assert "Fatal write error on socket transport" in log
-        assert f"{EGRESS_BLOCKED}: Blocked by tethered: <unreadable None> is not in the" in log
-        assert "redis connection error" in log
-        assert "5 retries remaining" in log
-        assert "Starting worker for" not in log
-        assert arrivals() == {}
-
-    def test_a_worker_that_activates_in_on_startup_loses_its_redis_connection(self) -> None:
-        """Limit: on Python 3.12+ activating a policy breaks the asyncio connections that exist.
-
-        The worker is connected and has started; ``on_startup`` activates the
-        policy; the next command on the open connection is refused and the
-        worker ends.
-        """
-        log = self.log_of_a_worker_that_ends("on_startup")
-        connected = log.index("redis_version=")
-        activated = re.search(r"probe: pid \d+ activated tethered \(locked\)", log)
-        assert activated is not None, log
-        assert connected < activated.start() < log.index(REFUSED_SENDMSG)
-        assert "Fatal write error on socket transport" in log
-        assert arrivals() == {}
+        stack = start_stack("locked", where)
+        for _ in range(3):
+            report = stack.probe("open_connection", ALLOWED_NAME, ALLOWED_PORT)
+            assert report["outcome"] == "reached", report
+        log = stack.worker.log
+        assert "blocked sendmsg" not in log, log
+        assert "Fatal write error" not in log, log
+        assert "redis connection error" not in log, log
+        assert arrivals() == {AT_ALLOWED: 3}
