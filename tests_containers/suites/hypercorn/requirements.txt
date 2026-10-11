@@ -1,0 +1,17 @@
+# hypercorn with both of its extras: hypercorn[trio] and hypercorn[uvloop].
+hypercorn==0.18.0
+h11==0.16.0
+h2==4.4.1
+hpack==4.2.0
+hyperframe==6.1.0
+priority==2.0.0
+wsproto==1.3.2
+# hypercorn[uvloop]
+uvloop==0.23.0
+# hypercorn[trio]
+trio==0.34.0
+attrs==26.1.0
+idna==3.20
+outcome==1.3.0.post0
+sniffio==1.3.1
+sortedcontainers==2.4.0
