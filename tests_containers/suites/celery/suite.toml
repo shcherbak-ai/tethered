@@ -1,4 +1,4 @@
-description = "Celery: prefork, threads and solo pools, recycled and replaced pool processes, beat, with a Redis broker"
+description = "Celery: prefork, threads, solo, gevent and eventlet pools, later pool processes, beat, with a Redis broker"
 
 # tests_containers/images/<image>.Dockerfile
 image = "base"
@@ -7,7 +7,7 @@ image = "base"
 apt = ["redis-server"]
 compiler = false
 # The packages whose versions the runner prints in its summary.
-key_packages = ["celery", "kombu", "billiard", "redis"]
+key_packages = ["celery", "kombu", "billiard", "redis", "gevent", "eventlet"]
 
 # Python versions the suite does not run on, each with the reason:
 #   "3.15" = "no wheel yet for ..."
