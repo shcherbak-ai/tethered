@@ -1576,6 +1576,14 @@ def _handle_connect(
         return
 
     address = args[1]
+    if address is None and event == "socket.sendmsg":
+        # sendmsg() with no address: a write on a connected socket.  It names
+        # no destination; the data goes where connect() was allowed to go,
+        # as it does for send(), which raises no event at all.  From Python
+        # 3.12 asyncio's selector transports write this way (every
+        # writelines(), and whatever part of a write() one send() did not
+        # take), so refusing it cut every large response short.
+        return
     parsed = _extract_host_port(address)
     if parsed is None:
         # Not an address tethered can read.  For AF_UNIX and other non-IP

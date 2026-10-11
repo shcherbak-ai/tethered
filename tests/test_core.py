@@ -1193,6 +1193,54 @@ class TestAddressShapes:
         ):
             _audit_hook("socket.connect", (sock, (b"\xff\xfe", 80)))
 
+    def test_sendmsg_without_an_address_is_a_write_on_a_connected_socket(self):
+        """It names no destination: the one ``connect()`` was asked about stands."""
+        tethered.activate(allow=[], allow_localhost=False)
+        _audit_hook("socket.sendmsg", (None, None))
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            _audit_hook("socket.sendmsg", (sock, None))
+            # Only sendmsg has that form.  connect() and sendto() always name
+            # an address, and one that cannot be read is refused.
+            for event in ("socket.connect", "socket.sendto"):
+                with pytest.raises(tethered.EgressBlocked):
+                    _audit_hook(event, (sock, None))
+
+    def test_sendmsg_without_an_address_passes_a_scope_too(self):
+        with tethered.scope(allow=[], allow_localhost=False):
+            _audit_hook("socket.sendmsg", (None, None))
+
+    @pytest.mark.skipif(not hasattr(socket.socket, "sendmsg"), reason="no socket.sendmsg here")
+    def test_a_connected_socket_can_sendmsg_under_a_policy(self, tcp_listener):
+        """The regression: ``sendmsg([data])`` was refused, as ``<unreadable None>``."""
+        tethered.activate(allow=["*.example.com"])
+        with socket.create_connection(("127.0.0.1", tcp_listener), timeout=10) as client:
+            assert client.sendmsg([b"one", b"two"]) == 6
+
+    async def test_asyncio_writes_arrive_whole_under_a_policy(self):
+        """asyncio writes with ``sendmsg`` from Python 3.12: ``writelines`` and long writes."""
+        received = bytearray()
+        done = asyncio.Event()
+
+        async def serve(reader, writer):
+            received.extend(await reader.read())
+            writer.close()
+            done.set()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        tethered.activate(allow=["*.example.com"])
+        chunk = b"x" * 65536
+        async with server:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.writelines([b"head", b"er:"])
+            writer.write(chunk * 128)  # 8 MB: far more than one send() takes
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.wait_for(done.wait(), 30)
+        assert len(received) == 7 + len(chunk) * 128
+        assert received.startswith(b"header:")
+
     def test_unreadable_address_on_a_non_ip_socket_is_not_checked(self):
         """Other address families keep their own address shapes and are skipped."""
         tethered.activate(allow=[], allow_localhost=False)

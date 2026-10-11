@@ -27,6 +27,7 @@ from harness import (
     OTHER_PORT,
     Server,
     arrivals,
+    http_get,
     probe_path,
     start_server,
 )
@@ -66,6 +67,28 @@ def assert_enforcing(report: dict[str, Any], *, locked: bool) -> None:
     assert report["active"] is True, report
     assert report["locked"] is locked, report
     assert report["loop"] == STANDARD_LOOP, report
+
+
+# ── What the server itself sends ──────────────────────────────────────
+
+
+@pytest.mark.parametrize("activate", ["plain", "locked", "none"])
+def test_a_response_longer_than_one_send_arrives_whole(activate: str) -> None:
+    """The policy is about where connections go, not about what is written on them.
+
+    From Python 3.12 asyncio writes what one ``send()`` did not take with
+    ``sendmsg()`` on the connected socket.  tethered refused that as a
+    destination it could not read: a 20 MB response stopped after about 3 MB
+    and the server logged "Fatal write error on socket transport".
+    """
+    command = [word.replace("probe_asgi:app", "big_response_app:app") for word in UVICORN]
+    server = start_server(command, env={"TETH_ACTIVATE": activate})
+    size = 20 * 1024 * 1024
+    response = http_get(f"{server.url}/big?size={size}", timeout=120)
+    assert response.status == 200
+    assert len(response.body) == size
+    assert "tethered: blocked" not in server.log, server.log
+    assert "Fatal write error" not in server.log, server.log
 
 
 # ── One process ───────────────────────────────────────────────────────
