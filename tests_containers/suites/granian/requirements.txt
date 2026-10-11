@@ -1,0 +1,6 @@
+# granian with the two event loops it can use besides asyncio's own:
+# granian[uvloop] and granian[rloop].
+granian==2.8.4
+click==8.5.0
+uvloop==0.23.0
+rloop==0.5.0
