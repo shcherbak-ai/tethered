@@ -4267,6 +4267,73 @@ class TestUnnamedAddressHint:
             _audit_hook(*self._CONNECT)
 
 
+class TestForkServerWarning:
+    """A fork server that is older than the policy forks workers that do not hold it.
+
+    A ``forkserver`` worker is a copy of the fork server process.  If that
+    was started before ``activate()``, neither the fork copy of this
+    process's state nor the bootstrap of a new interpreter reaches its
+    workers, and asking it for one raises no launch event.  tethered cannot
+    close that; ``activate()`` says so, once.  The stand-in has the shape of
+    ``multiprocessing.forkserver``; the real thing is exercised in the
+    container suite ``stdlib_pools``.
+    """
+
+    @pytest.fixture
+    def fork_server(self, monkeypatch):
+        state = types.SimpleNamespace(_forkserver_pid=4321)
+        module = types.ModuleType("multiprocessing.forkserver")
+        module._forkserver = state
+        monkeypatch.setitem(sys.modules, "multiprocessing.forkserver", module)
+        monkeypatch.setattr(_core, "_fork_server_warning_pending", True)
+        return state
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if "fork server" in r.getMessage()]
+
+    @pytest.mark.parametrize("kwargs", [{}, {"locked": True}, {"log_only": True}])
+    def test_activate_warns_once_when_it_is_running(self, fork_server, kwargs, caplog):
+        if "locked" in kwargs:
+            kwargs = {**kwargs, "lock_token": object()}
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"], **kwargs)
+            tethered.activate(allow=["*.example.com"], **kwargs)
+        (message,) = self._warnings(caplog)
+        assert "was started before this policy" in message
+        assert "NOT restricted, under a locked policy either" in message
+        assert "Call activate() before the first pool or process is started" in message
+        assert _core._fork_server_warning_pending is False
+
+    def test_nothing_is_said_while_it_is_not_running(self, fork_server, caplog):
+        fork_server._forkserver_pid = None
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        assert self._warnings(caplog) == []
+        assert (
+            _core._fork_server_warning_pending is True
+        )  # it may start later, under a later policy
+
+    def test_nothing_is_said_when_multiprocessing_was_never_used(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_fork_server_warning_pending", True)
+        monkeypatch.delitem(sys.modules, "multiprocessing.forkserver", raising=False)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        assert self._warnings(caplog) == []
+
+    def test_a_module_of_another_shape_counts_as_no_fork_server(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_fork_server_warning_pending", True)
+        monkeypatch.setitem(sys.modules, "multiprocessing.forkserver", types.ModuleType("x"))
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        assert self._warnings(caplog) == []
+
+    def test_not_checked_once_the_flag_is_clear(self, fork_server, monkeypatch):
+        monkeypatch.setattr(_core, "_fork_server_warning_pending", False)
+        monkeypatch.setattr(_core, "_warn_if_fork_server_runs", _raise_runtime)
+        tethered.activate(allow=["*.example.com"])
+
+
 class TestScopeExitOutOfOrder:
     """A scope's exit removes its own entry, whatever was entered or exited since.
 

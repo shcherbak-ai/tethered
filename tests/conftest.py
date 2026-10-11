@@ -153,6 +153,7 @@ def _cleanup():
     count are reset, the propagation env var is removed, and the native-env
     dirty flag is cleared.
     """
+    _quiet_once_per_process_messages()
     yield
     # Deactivate the C guardian first (using the token the test supplied)
     _unlock_guardian()
@@ -164,10 +165,19 @@ def _cleanup():
     _core._active_scope_count = 0
     os.environ.pop(_CHILD_POLICY_ENV, None)
     _core._env_dirty = False
-    # The once-per-process hint for a refused address is off unless a test
-    # asks for it: it would otherwise appear in whichever test refuses an
-    # address first.
+    _quiet_once_per_process_messages()
+
+
+def _quiet_once_per_process_messages() -> None:
+    """Switch off what tethered says once per process, unless a test asks for it.
+
+    The hint for a refused address would appear in whichever test refuses an
+    address first, and the warning about a fork server in whichever test
+    activates a policy first after some other test started a process pool
+    (the fork server is the default start method on Linux from Python 3.14).
+    """
     _core._unnamed_address_hint_pending = False
+    _core._fork_server_warning_pending = False
 
 
 @pytest.fixture(scope="session", autouse=True)

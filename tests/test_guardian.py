@@ -664,6 +664,7 @@ _UNPINNED_GLOBALS = {
         "_proactor_warning_pending": "cleared once the Proactor-loop warning has been logged",
         "_uvloop_warning_pending": "cleared once the uvloop warning has been logged",
         "_unnamed_address_hint_pending": "cleared once the hint for a refused address is out",
+        "_fork_server_warning_pending": "cleared once the fork-server warning has been logged",
         "_pth_path_cache": "bootstrap path cached for scope-only use (None until computed)",
         "_env_dirty": "set when the policy variable changed behind os.environ's back",
         **_MODULE_METADATA,

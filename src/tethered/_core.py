@@ -582,6 +582,10 @@ _IMPORT_REFUSALS = {
 # been logged — see _hint_at_unnamed_address.
 _unnamed_address_hint_pending: bool = True
 
+# True until activate() has warned about a multiprocessing fork server that
+# was started before the policy — see _warn_if_fork_server_runs.
+_fork_server_warning_pending: bool = True
+
 _UVLOOP_LOADED_MSG = (
     "tethered: activate() refused — uvloop is loaded in this process. A uvloop event loop "
     "does its networking outside Python's socket module and raises no audit event, so the "
@@ -1033,6 +1037,44 @@ def _refuse_import(name: str) -> None:
         _import_refusals_logged.add(library)
         logger.log(level, line)
     raise ImportError(message, name=library)
+
+
+def _warn_if_fork_server_runs() -> None:
+    """Warn, once, that multiprocessing's fork server is older than the policy.
+
+    Called when a policy has been activated.  A worker of the ``forkserver``
+    start method (the default on Linux from Python 3.14) is a copy of the
+    fork server process, not of the process that asks for it and not a new
+    interpreter.  A fork server that was started before ``activate()`` holds
+    no policy, or the one before this one, and so does every worker it
+    forks from then on: neither the copy of this process's state that a
+    ``fork`` child gets, nor the bootstrap that a spawned child runs,
+    reaches them.  Asking the fork server for a worker goes over a socket
+    and raises no launch event, so nothing can be refused or completed
+    here.  A fork server that starts under the policy is an ordinary Python
+    child and passes the policy on.
+
+    multiprocessing is looked up in ``sys.modules``, never imported, and
+    the one attribute read is private: anything unexpected there counts as
+    "no fork server".
+    """
+    global _fork_server_warning_pending
+    module = sys.modules.get("multiprocessing.forkserver")
+    try:
+        running = module is not None and module._forkserver._forkserver_pid is not None
+    except Exception:
+        return
+    if not running:
+        return
+    # Cleared before logging: a log handler may itself start a process.
+    _fork_server_warning_pending = False
+    logger.warning(
+        "tethered: multiprocessing's fork server was started before this policy. Every "
+        "worker it forks is a copy of the fork server, which does not hold the policy: "
+        "the workers of process pools that use the forkserver start method (the default "
+        "on Linux from Python 3.14) are NOT restricted, under a locked policy either. "
+        "Call activate() before the first pool or process is started."
+    )
 
 
 def _hint_at_unnamed_address(cfg: _Config, address: str) -> None:
@@ -3666,6 +3708,8 @@ def activate(
                 else ""
             ),
         )
+    if _fork_server_warning_pending:
+        _warn_if_fork_server_runs()
     logger.info("tethered: activated with %d rules (log_only=%s)", len(allow), log_only)
 
 

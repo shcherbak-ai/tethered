@@ -388,10 +388,14 @@ class TestPoolsOlderThanThePolicy:
         environment variable.  When the fork server was started before
         ``activate()`` (here by a pool that was used first), every later
         worker is unrestricted too, although it starts under a locked policy.
-        forkserver is the default start method from Python 3.14.
+        forkserver is the default start method from Python 3.14.  tethered
+        cannot stop it (asking the fork server for a worker raises no launch
+        event); ``activate()`` says so, once.
         """
         server = owner(kind, "forkserver", where="after_warmup", recycle=3)
         assert_policy(server.get("/owner").json(), "locked")
+        said = "tethered: multiprocessing's fork server was started before this policy."
+        assert server.log.count(said) == 1, server.log
         first = [int(pid) for pid in server.wait_log(r"workers \[(.*)\]").group(1).split(", ")]
 
         path = probe_path("connect", FORBIDDEN_NAME, OTHER_PORT)
