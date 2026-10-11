@@ -1,0 +1,15 @@
+description = "arq: an asyncio worker, coroutine jobs, cron jobs, with Redis"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# redis-server is the queue and the result store, on 127.0.0.1.
+apt = ["redis-server"]
+# arq needs hiredis, which has no wheel for Python 3.15 yet and is built there.
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["arq", "redis"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]

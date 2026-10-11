@@ -1,0 +1,7 @@
+# arq and what it needs.  hiredis has no wheel for Python 3.15 yet and is
+# built from source there (compiler = true in suite.toml).
+arq==0.28.0
+click==8.5.0
+hiredis==3.4.2
+PyJWT==2.15.1
+redis==5.3.1
