@@ -1,0 +1,17 @@
+description = "Apache with mod_wsgi: daemon and embedded mode, mod_wsgi-express, application groups as interpreters of one process"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# pip builds mod_wsgi against the image's Python: that takes Apache's apxs
+# (apache2-dev) and a compiler.  Apache itself is the apache2 of the base
+# image's Debian release and is not pinned; test_the_versions_under_test
+# checks that it is a 2.4 and that it loaded the mod_wsgi that pip built.
+apt = ["apache2", "apache2-dev"]
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["mod_wsgi", "uvloop"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]

@@ -1,0 +1,7 @@
+# mod_wsgi has no wheels: pip builds it from source against the image's Python
+# and Apache (suite.toml: apache2, apache2-dev, compiler).  It depends on
+# nothing at run time.
+mod_wsgi==6.1.0
+# Not a server here: the suite checks what an application under mod_wsgi can
+# and cannot do with uvloop next to a policy (test_uvloop.py).
+uvloop==0.23.0
