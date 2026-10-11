@@ -1447,6 +1447,179 @@ class TestStartFileGuard:
         assert start.exists()
 
 
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestPthGuardByAnotherName:
+    """Real operations on the hook file, named in another way than ``site`` names it.
+
+    The guard knows the file by its name and its directory, however the
+    directory is reached.  ``pip`` names files by their resolved path and
+    ``shutil.rmtree`` (POSIX) by a directory descriptor, and a guard that
+    compared the text of paths let both remove the hook under a lock.
+    ``tests/test_subprocess.py`` goes through the cases one by one; here the
+    policy is locked and the calls are the real ones.
+    """
+
+    @staticmethod
+    def _operations(pth, start, source):
+        return {
+            "open-w": lambda: open(pth, "w"),
+            "open-a": lambda: open(pth, "a"),
+            "os.open": lambda: os.open(pth, os.O_WRONLY),
+            "write_text": lambda: pth.write_text(""),
+            "remove": lambda: os.remove(pth),
+            "unlink": lambda: pth.unlink(),
+            "rename-away": lambda: os.rename(pth, pth.with_name("gone.pth")),
+            "replace-onto": lambda: os.replace(source, pth),
+            "chmod": lambda: os.chmod(pth, 0o600),
+            "truncate": lambda: os.truncate(pth, 0),
+            "copy": lambda: shutil.copy(source, pth),
+            "copy2": lambda: shutil.copy2(source, pth),
+            "move-away": lambda: shutil.move(pth, pth.with_name("gone.pth")),
+            "bytes-path": lambda: os.remove(os.fsencode(pth)),
+            "create-start": lambda: open(start, "x"),
+            "link-start": lambda: os.link(source, start),
+            "copy2-start": lambda: shutil.copy2(source, start),
+        }
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "open-w",
+            "open-a",
+            "os.open",
+            "write_text",
+            "remove",
+            "unlink",
+            "rename-away",
+            "replace-onto",
+            "chmod",
+            "truncate",
+            "copy",
+            "copy2",
+            "move-away",
+            "bytes-path",
+            "create-start",
+            "link-start",
+            "copy2-start",
+        ],
+    )
+    def test_through_another_name_of_the_directory(
+        self, operation, scratch_pth, tmp_path, alias_of, capfd
+    ):
+        alias = alias_of(scratch_pth.parent, tmp_path / "alias")
+        source = tmp_path / "empty.txt"
+        source.write_text("")
+        _activate_locked()
+        run = self._operations(alias / "tethered.pth", alias / "tethered.start", source)[operation]
+        with pytest.raises(tethered.SubprocessBlocked, match="refused"):
+            run()
+        assert scratch_pth.read_text() == PTH_LINE
+        assert not os.path.lexists(scratch_pth.with_name("tethered.start"))
+        assert source.read_text() == ""
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_reading_through_another_name(self, scratch_pth, tmp_path, alias_of):
+        alias = alias_of(scratch_pth.parent, tmp_path / "alias")
+        _activate_locked()
+        assert (alias / "tethered.pth").read_text() == PTH_LINE
+
+    def test_removing_the_directory_tree_is_refused(self, scratch_pth):
+        """On POSIX ``shutil.rmtree`` removes each file relative to a directory descriptor."""
+        (scratch_pth.parent / "tethered" / "__init__.py").write_text("")
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused deletion"):
+            shutil.rmtree(scratch_pth.parent)
+        assert scratch_pth.read_text() == PTH_LINE
+
+    @staticmethod
+    def _descriptor_operations(fd):
+        return {
+            "remove": lambda: os.remove("tethered.pth", dir_fd=fd),
+            "rename-away": lambda: os.rename(
+                "tethered.pth", "gone.pth", src_dir_fd=fd, dst_dir_fd=fd
+            ),
+            "replace-onto": lambda: os.replace(
+                "empty.txt", "tethered.pth", src_dir_fd=fd, dst_dir_fd=fd
+            ),
+            "chmod": lambda: os.chmod("tethered.pth", 0, dir_fd=fd),
+            "symlink-start": lambda: os.symlink("empty.txt", "tethered.start", dir_fd=fd),
+            "link-start": lambda: os.link(
+                "empty.txt", "tethered.start", src_dir_fd=fd, dst_dir_fd=fd
+            ),
+        }
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no directory descriptors")
+    @pytest.mark.parametrize(
+        "operation",
+        ["remove", "rename-away", "replace-onto", "chmod", "symlink-start", "link-start"],
+    )
+    def test_relative_to_a_descriptor_of_the_directory(self, operation, scratch_pth, capfd):
+        scratch_pth.with_name("empty.txt").write_text("")
+        fd = os.open(scratch_pth.parent, os.O_RDONLY)
+        try:
+            _activate_locked()
+            with pytest.raises(tethered.SubprocessBlocked, match="refused"):
+                self._descriptor_operations(fd)[operation]()
+        finally:
+            os.close(fd)
+        assert scratch_pth.read_text() == PTH_LINE
+        assert os.stat(scratch_pth).st_mode & 0o400
+        assert not os.path.lexists(scratch_pth.with_name("tethered.start"))
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path forms")
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            lambda pth: "\\\\?\\" + str(pth),
+            lambda pth: str(pth) + "::$DATA",
+            lambda pth: str(pth) + ".",
+            lambda pth: str(pth).upper(),
+        ],
+        ids=["extended-length prefix", "unnamed data stream", "trailing dot", "upper case"],
+    )
+    def test_windows_spellings_of_the_file(self, spelling, scratch_pth):
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            open(spelling(scratch_pth), "a")  # noqa: SIM115
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            os.open(spelling(scratch_pth), os.O_WRONLY | os.O_TRUNC)
+        assert scratch_pth.read_text() == PTH_LINE
+
+    def test_the_same_names_elsewhere_stay_usable(
+        self, scratch_pth, tmp_path, alias_of, monkeypatch
+    ):
+        """Also from inside the hook's directory, and relative to another directory's descriptor."""
+        elsewhere = tmp_path / "another-environment"
+        elsewhere.mkdir()
+        alias = alias_of(elsewhere, tmp_path / "alias")
+        monkeypatch.chdir(scratch_pth.parent)
+        _activate_locked()
+        for directory in (elsewhere, alias):
+            hook = directory / "tethered.pth"
+            hook.write_text(PTH_LINE)
+            os.chmod(hook, 0o644)
+            os.truncate(hook, 0)
+            os.replace(hook, directory / "tethered.start")
+            os.replace(directory / "tethered.start", hook)
+            os.remove(hook)
+        if sys.platform != "win32":
+            (elsewhere / "tethered.pth").write_text(PTH_LINE)
+            fd = os.open(elsewhere, os.O_RDONLY)
+            try:
+                os.chmod("tethered.pth", 0o600, dir_fd=fd)
+                os.symlink("tethered.pth", "tethered.start", dir_fd=fd)
+                os.remove("tethered.start", dir_fd=fd)
+                os.remove("tethered.pth", dir_fd=fd)
+            finally:
+                os.close(fd)
+        (elsewhere / "tethered.pth").write_text(PTH_LINE)
+        (elsewhere / "tethered.start").write_text("")
+        shutil.rmtree(elsewhere)
+        assert not elsewhere.exists()
+        assert scratch_pth.read_text() == PTH_LINE
+
+
 # ── Integrity verification on non-socket events (R30) ──────────────
 
 

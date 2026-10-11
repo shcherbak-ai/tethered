@@ -492,6 +492,8 @@ Whatever re-executes the server keeps a locked policy. The new process image inh
 
 The same policy asked for again is a no-op, so a reload that changes nothing about the policy is unaffected. uWSGI with `--lazy-apps`, gunicorn without `--preload` and unlocked policies are not affected either. To change a locked policy, stop the server and start it.
 
+Upgrade tethered itself the same way: from the deployment, with the server stopped. A `pip install --upgrade tethered` that a locked application starts for itself is refused when it reaches `tethered.pth`, and pip leaves the installation half changed; [COMPATIBILITY.md](COMPATIBILITY.md#installing-upgrading-and-removing-tethered) has what that looks like and how to repair it.
+
 ### Celery and other task queues
 
 What matters is where `activate()` is called: it has to run in every process that runs task code, before the first task.

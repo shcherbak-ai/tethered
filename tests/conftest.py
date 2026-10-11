@@ -13,6 +13,7 @@ that exercise subprocess auto-propagation need it there to work end-to-end.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import ipaddress
 import os
@@ -204,3 +205,29 @@ def _ensure_pth_installed():
             pth_dst.unlink()
         except OSError:  # pragma: no cover — best-effort cleanup
             pass
+
+
+@pytest.fixture
+def alias_of():
+    """Give a directory another name: ``alias_of(directory, alias)`` returns ``alias``.
+
+    A symlink, and on Windows a junction, which needs no privilege.  The
+    aliases are taken away again after the test, before pytest clears the
+    temporary directory they are in.
+    """
+    made: list[Path] = []
+
+    def make(directory: Path, alias: Path) -> Path:
+        if sys.platform == "win32":
+            import _winapi
+
+            _winapi.CreateJunction(str(directory), str(alias))
+        else:
+            alias.symlink_to(directory, target_is_directory=True)
+        made.append(alias)
+        return alias
+
+    yield make
+    for alias in made:
+        with contextlib.suppress(OSError):
+            (os.rmdir if sys.platform == "win32" else os.unlink)(alias)

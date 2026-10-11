@@ -1315,12 +1315,16 @@ unicode_readable(PyObject *str)
  * Could this path argument refer to tethered.pth, or to the tethered.start
  * beside it?
  *
- * The Python guard compares normcase(normpath(abspath(path))) with the
- * cached location of each.  normpath only drops components
- * ("x/tethered.pth/.", "x/y/../tethered.pth"), and case folding never
- * produces these ASCII letters from other characters, so every path the
- * guard can match contains one of the file names as a substring — which is
- * what is tested here, not merely the final component.
+ * The Python guard (_core._path_matches_pth) knows each file by its name
+ * and its directory: it matches the cached location as text, and a path
+ * whose last component is the file name in that same directory, however the
+ * directory is named or reached (a symlink, a junction, a directory
+ * descriptor).  Normalising a path only drops components
+ * ("x/tethered.pth/.", "x/y/../tethered.pth") and, on Windows, trailing dots
+ * and spaces and the name of a stream ("tethered.pth::$DATA"), and case
+ * folding never produces these ASCII letters from other characters, so
+ * every path the guard can match contains one of the file names as a
+ * substring — which is what is tested here, not merely the final component.
  *
  * A file descriptor (int) cannot be matched and is skipped.  Any other
  * object — os.remove(pathlib.Path(...)) passes the Path itself — cannot be

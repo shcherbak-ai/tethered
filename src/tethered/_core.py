@@ -3132,6 +3132,13 @@ def _handle_subprocess(
     raise SubprocessBlocked(event, desc)
 
 
+# Windows reads a path its own way before it looks for the file: ".." is
+# resolved in the text, trailing dots and spaces are dropped, and a ":" in
+# the last component starts the name of a stream of the file
+# ("tethered.pth::$DATA" is the content of tethered.pth).
+_WINDOWS_PATH_RULES = os.name == "nt"
+
+
 def _is_open_for_write(args: tuple[Any, ...]) -> bool:
     """Inspect an ``open`` audit event's args and return True for write/append/truncate modes.
 
@@ -3152,36 +3159,101 @@ def _is_open_for_write(args: tuple[Any, ...]) -> bool:
     return False
 
 
-def _created_path(event: str, args: tuple[Any, ...]) -> Any:
-    """Return the path at which ``event`` brings a file into being, or ``None``.
+def _created_path(event: str, args: tuple[Any, ...]) -> tuple[Any, Any]:
+    """Return ``(path, dir_fd)`` for the file ``event`` brings into being, or ``(None, -1)``.
 
     That is the target of a write-capable ``open`` and the destination of a
     rename, a hard link, a symlink or a ``_winapi.CopyFile2`` — the ways of
     creating a file from Python that raise an audit event.  ``os.mknod`` and
-    ``os.mkfifo`` raise none.
+    ``os.mkfifo`` raise none.  ``dir_fd`` is the directory descriptor the
+    event carries for a relative destination, negative when there is none.
     """
     if event == "open":
-        return args[0] if args and _is_open_for_write(args) else None
-    if event in ("os.rename", "os.link", "os.symlink", "_winapi.CopyFile2"):
-        return args[1] if len(args) >= 2 else None
-    return None
+        return (args[0], -1) if args and _is_open_for_write(args) else (None, -1)
+    if len(args) < 2:
+        return None, -1
+    if event in ("os.rename", "os.link"):  # (src, dst, src_dir_fd, dst_dir_fd)
+        return args[1], args[3] if len(args) >= 4 else -1
+    if event == "os.symlink":  # (src, dst, dir_fd)
+        return args[1], args[2] if len(args) >= 3 else -1
+    if event == "_winapi.CopyFile2":
+        return args[1], -1
+    return None, -1
 
 
-def _path_matches_pth(target: Any, cached: str) -> bool:
-    """Return True if ``target`` (str/bytes/PathLike) refers to ``cached``, a guarded path.
+def _mentions_hook(path: Any) -> bool:
+    """Return False for an event argument that cannot name ``tethered.pth`` or ``tethered.start``.
+
+    Both names begin with ``tethered.``, and every way of naming either file
+    spells its name out (see :func:`_path_matches_pth`).  Under a lock this
+    test is what the ``open`` of any other file costs, so it stays this
+    small.  An ``os.PathLike`` cannot be read without running its code and is
+    passed on.
+    """
+    if isinstance(path, str):
+        return "tethered." in path.lower()
+    if isinstance(path, bytes):
+        return b"tethered." in path.lower()
+    return path is not None and not isinstance(path, int) and isinstance(path, os.PathLike)
+
+
+def _path_matches_pth(target: Any, cached: str, dir_fd: Any = -1) -> bool:
+    """Return True if ``target`` (str/bytes/PathLike) names ``cached``, a guarded path.
 
     ``cached`` is the ``tethered.pth`` path stored at ``activate()`` time, or
     the ``tethered.start`` path beside it, in :func:`_normalize_path` form.
+    ``dir_fd`` is the directory descriptor an event carries for a relative
+    ``target``, negative when there is none.
+
+    The same text is a match.  So is the same file name in the same
+    directory, whatever ``target`` calls that directory: a symlink or a
+    junction to it, a Windows short name or extended-length prefix, a path
+    relative to a descriptor.  ``pip`` names files by their resolved path, so
+    a comparison of text alone let it remove the hook from an environment
+    that is reached through any of these.  The directories are compared by
+    identity (``os.stat``), and only for a path whose last component is the
+    guarded name, so a path that has nothing to do with the hook costs no
+    system call.
+
+    Not matched: another name for the file itself (a hard link, a symlink to
+    the file), and a directory on a file system that reports no file index.
     """
     if not cached:
         return False
     if not isinstance(target, (str, bytes, os.PathLike)):
         return False
     try:
-        target_str = os.fsdecode(target)
+        text = os.fsdecode(target)
     except (TypeError, ValueError):
         return False
-    return os.path.normcase(os.path.normpath(os.path.abspath(target_str))) == cached
+    name = cached.rpartition(os.sep)[2].lower()
+    # Every way of naming the entry mentions its name (the C guardian's
+    # pre-filter rests on the same fact), and hardly any other path does.
+    if name not in text.lower():
+        return False
+    relative_to_fd = isinstance(dir_fd, int) and dir_fd >= 0 and not os.path.isabs(text)
+    if not relative_to_fd and _normalize_path(text) == cached:
+        return True
+    if _WINDOWS_PATH_RULES:
+        directory, last = os.path.split(os.path.abspath(text))
+        last = last.partition(":")[0]
+    else:
+        # (Not normalized: "link/../tethered.pth" is in the parent of what
+        # the link points to, which only the file system can say.)
+        directory, last = os.path.split(text)
+    if last.lower() != name:
+        return False
+    try:
+        if not relative_to_fd:
+            found = os.stat(directory or os.curdir)
+        elif directory:
+            found = os.stat(directory, dir_fd=dir_fd)
+        else:
+            found = os.stat(dir_fd)
+        # (Some network file systems report 0 for every file.)
+        return found.st_ino != 0 and os.path.samestat(found, os.stat(os.path.dirname(cached)))
+    except (OSError, ValueError, NotImplementedError):
+        return False
 
 
 def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
@@ -3211,10 +3283,17 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     ``tethered.pth`` in a directory ``site.py`` processes — see
     :func:`_compute_pth_path`), the hook is a no-op.
 
+    Both files are recognised by their name and their directory, however an
+    event names that directory, a directory descriptor included
+    (:func:`_path_matches_pth`); ``shutil.rmtree`` removes files that way on
+    POSIX.
+
     No effect outside locked mode.  Not caught: ``os.ftruncate`` (and
     ``os.truncate`` given a file descriptor) — the event carries the
     descriptor, not a path, though obtaining a writable descriptor through
-    ``open`` / ``os.open`` is refused above; ``os.mknod`` creating
+    ``open`` / ``os.open`` is refused above; ``os.open`` with ``dir_fd``,
+    whose ``open`` event does not carry the descriptor; another name for the
+    file itself (a hard link, a symlink to the file); ``os.mknod`` creating
     ``tethered.start`` (POSIX), which raises no audit event; ``ctypes``
     calling libc ``unlink`` / ``rename`` / ``open`` / ``chmod`` /
     ``truncate`` directly, which raises none either; and external tools
@@ -3223,10 +3302,20 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     """
     if not cfg.locked or not cfg._pth_path:
         return
-    created = _created_path(event, args)
+    # Nearly every event ends here.  An event's paths are its first two
+    # arguments at most (the second one of ``open`` is the mode).
+    if not (
+        _mentions_hook(args[0] if args else None)
+        or _mentions_hook(args[1] if len(args) >= 2 else None)
+    ):
+        return
+    pth = cfg._pth_path
+    # (For ``open`` this is the path of a write-capable open only: reading
+    # either file is not refused.)
+    created, created_fd = _created_path(event, args)
     if created is not None:
-        start_path = os.path.join(os.path.dirname(cfg._pth_path), "tethered.start")
-        if _path_matches_pth(created, start_path):
+        start_path = os.path.join(os.path.dirname(pth), "tethered.start")
+        if _path_matches_pth(created, start_path, created_fd):
             logger.warning("tethered: blocked creation of %s", start_path)
             raise SubprocessBlocked(
                 event,
@@ -3234,41 +3323,42 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
                 "(beside tethered.pth it disables auto-activation on Python 3.15+)",
             )
     if event == "os.remove":
+        # args: (path, dir_fd)
         target = args[0] if args else None
-        if _path_matches_pth(target, cfg._pth_path):
-            logger.warning("tethered: blocked deletion of %s", cfg._pth_path)
-            raise SubprocessBlocked(event, f"refused deletion of {cfg._pth_path} in locked mode")
+        dir_fd = args[1] if len(args) >= 2 else -1
+        if _path_matches_pth(target, pth, dir_fd):
+            logger.warning("tethered: blocked deletion of %s", pth)
+            raise SubprocessBlocked(event, f"refused deletion of {pth} in locked mode")
     elif event == "os.rename":
+        # args: (src, dst, src_dir_fd, dst_dir_fd); ``created`` is dst
         src = args[0] if args else None
-        dst = args[1] if len(args) >= 2 else None
-        if _path_matches_pth(src, cfg._pth_path) or _path_matches_pth(dst, cfg._pth_path):
-            logger.warning("tethered: blocked rename touching %s", cfg._pth_path)
-            raise SubprocessBlocked(
-                event, f"refused rename touching {cfg._pth_path} in locked mode"
-            )
+        src_fd = args[2] if len(args) >= 3 else -1
+        if _path_matches_pth(src, pth, src_fd) or _path_matches_pth(created, pth, created_fd):
+            logger.warning("tethered: blocked rename touching %s", pth)
+            raise SubprocessBlocked(event, f"refused rename touching {pth} in locked mode")
     elif event == "open":
-        target = args[0] if args else None
-        if _path_matches_pth(target, cfg._pth_path) and _is_open_for_write(args):
-            logger.warning("tethered: blocked write-open of %s", cfg._pth_path)
-            raise SubprocessBlocked(event, f"refused write-open of {cfg._pth_path} in locked mode")
+        if _path_matches_pth(created, pth):
+            logger.warning("tethered: blocked write-open of %s", pth)
+            raise SubprocessBlocked(event, f"refused write-open of {pth} in locked mode")
     elif event == "os.chmod":
+        # args: (path, mode, dir_fd)
         target = args[0] if args else None
-        if _path_matches_pth(target, cfg._pth_path):
-            logger.warning("tethered: blocked chmod of %s", cfg._pth_path)
-            raise SubprocessBlocked(event, f"refused chmod of {cfg._pth_path} in locked mode")
+        dir_fd = args[2] if len(args) >= 3 else -1
+        if _path_matches_pth(target, pth, dir_fd):
+            logger.warning("tethered: blocked chmod of %s", pth)
+            raise SubprocessBlocked(event, f"refused chmod of {pth} in locked mode")
     elif event == "os.truncate":
         # args: (path_or_fd, length).  An int is a file descriptor, which
         # _path_matches_pth() does not match.
         target = args[0] if args else None
-        if _path_matches_pth(target, cfg._pth_path):
-            logger.warning("tethered: blocked truncation of %s", cfg._pth_path)
-            raise SubprocessBlocked(event, f"refused truncation of {cfg._pth_path} in locked mode")
+        if _path_matches_pth(target, pth):
+            logger.warning("tethered: blocked truncation of %s", pth)
+            raise SubprocessBlocked(event, f"refused truncation of {pth} in locked mode")
     elif event == "_winapi.CopyFile2":
-        # args: (existing_file_name, new_file_name, flags)
-        dst = args[1] if len(args) >= 2 else None
-        if _path_matches_pth(dst, cfg._pth_path):
-            logger.warning("tethered: blocked overwrite of %s", cfg._pth_path)
-            raise SubprocessBlocked(event, f"refused overwrite of {cfg._pth_path} in locked mode")
+        # args: (existing_file_name, new_file_name, flags); ``created`` is the new file
+        if _path_matches_pth(created, pth):
+            logger.warning("tethered: blocked overwrite of %s", pth)
+            raise SubprocessBlocked(event, f"refused overwrite of {pth} in locked mode")
 
 
 def _install_hook() -> None:

@@ -1611,6 +1611,295 @@ class TestPathMatchesPthEdgeCases:
         assert _path_matches_pth(BadPath(), "/site-packages/tethered.pth") is False
 
 
+class TestPthGuardByAnotherName:
+    """The guarded files are recognised by name and directory, however the directory is named.
+
+    The guard used to compare the text of paths.  ``pip`` names the files it
+    removes by their resolved path, so in an environment reached through a
+    symlink, a junction or a Windows short name ``pip uninstall tethered``
+    took the hook away under a lock; so did ``shutil.rmtree`` on POSIX, which
+    removes files relative to a directory descriptor.
+    """
+
+    @pytest.fixture
+    def hook(self, tmp_path, alias_of):
+        """A site directory with a hook file: ``(directory, alias of it, locked config)``."""
+        directory = tmp_path / "site-packages"
+        directory.mkdir()
+        (directory / "tethered.pth").write_text("import tethered._autoactivate\n")
+        alias = alias_of(directory, tmp_path / "alias")
+        cfg = _Config(
+            policy=AllowPolicy([], allow_localhost=True),
+            locked=True,
+            _serialized_payload="{}",
+            _pth_path=_core._normalize_path(str(directory / "tethered.pth")),
+        )
+        return directory, alias, cfg
+
+    @pytest.fixture
+    def windows_rules(self, monkeypatch):
+        monkeypatch.setattr(_core, "_WINDOWS_PATH_RULES", True)
+
+    @pytest.fixture
+    def posix_rules(self, monkeypatch):
+        monkeypatch.setattr(_core, "_WINDOWS_PATH_RULES", False)
+
+    def test_platform_default(self):
+        assert _core._WINDOWS_PATH_RULES is (os.name == "nt")
+
+    # ── another name for the directory ─────────────────────────────────
+
+    @pytest.mark.parametrize(
+        ("event", "arguments", "refusal"),
+        [
+            ("open", lambda a, t: (str(a / "tethered.pth"), "w", 0), "refused write-open"),
+            ("open", lambda a, t: (os.fsencode(a / "tethered.pth"), "a", 0), "refused write-open"),
+            ("open", lambda a, t: (a / "tethered.pth", "", os.O_RDWR), "refused write-open"),
+            ("os.remove", lambda a, t: (str(a / "tethered.pth"), -1), "refused deletion"),
+            ("os.rename", lambda a, t: (str(a / "tethered.pth"), str(t), -1, -1), "refused rename"),
+            ("os.rename", lambda a, t: (str(t), str(a / "tethered.pth"), -1, -1), "refused rename"),
+            ("os.chmod", lambda a, t: (str(a / "tethered.pth"), 0, -1), "refused chmod"),
+            ("os.truncate", lambda a, t: (str(a / "tethered.pth"), 0), "refused truncation"),
+            (
+                "_winapi.CopyFile2",
+                lambda a, t: (str(t), str(a / "tethered.pth"), 0),
+                "refused overwrite",
+            ),
+            ("open", lambda a, t: (str(a / "tethered.start"), "x", 0), "refused creation"),
+            (
+                "os.rename",
+                lambda a, t: (str(t), str(a / "tethered.start"), -1, -1),
+                "refused creation",
+            ),
+            (
+                "os.link",
+                lambda a, t: (str(t), str(a / "tethered.start"), -1, -1),
+                "refused creation",
+            ),
+            (
+                "os.symlink",
+                lambda a, t: (str(t), str(a / "tethered.start"), -1),
+                "refused creation",
+            ),
+            (
+                "_winapi.CopyFile2",
+                lambda a, t: (str(t), str(a / "tethered.start"), 0),
+                "refused creation",
+            ),
+        ],
+        ids=lambda value: value if isinstance(value, str) else None,
+    )
+    def test_the_directory_by_another_name(self, hook, tmp_path, event, arguments, refusal):
+        _, alias, cfg = hook
+        with pytest.raises(tethered.SubprocessBlocked, match=refusal):
+            _handle_pth_fs_op(cfg, event, arguments(alias, tmp_path / "other.txt"))
+
+    def test_reading_by_another_name_is_allowed(self, hook):
+        _, alias, cfg = hook
+        _handle_pth_fs_op(cfg, "open", (str(alias / "tethered.pth"), "rb", 0))  # no raise
+        _handle_pth_fs_op(cfg, "open", (str(alias / "tethered.start"), "r", os.O_RDONLY))
+
+    @pytest.mark.parametrize(
+        "name",
+        ["tethered.pth.bak", "my-tethered.pth", "tethered.pthx", "tethered.start.txt", "other.pth"],
+    )
+    def test_other_names_in_the_directory_are_not_matched(self, hook, name):
+        directory, alias, cfg = hook
+        for where in (directory, alias):
+            _handle_pth_fs_op(cfg, "open", (str(where / name), "w", 0))  # no raise
+            _handle_pth_fs_op(cfg, "os.remove", (str(where / name), -1))  # no raise
+
+    def test_the_same_names_in_another_directory_are_not_matched(self, hook, tmp_path, alias_of):
+        _, _, cfg = hook
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        other_alias = alias_of(elsewhere, tmp_path / "other-alias")
+        for where in (elsewhere, other_alias, tmp_path / "missing"):
+            for name in ("tethered.pth", "tethered.start"):
+                _handle_pth_fs_op(cfg, "open", (str(where / name), "w", 0))  # no raise
+                _handle_pth_fs_op(cfg, "os.remove", (str(where / name), -1))  # no raise
+                _handle_pth_fs_op(cfg, "os.rename", (str(where / name), "x", -1, -1))
+
+    def test_the_name_is_compared_ignoring_case(self, hook):
+        """macOS and Windows keep one file under both spellings."""
+        _, alias, cfg = hook
+        assert _path_matches_pth(str(alias / "TETHERED.PTH"), cfg._pth_path)
+        with pytest.raises(tethered.SubprocessBlocked, match="refused deletion"):
+            _handle_pth_fs_op(cfg, "os.remove", (str(alias / "Tethered.Pth"), -1))
+
+    def test_dot_dot_is_resolved_the_way_the_platform_does(self, hook, alias_of):
+        """POSIX looks ``..`` up in the file system, Windows resolves it in the text."""
+        directory, _, cfg = hook
+        package = directory / "tethered"
+        package.mkdir()
+        link = alias_of(package, directory.parent / "package")
+        path = os.path.join(str(link), "..", "tethered.pth")
+        # link/.. is site-packages on POSIX, and the directory of the link on Windows.
+        assert _path_matches_pth(path, cfg._pth_path) is (sys.platform != "win32")
+
+    def test_a_directory_without_a_file_index_is_not_matched(self, hook, monkeypatch):
+        """Some network file systems report 0 for every file; then only the text counts."""
+        directory, alias, cfg = hook
+        real_stat = os.stat
+
+        def without_index(path, **kwargs):
+            fields = list(real_stat(path, **kwargs))
+            fields[1] = 0  # st_ino
+            return os.stat_result(fields)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "stat", without_index)
+            assert not _path_matches_pth(str(alias / "tethered.pth"), cfg._pth_path)
+            assert _path_matches_pth(str(directory / "tethered.pth"), cfg._pth_path)
+
+    @pytest.mark.parametrize(
+        ("argument", "expected"),
+        [
+            ("/site-packages/tethered.pth", True),
+            ("C:\\Site-Packages\\TETHERED.PTH", True),
+            ("tethered.start", True),
+            (b"/site-packages/Tethered.Start", True),
+            ("/x/tethered.pth.d/data.txt", True),  # not the file; decided by the next test
+            (Path("anything"), True),  # cannot be read without running its code
+            ("/site-packages/tethered/_core.py", False),
+            ("/site-packages/tethered-0.5.3.dist-info/RECORD", False),
+            (b"/var/log/app.log", False),
+            ("rb", False),  # the mode of an open event
+            (None, False),
+            (-1, False),  # a directory descriptor, a mode, a length
+            (3.5, False),
+        ],
+        ids=repr,
+    )
+    def test_which_arguments_can_name_the_hook(self, argument, expected):
+        assert _core._mentions_hook(argument) is expected
+
+    def test_a_path_that_is_not_about_the_hook_costs_no_system_call(self, hook, monkeypatch):
+        directory, alias, cfg = hook
+        unrelated = [
+            str(directory / "requests" / "api.py"),
+            str(alias / "notes-tethered.pth.txt"),
+            str(alias / "tethered.pth.d" / "data.txt"),
+            os.fsencode(alias / "other.pth"),
+        ]
+
+        def refuse_to_stat(*args, **kwargs):
+            raise AssertionError("os.stat() called for an unrelated path")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "stat", refuse_to_stat)
+            for path in unrelated:
+                _handle_pth_fs_op(cfg, "open", (path, "r", os.O_RDONLY))
+                _handle_pth_fs_op(cfg, "open", (path, "w", os.O_WRONLY | os.O_CREAT))
+                _handle_pth_fs_op(cfg, "os.remove", (path, -1))
+                _handle_pth_fs_op(cfg, "os.rename", (path, path, -1, -1))
+                _handle_pth_fs_op(cfg, "os.chmod", (path, 0o644, -1))
+                _handle_pth_fs_op(cfg, "os.truncate", (path, 0))
+                _handle_pth_fs_op(cfg, "os.link", (path, path, -1, -1))
+                _handle_pth_fs_op(cfg, "os.symlink", (path, path, -1))
+                _handle_pth_fs_op(cfg, "_winapi.CopyFile2", (path, path, 0))
+            # Reading the hook file itself is decided without one as well.
+            _handle_pth_fs_op(cfg, "open", (str(alias / "tethered.pth"), "r", os.O_RDONLY))
+
+    # ── Windows: a stream of the file ──────────────────────────────────
+
+    def test_a_stream_of_the_file_is_the_file(self, hook, windows_rules):
+        """``tethered.pth::$DATA`` is the content of ``tethered.pth``."""
+        directory, alias, cfg = hook
+        for where in (directory, alias):
+            assert _path_matches_pth(str(where / "tethered.pth") + "::$DATA", cfg._pth_path)
+            assert _path_matches_pth(str(where / "tethered.pth") + ":other", cfg._pth_path)
+            assert not _path_matches_pth(str(where / "other.pth") + "::$DATA", cfg._pth_path)
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            _handle_pth_fs_op(cfg, "open", (str(alias / "tethered.pth") + "::$DATA", "a", 0))
+
+    def test_a_colon_is_part_of_a_posix_file_name(self, hook, posix_rules):
+        directory, _, cfg = hook
+        assert not _path_matches_pth(str(directory / "tethered.pth") + "::$DATA", cfg._pth_path)
+
+    # ── a path relative to a directory descriptor ──────────────────────
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no directory descriptors")
+    @pytest.mark.parametrize(
+        ("event", "arguments", "refusal"),
+        [
+            ("os.remove", lambda fd, up: ("tethered.pth", fd), "refused deletion"),
+            ("os.remove", lambda fd, up: (b"tethered.pth", fd), "refused deletion"),
+            ("os.remove", lambda fd, up: ("./tethered.pth", fd), "refused deletion"),
+            ("os.remove", lambda fd, up: ("site-packages/tethered.pth", up), "refused deletion"),
+            ("os.rename", lambda fd, up: ("tethered.pth", "gone.pth", fd, fd), "refused rename"),
+            ("os.rename", lambda fd, up: ("new.pth", "tethered.pth", fd, fd), "refused rename"),
+            ("os.rename", lambda fd, up: ("/tmp/new", "tethered.pth", -1, fd), "refused rename"),
+            ("os.chmod", lambda fd, up: ("tethered.pth", 0, fd), "refused chmod"),
+            ("os.rename", lambda fd, up: ("x", "tethered.start", fd, fd), "refused creation"),
+            ("os.link", lambda fd, up: ("/tmp/x", "tethered.start", -1, fd), "refused creation"),
+            ("os.symlink", lambda fd, up: ("/tmp/x", "tethered.start", fd), "refused creation"),
+            (
+                "os.symlink",
+                lambda fd, up: ("/tmp/x", "site-packages/tethered.start", up),
+                "refused creation",
+            ),
+        ],
+        ids=lambda value: value if isinstance(value, str) else None,
+    )
+    def test_relative_to_a_descriptor_of_the_directory(self, hook, event, arguments, refusal):
+        directory, _, cfg = hook
+        fd = os.open(directory, os.O_RDONLY)
+        parent_fd = os.open(directory.parent, os.O_RDONLY)
+        try:
+            with pytest.raises(tethered.SubprocessBlocked, match=refusal):
+                _handle_pth_fs_op(cfg, event, arguments(fd, parent_fd))
+        finally:
+            os.close(fd)
+            os.close(parent_fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no directory descriptors")
+    def test_relative_to_a_descriptor_of_another_directory(self, hook, tmp_path, monkeypatch):
+        """The working directory says nothing about a path that is relative to a descriptor."""
+        directory, _, cfg = hook
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        fd = os.open(elsewhere, os.O_RDONLY)
+        monkeypatch.chdir(directory)
+        try:
+            assert _path_matches_pth("tethered.pth", cfg._pth_path)  # the working directory
+            assert not _path_matches_pth("tethered.pth", cfg._pth_path, fd)
+            _handle_pth_fs_op(cfg, "os.remove", ("tethered.pth", fd))  # no raise
+            _handle_pth_fs_op(cfg, "os.rename", ("tethered.pth", "tethered.start", fd, fd))
+            _handle_pth_fs_op(cfg, "os.chmod", ("tethered.pth", 0, fd))
+            _handle_pth_fs_op(cfg, "os.symlink", ("/tmp/x", "tethered.start", fd))
+        finally:
+            os.close(fd)
+
+    def test_an_absolute_path_ignores_the_descriptor(self, hook, tmp_path, posix_rules):
+        directory, _, cfg = hook
+        fd = os.open(tmp_path / "some-file", os.O_CREAT | os.O_RDWR)
+        try:
+            assert _path_matches_pth(str(directory / "tethered.pth"), cfg._pth_path, fd)
+        finally:
+            os.close(fd)
+
+    def test_a_descriptor_that_is_no_directory_matches_nothing(self, hook, tmp_path, posix_rules):
+        _, _, cfg = hook
+        fd = os.open(tmp_path / "some-file", os.O_CREAT | os.O_RDWR)
+        try:
+            assert not _path_matches_pth("tethered.pth", cfg._pth_path, fd)
+            assert not _path_matches_pth(os.path.join("sub", "tethered.pth"), cfg._pth_path, fd)
+        finally:
+            os.close(fd)
+        assert not _path_matches_pth("tethered.pth", cfg._pth_path, fd)  # closed
+
+    @pytest.mark.parametrize("no_descriptor", [-1, -100, None, "3"])
+    def test_without_a_descriptor_the_working_directory_counts(
+        self, hook, monkeypatch, no_descriptor
+    ):
+        directory, _, cfg = hook
+        monkeypatch.chdir(directory)
+        assert _path_matches_pth("tethered.pth", cfg._pth_path, no_descriptor)
+        with pytest.raises(tethered.SubprocessBlocked, match="refused deletion"):
+            _handle_pth_fs_op(cfg, "os.remove", ("tethered.pth", no_descriptor))
+
+
 class TestComputePthPath:
     """Direct tests for _compute_pth_path.
 
