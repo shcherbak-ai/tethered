@@ -1,6 +1,6 @@
 # Container tests
 
-Real application servers, in Docker, on every supported Python version, with tethered installed the way a user installs it. The unit and integration tests in `tests/` drive tethered from inside one pytest process; these suites start the servers people deploy (uvicorn, gunicorn, more to come), let them fork, spawn, recycle and reload their workers, and check from the outside that the policy holds in every process.
+Real application servers, task queues and client libraries, in Docker, on every supported Python version, with tethered installed the way a user installs it. The unit and integration tests in `tests/` drive tethered from inside one pytest process; these suites start what people deploy (uvicorn, gunicorn, hypercorn, granian, uWSGI, Apache with mod_wsgi, Celery and the other task queues, some seventy client-library arrangements; `run.py --list` has them all), let the servers fork, spawn, recycle and reload their workers, and check from the outside that the policy holds in every process. [`docs/COMPATIBILITY.md`](../docs/COMPATIBILITY.md) is written from their results.
 
 **The gating rule.** Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`. CI runs them on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or this directory (`.github/workflows/container-tests.yml`).
 
@@ -266,14 +266,14 @@ What makes a good test here:
 - It names the arrangement on the command line (worker class, event loop, preload) rather than relying on a default, and checks through `/whoami` that it got it.
 - It asserts the application's report and the world's counter.
 - It asserts on every worker when there are several (`each_worker`), and on workers that were started later.
-- A limit that is documented (an external tool is not restricted under `warn`) is asserted as what it is, with the counter that moves; it then also serves as the proof that the counter can move.
+- A limit that is documented (an external tool is not restricted under `warn`) is asserted as what it is, with the counter that moves; it then also serves as the proof that the counter can move. The docstring of such a test starts with `Limit:`, so that the limits a suite pins can be listed.
 - It does not sleep. `wait_log`, `each_worker` and `start_server` wait for a condition.
 
 ## Pins
 
 Every requirement is pinned, so that a pull request is tested against the same servers as the one before it. The weekly CI run uses `--unpinned` and tells when the ecosystem has moved.
 
-To bump: run `uv run python tests_containers/run.py --suite <name> --unpinned --verbose`, read what was installed (the line that starts with `installed:` at the top of the container's output is the image's `pip freeze`), write the versions into the suite's `requirements.txt` and run the suite pinned. For pytest it is `harness/requirements.txt`, and then every suite. When a new version changes what tethered has to do, that is a finding: write it down where the behaviour is documented before changing the test.
+To bump: run `uv run python tests_containers/run.py --suite <name> --unpinned --verbose`, read what was installed (the line that starts with `installed:` at the top of the container's output is the image's `pip freeze`), write the versions into the suite's `requirements.txt` and run the suite pinned. For pytest it is `harness/requirements.txt`, and then every suite. When a new version changes what tethered has to do, that is a finding: write it down where the behaviour is documented before changing the test. [`docs/COMPATIBILITY.md`](../docs/COMPATIBILITY.md) names the version each of its rows was measured with and the suite behind it, and [`docs/COOKBOOK.md`](../docs/COOKBOOK.md) says what each server needs: a bump that changes a result changes those two pages.
 
 A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. When 3.15 is released, change its tag from `3.15-rc` to `3.15` there.
 
@@ -283,17 +283,27 @@ A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. When 3.15 i
 
 ## What a run costs
 
-Measured on a 32-CPU Windows machine with Docker Desktop, base images already pulled, the default `--jobs 4`:
+Measured on a 32-CPU Windows machine with Docker Desktop, base images already pulled, the default `--jobs 4`. This table is from when there were three suites (`selftest`, `uvicorn`, `gunicorn`, the last two smaller than they are now). There are thirty today, and a run of everything has not been timed since: expect a multiple of the first two rows.
 
 | Run | Time |
 | --- | --- |
 | Everything (3 suites on 5 Python versions, 15 runs), images cached | 2 to 3 minutes |
 | The same when every image has to be built | about 4 minutes |
 | One run: `selftest` | 11 to 20 s |
-| One run: `uvicorn` or `gunicorn` | 30 s alone, 30 to 50 s next to three others |
+| One run: `uvicorn` or `gunicorn`, as they were then | 30 s alone, 30 to 50 s next to three others |
 | Building one image without cache | 15 to 30 s |
 
-On top of that, the first build for a Python version downloads its two base images (the full one, which the builder stage uses, is about 1.6 GB unpacked). A change under `src/` rebuilds the wheel and the layers after it, a few seconds per Python version; a change to a test or to the harness rebuilds only the last layers. The time of a CI job has not been measured: the workflow has not run yet.
+Single runs measured since, on Python 3.13 with the image cached (the time of the container, as the summary's `tests` column gives it):
+
+| Run | Time |
+| --- | --- |
+| `waitress` | 4 s |
+| `clients_niquests` | 10 s |
+| `django` | 25 s |
+| `clients` | 68 s |
+| `modwsgi` | 2 to 4 minutes, depending on the Python version |
+
+On top of that, the first build for a Python version downloads its two base images (the full one, which the builder stage uses, is about 1.6 GB unpacked). A change under `src/` rebuilds the wheel and the layers after it, a few seconds per Python version; a change to a test or to the harness rebuilds only the last layers. A suite that needs system packages or a compiler (`modwsgi`, `clients`, `uwsgi`) takes longer to build the first time; that was not timed. The time of a CI job has not been measured: the workflow has not run yet.
 
 ## Troubleshooting
 

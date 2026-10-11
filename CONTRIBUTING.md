@@ -2,7 +2,7 @@
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook).
+**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook and for the container suites).
 
 ```bash
 git clone https://github.com/shcherbak-ai/tethered.git
@@ -39,6 +39,24 @@ Example tests (run each example script as a subprocess, requires network):
 uv run pytest tests_examples/ -v
 ```
 
+Container suites (real servers, task queues and client libraries in Docker, on every supported Python version; requires Docker with Linux containers):
+
+```bash
+# Everything: every suite on every supported Python version.
+uv run python tests_containers/run.py
+
+# One suite, one Python version.
+uv run python tests_containers/run.py --suite uvicorn --python 3.13
+
+# Only the tests whose name matches, with the full output of every run.
+uv run python tests_containers/run.py --suite gunicorn -k reload --verbose
+
+# What is there to run?
+uv run python tests_containers/run.py --list
+```
+
+**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/README.md](tests_containers/README.md) explains how they work and how to add a suite.
+
 ## Linting and formatting
 
 Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, commitizen) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`:
@@ -68,7 +86,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) e
 src/tethered/
     __init__.py           # Public API: activate, deactivate, scope, EgressBlocked, TetheredLocked, SubprocessBlocked
     _policy.py            # AllowPolicy — pattern parsing and matching (pure logic)
-    _core.py              # Audit hook, scope, subprocess propagation, state management, IP-to-hostname
+    _core.py              # Audit hook, scope, subprocess propagation, state management, IP-to-hostname, refused imports (uvloop, pycares)
     _autoactivate.py      # Child-process bootstrap — reads _TETHERED_CHILD_POLICY and re-activates
     _guardian.c           # C extension — integrity verifier for tamper-resistant locked mode
     _guardian.pyi         # Type stub for the C extension
@@ -91,10 +109,17 @@ tests/
 tests_examples/
     conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
+tests_containers/
+    run.py                # Host runner: one image per suite and Python version, each run in a container without a network
+    README.md             # How the suites work, the helpers, adding a suite
+    images/               # The Dockerfile: tethered built as a wheel and installed like a user's
+    harness/              # Shared in-container code: pytest plugin, the destinations that count arrivals, probe applications
+    suites/<name>/        # One directory per server, task queue or library family
 examples/
     01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
 docs/
     API.md, ARCHITECTURE.md, COOKBOOK.md, SUBPROCESS.md  # Detailed reference
+    COMPATIBILITY.md      # What was measured under which server, task queue and client library
 ```
 
 ## Network safety in tests
@@ -150,5 +175,7 @@ On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` wi
 - **Guardian tests** (`test_guardian.py`): C extension tamper detection — replaces `_config`, monkey-patches `is_allowed`, mutates frozen-dataclass slots via `object.__setattr__`, replaces helper functions; all should fail-closed. One test fails when a new module-level name in `_core.py` or `_policy.py` is neither covered by the integrity snapshot nor on its allowlist of runtime state: name constants in UPPER_CASE, keep runtime flags and counters as lower-case scalars and add them to that allowlist, and never rebind other module-level objects at runtime.
 - **Exception tests** (`test_exceptions.py`) and **lifecycle tests** (`test_lifecycle.py`): pickling and copying of `EgressBlocked` / `SubprocessBlocked` (including real spawn-mode pools), and `activate()` / `deactivate()` transitions under interleaving and failure.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
+- **Container suites** (`tests_containers/suites/<name>/`): A suite starts a real server, task queue or client library in a container that has no network, with tethered installed from a wheel. Destinations on the container's loopback interface count what arrives, and a test asserts both what the application reported and what arrived: "blocked" means that the counter did not move. A known limit is pinned as what happens today, in a test whose docstring starts with `Limit:`. Every requirement is pinned; a suite is added by adding its directory. `docs/COMPATIBILITY.md` is written from these suites: when a result changes, change the page with it.
+- **Documentation that is tested.** The code and configuration blocks of `docs/COOKBOOK.md` are meant to work as printed. Run a block in a container before you change it, or take it from a suite where it already runs. The FastAPI recipe and the Django middleware have a copy in their suite (`tests_containers/suites/fastapi/cookbook_recipe.py`, `tests_containers/suites/django/djapp/`): change the copy with the block and run the suite.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before the connection is opened.
