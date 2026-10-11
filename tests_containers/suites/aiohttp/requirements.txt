@@ -1,0 +1,22 @@
+# aiohttp as a server, alone and under gunicorn; uvloop for GunicornUVLoopWebWorker.
+aiohttp==3.14.4
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+idna==3.20
+multidict==6.9.1
+propcache==0.5.4
+typing_extensions==4.16.0
+yarl==1.25.1
+gunicorn==26.2.0
+uvloop==0.23.0
+# aiodns, the resolver that "pip install aiohttp[speedups]" adds and aiohttp then
+# uses by default.  The suite sets it aside and gives it to the servers that
+# ask for it (resolver_packages.py).
+aiodns==4.0.4
+pycares==5.1.0
+cffi==2.1.1
+pycparser==3.11
+# Also a requirement of pytest: keep the pin equal to harness/requirements.txt.
+packaging==26.3

@@ -1,0 +1,15 @@
+description = "aiohttp as a server: web.run_app, gunicorn with aiohttp's two worker classes, the client with aiodns"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# The compiler and cmake are for pycares, which has no wheel for Python 3.15
+# yet and builds the c-ares it bundles.
+apt = ["cmake"]
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["aiohttp", "gunicorn", "uvloop", "aiodns"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
