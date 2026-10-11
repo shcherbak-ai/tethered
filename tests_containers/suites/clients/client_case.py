@@ -190,13 +190,17 @@ def main() -> None:
     started = time.monotonic()
     try:
         function = getattr(importlib.import_module(module_name), function_name)
-        if os.environ.get("CLIENT_LOOKUP_FIRST"):
+        lookup = os.environ.get("CLIENT_LOOKUP_FIRST")
+        if lookup:
             # The application looks the name up through Python's socket module
             # before it hands it to the library: the C function, so that a
             # monkey-patched socket.getaddrinfo does not stand in for it.
             import _socket
 
-            _socket.getaddrinfo(host, port)
+            if lookup == "gethostbyname":
+                _socket.gethostbyname(host)
+            else:
+                _socket.getaddrinfo(host, port)
         function(host, port)
         report.update(outcome="completed", surface=None)
     except BaseException as exc:

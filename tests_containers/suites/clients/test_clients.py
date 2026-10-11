@@ -296,12 +296,31 @@ def test_a_lookup_through_the_socket_module_makes_the_allowed_host_reachable(
     """
     if measure.PYTHON in variant.missing_on:
         pytest.skip(variant.missing_on[measure.PYTHON])
-    batch = measure.run_batch(variant, measure.under("plain"), env={"CLIENT_LOOKUP_FIRST": "1"})
+    lookup = {"CLIENT_LOOKUP_FIRST": "getaddrinfo"}
+    batch = measure.run_batch(variant, measure.under("plain"), env=lookup)
     assert arrived(batch) == ["allowed"], batch.reports
     assert not batch.queried(FORBIDDEN_NAME)
     refusal = batch.reports["forbidden_name"]
     assert refusal["outcome"] == "blocked", refusal
     assert f"{FORBIDDEN_NAME} is not in the allow list" in refusal["message"]
+
+
+def test_knowing_the_allowed_name_is_enough_to_match_its_address() -> None:
+    """``gethostbyname`` gives tethered the name and no address, and the host is reached.
+
+    tethered records such a name as a candidate only.  When the library then
+    connects to an address tethered has no name for, tethered resolves its
+    candidates itself and finds the address among the answers.  The name does
+    not have to come from a lookup of the application: an exact host name of
+    the allow list would do as a candidate just as well.
+    """
+    variant = catalog.TABLE["aiohttp-aiodns"]
+    lookup = {"CLIENT_LOOKUP_FIRST": "gethostbyname"}
+    batch = measure.run_batch(variant, measure.under("plain"), env=lookup)
+    assert arrived(batch) == ["allowed"], batch.reports
+    assert batch.reports["other_port"]["message"].endswith(
+        f"{ALLOWED_ADDR}:9003 (resolved from {ALLOWED_NAME}) is not in the allow list"
+    )
 
 
 def test_an_address_rule_makes_the_allowed_host_reachable() -> None:
