@@ -281,16 +281,6 @@ class TestBlockingExternalLaunches:
 # ── Python 3.12 and later ─────────────────────────────────────────────
 
 
-def wait_until_gone(server: Server, timeout: float = 30.0) -> int | None:
-    """Wait until the process has ended by itself; returns its exit status."""
-    deadline = time.monotonic() + timeout
-    while server.running:
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"{server.name} is still running after {timeout} s")
-        time.sleep(0.05)
-    return server.stop(check=False)
-
-
 class TestWithoutTethered:
     def test_the_worker_runs_jobs_and_reaches_the_forbidden_destination(self) -> None:
         # The control, on every Python version: the same worker, no policy.
@@ -306,18 +296,29 @@ class TestWithoutTethered:
     not SENDMSG_REFUSED, reason="asyncio does not write with sendmsg before Python 3.12"
 )
 class TestAsyncioWritesFromPython312:
-    def start(self, where: str, ready: str) -> tuple[Server, Server]:
+    def log_of_a_worker_that_ends(self, where: str) -> str:
+        """Start a worker under a locked policy, wait until it has given up; returns its log."""
+
         def accepting(server: Server) -> bool:
             socket.create_connection((LOOPBACK_ADDR, server.port), timeout=1.0).close()
             return True
 
         redis = start_server(REDIS, ready=accepting)
-        worker = start_server(
-            ["arq", "arq_tasks.WorkerSettings"],
-            env={"REDIS_PORT": str(redis.port), "TETH_ACTIVATE": "locked", "TETH_WHERE": where},
-            ready=lambda server: ready in server.log,
-        )
-        return redis, worker
+        started: list[Server] = []
+
+        def never(server: Server) -> bool:
+            started.append(server)
+            return False
+
+        # The worker ends by itself, and start_server says with which status.
+        with pytest.raises(AssertionError, match="exited with status 1 while starting"):
+            start_server(
+                ["arq", "arq_tasks.WorkerSettings"],
+                env={"REDIS_PORT": str(redis.port), "TETH_ACTIVATE": "locked", "TETH_WHERE": where},
+                ready=never,
+                timeout=60,
+            )
+        return started[0].log
 
     def test_a_worker_that_holds_the_policy_from_the_start_cannot_talk_to_redis(self) -> None:
         """Limit: on Python 3.12+ an arq worker under a policy never gets its Redis connection.
@@ -327,9 +328,8 @@ class TestAsyncioWritesFromPython312:
         refused; asyncio closes the transport, arq retries five times and
         gives up.
         """
-        _redis, worker = self.start("import", REFUSED_SENDMSG)
-        assert wait_until_gone(worker) == 1
-        log = worker.log
+        log = self.log_of_a_worker_that_ends("import")
+        assert REFUSED_SENDMSG in log
         assert "Fatal write error on socket transport" in log
         assert f"{EGRESS_BLOCKED}: Blocked by tethered: <unreadable None> is not in the" in log
         assert "redis connection error" in log
@@ -344,9 +344,10 @@ class TestAsyncioWritesFromPython312:
         policy; the next command on the open connection is refused and the
         worker ends.
         """
-        _redis, worker = self.start("on_startup", "redis_version=")
-        worker.wait_log(r"probe: pid \d+ activated tethered \(locked\)")
-        worker.wait_log(re.escape(REFUSED_SENDMSG))
-        assert wait_until_gone(worker) == 1
-        assert "Fatal write error on socket transport" in worker.log
+        log = self.log_of_a_worker_that_ends("on_startup")
+        connected = log.index("redis_version=")
+        activated = re.search(r"probe: pid \d+ activated tethered \(locked\)", log)
+        assert activated is not None, log
+        assert connected < activated.start() < log.index(REFUSED_SENDMSG)
+        assert "Fatal write error on socket transport" in log
         assert arrivals() == {}
