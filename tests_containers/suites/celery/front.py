@@ -29,7 +29,13 @@ def submit(op: str, params: dict[str, str]) -> dict[str, Any]:
     try:
         report = result.get(timeout=wait)
     except Exception as exc:
-        failed = taskprobe.failure(exc, id=result.id, traceback=result.traceback)
+        failed = taskprobe.failure(
+            exc,
+            id=result.id,
+            traceback=result.traceback,
+            host=getattr(exc, "host", None),
+            port=getattr(exc, "port", None),
+        )
         return {"task": {**failed, "celery_state": result.state}}
     return {**report, "task": {"state": "succeeded", "id": result.id, "celery_state": result.state}}
 

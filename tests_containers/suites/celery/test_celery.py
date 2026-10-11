@@ -509,16 +509,15 @@ class TestBlockingExternalLaunches:
 
 
 class TestTheProducer:
-    def test_a_producer_under_a_locked_policy_sends_tasks_and_gets_a_plain_exception(
-        self,
-    ) -> None:
-        """Limit: with JSON results, a producer that has tethered loaded gets ``Exception``.
+    def test_a_producer_under_a_locked_policy_sends_tasks_and_gets_egress_blocked(self) -> None:
+        """With JSON results, a producer that has tethered loaded gets ``EgressBlocked``.
 
-        Celery's JSON result backend rebuilds an exception by calling its
-        class with the stored message.  ``EgressBlocked(message)`` is not a
-        valid call, so Celery falls back to a bare ``Exception`` whose text
-        names the class: ``except tethered.EgressBlocked`` around
-        ``result.get()`` does not match.
+        Celery's JSON result backend stores the class name and ``args`` of an
+        exception and rebuilds it by calling the class with them.  ``args``
+        of ``EgressBlocked`` is its message, and the class accepts the
+        message alone: ``except tethered.EgressBlocked`` around
+        ``result.get()`` matches, and the attributes are read back out of
+        the message.
         """
         stack = start_stack("--pool", "solo", front_activate="locked")
         assert_policy(stack.front.get("/front").json(), "locked")
@@ -528,10 +527,21 @@ class TestTheProducer:
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_ALLOWED: 1}
 
+        # Refused at the lookup: a name and no port.
         task = stack.probe("connect", FORBIDDEN_NAME, OTHER_PORT, uncaught=1)["task"]
         assert task["celery_state"] == "FAILURE", task
-        assert task["exception"] == "builtins.Exception", task
-        assert task["message"] == f"<class '{EGRESS_BLOCKED}'>(['{REFUSED_NAME}'])"
+        assert task["exception"] == EGRESS_BLOCKED, task
+        assert task["message"] == REFUSED_NAME
+        assert (task["host"], task["port"]) == (FORBIDDEN_NAME, None)
+
+        # Refused at the connection: the address, the port, and the name it was looked up by.
+        task = stack.probe("connect", ALLOWED_NAME, OTHER_PORT, uncaught=1)["task"]
+        assert task["exception"] == EGRESS_BLOCKED, task
+        assert task["message"] == (
+            f"Blocked by tethered: {ALLOWED_ADDR}:{OTHER_PORT} "
+            f"(resolved from {ALLOWED_NAME}) is not in the allow list"
+        )
+        assert (task["host"], task["port"]) == (ALLOWED_ADDR, OTHER_PORT)
         assert arrivals() == {AT_ALLOWED: 1}
 
     def test_with_pickled_results_the_producer_gets_egress_blocked(self) -> None:

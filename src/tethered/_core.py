@@ -46,7 +46,10 @@ def _rebuild_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseE
 
     ``BaseException.__reduce__`` rebuilds an exception as ``cls(*self.args)``.
     ``EgressBlocked`` and ``SubprocessBlocked`` hand ``RuntimeError`` a single
-    formatted message but take other positional parameters themselves, so
+    formatted message but take other positional parameters themselves.
+    Called with the message alone they can only read their attributes back
+    out of it, which loses whatever the message does not hold, and a
+    subclass with a constructor of its own cannot be called that way at all:
     that call raises ``TypeError`` — in the process *receiving* the pickle.
     A blocked call in a pool worker then breaks the pool
     (``ProcessPoolExecutor``) or never delivers a result
@@ -60,18 +63,127 @@ def _rebuild_exception(cls: type[BaseException], args: tuple[Any, ...]) -> BaseE
     return cls.__new__(cls, *args)
 
 
+# Stands for "not passed" where None is a value of its own (a port).
+_NOT_GIVEN: Any = object()
+
+# The fixed parts of the messages of EgressBlocked and SubprocessBlocked, for
+# reading a message back.  The constructors write the same text as literals.
+_BLOCKED_PREFIX = "Blocked by tethered: "
+_NOT_IN_ALLOW_LIST = " is not in the allow list"
+_REFUSED_BY_POLICY = (
+    " — refused by tethered policy (external_subprocess_policy or locked-mode tamper check)"
+)
+_MESSAGE_ALONE_MSG = (
+    "{name}() takes {fields}, or nothing but the message of a {name} "
+    f"(a text that starts with {_BLOCKED_PREFIX!r})"
+)
+
+
+def _message_alone(name: str, fields: str, message: object, *others: object) -> str:
+    """Return the text after the prefix of a message that is all an exception was given.
+
+    ``cls(*exc.args)`` is how an exception is rebuilt by whatever carries it
+    without pickling it (Celery's JSON result serializer keeps the class
+    name and ``args``).  ``args`` of these exceptions is the message, so the
+    classes accept it in place of their fields.  Nothing else is accepted in
+    that place: a call that left out a field is still a ``TypeError``.
+    """
+    if (
+        not isinstance(message, str)
+        or not message.startswith(_BLOCKED_PREFIX)
+        or any(other is not None for other in others)
+    ):
+        raise TypeError(_MESSAGE_ALONE_MSG.format(name=name, fields=fields))
+    return message[len(_BLOCKED_PREFIX) :]
+
+
+def _egress_fields(text: str) -> tuple[str, int | None, str | None, str | None, str | None]:
+    """Read ``host, port, resolved_from, scope_label, scope_hint`` out of a message.
+
+    ``text`` is the message of an ``EgressBlocked`` without its prefix.  The
+    attributes come back as far as the message holds them: a
+    ``resolved_from`` equal to the host was never written into it.  A
+    message of another form (the guardian words its own for an interpreter
+    outside the lock) gives its text up to the first parenthesis as the
+    host and nothing else.
+    """
+    target, found, tail = text.partition(_NOT_IN_ALLOW_LIST)
+    if not found:
+        return text.partition(" (")[0], None, None, None, None
+    tail, _, hint = tail.partition("\nHint: ")
+    label = None
+    if tail.startswith(" (blocked by ") and tail.endswith(")"):
+        label = tail[len(" (blocked by ") : -1]
+    target, found, resolved = target.partition(" (resolved from ")
+    resolved_from = resolved[:-1] if found and resolved.endswith(")") else None
+
+    # "host", "host:port" or "[IPv6 address]:port".  An IPv6 address without
+    # a port has colons of its own and no brackets.
+    if target.startswith("["):
+        host, found, port = target[1:].rpartition("]:")
+    else:
+        host, found, port = target.rpartition(":")
+        if ":" in host:
+            found = ""
+    # (The length is checked because int() refuses a very long number.)
+    if found and len(port) <= 5 and port.isascii() and port.isdecimal():
+        return host, int(port), resolved_from, label, hint or None
+    return target, None, resolved_from, label, hint or None
+
+
+def _subprocess_fields(text: str) -> tuple[str, str]:
+    """Read ``event, description`` out of a message of ``SubprocessBlocked`` without its prefix.
+
+    The description is the message; the event is not written into it as
+    such.  Every launch is described starting with its event, and so are the
+    guardian's refusals; where the description starts with something else
+    (a refused change to ``tethered.pth``) the event comes back empty.
+    """
+    description = text.removesuffix(_REFUSED_BY_POLICY)
+    name = description.partition("(")[0].partition(" ")[0].rstrip("*")
+    known = name in _SUBPROCESS_EVENTS or name in _PTH_FS_EVENTS or name in _ENV_EVENTS
+    return (name if known else ""), description
+
+
 class EgressBlocked(RuntimeError):
     """Raised when a network connection is blocked by tethered policy."""
 
     def __init__(
         self,
         host: str,
-        port: int | None,
+        port: int | None = _NOT_GIVEN,
         *,
         resolved_from: str | None = None,
         scope_label: str | None = None,
         scope_hint: str | None = None,
     ) -> None:
+        if port is _NOT_GIVEN:
+            # The message alone, as in ``EgressBlocked(*exc.args)``: it is
+            # kept to the letter and the attributes are read back out of it.
+            text = _message_alone(
+                "EgressBlocked", "a host and a port", host, resolved_from, scope_label, scope_hint
+            )
+            msg = host
+            host, port, resolved_from, scope_label, scope_hint = _egress_fields(text)
+        else:
+            # Literal text, here and in SubprocessBlocked, not the constants
+            # the readers above use: the guardian builds these exceptions
+            # when it refuses over a tampered module, and that has to work
+            # whatever the module's names are bound to by then.
+            msg = f"Blocked by tethered: {host}"
+            if port is not None:
+                # An IPv6 address is written the way an allow rule writes
+                # it: "2001:db8::1:443" does not say where the address ends.
+                if ":" in str(host):
+                    msg = f"Blocked by tethered: [{host}]"
+                msg += f":{port}"
+            if resolved_from and resolved_from != host:
+                msg += f" (resolved from {resolved_from})"
+            msg += " is not in the allow list"
+            if scope_label:
+                msg += f" (blocked by {scope_label})"
+            if scope_hint:
+                msg += f"\nHint: {scope_hint}"
         self.host = host
         self.port = port
         self.resolved_from = resolved_from
@@ -88,17 +200,6 @@ class EgressBlocked(RuntimeError):
         # Named ``scope_hint`` to mirror ``scope_label`` — both are scope-
         # derived; ``activate()`` has no hint API by design.
         self.scope_hint = scope_hint
-
-        msg = f"Blocked by tethered: {host}"
-        if port is not None:
-            msg += f":{port}"
-        if resolved_from and resolved_from != host:
-            msg += f" (resolved from {resolved_from})"
-        msg += " is not in the allow list"
-        if scope_label:
-            msg += f" (blocked by {scope_label})"
-        if scope_hint:
-            msg += f"\nHint: {scope_hint}"
         super().__init__(msg)
 
     def __reduce__(self) -> tuple[Any, ...]:
@@ -122,13 +223,21 @@ class TetheredLocked(RuntimeError):
 class SubprocessBlocked(RuntimeError):
     """Raised when a subprocess launch is blocked by tethered policy."""
 
-    def __init__(self, event: str, description: str) -> None:
+    def __init__(self, event: str, description: str = _NOT_GIVEN) -> None:
+        if description is _NOT_GIVEN:
+            # The message alone, as in ``SubprocessBlocked(*exc.args)``.
+            msg = event
+            event, description = _subprocess_fields(
+                _message_alone("SubprocessBlocked", "an event and a description", event)
+            )
+        else:
+            msg = (
+                f"Blocked by tethered: {description} — refused by tethered policy "
+                "(external_subprocess_policy or locked-mode tamper check)"
+            )
         self.event = event
         self.description = description
-        super().__init__(
-            f"Blocked by tethered: {description} — refused by tethered policy "
-            f"(external_subprocess_policy or locked-mode tamper check)"
-        )
+        super().__init__(msg)
 
     def __reduce__(self) -> tuple[Any, ...]:
         # Picklable and copyable with every attribute — see _rebuild_exception.

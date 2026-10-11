@@ -2,7 +2,9 @@
 
 A blocked call raised inside a pool worker reaches the parent as a pickle,
 so ``EgressBlocked`` and ``SubprocessBlocked`` have to survive that trip with
-every attribute.  The pool tests spawn real worker processes; they are
+every attribute.  A transport that does not pickle (Celery's JSON result
+serializer) keeps the class and ``args``, so both can also be rebuilt from
+their message alone.  The pool tests spawn real worker processes; they are
 offline — the only socket activity is a loopback connect that tethered
 blocks before it leaves the audit hook.
 """
@@ -10,10 +12,12 @@ blocks before it leaves the audit hook.
 from __future__ import annotations
 
 import copy
+import json
 import multiprocessing
 import os
 import pickle
 import socket
+import subprocess
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
@@ -212,6 +216,240 @@ class TestTetheredLockedRoundTrip:
         _assert_same_exception(clone, original, ())
         if message is not None:
             assert str(clone) == message
+
+
+# What the C guardian says to an interpreter that is outside a lock.
+_OUTSIDE_THE_LOCK = (
+    "a locked tethered policy is active in another interpreter of this process, so this interpreter"
+)
+
+
+def _rebuilt_from_args(original):
+    """What a transport that keeps the class and ``args`` gives back.
+
+    Celery's JSON result serializer does this: ``args`` goes through JSON
+    and the producer calls ``cls(*args)``.
+    """
+    return type(original)(*json.loads(json.dumps(original.args)))
+
+
+class TestEgressBlockedFromItsMessage:
+    """``EgressBlocked(*exc.args)`` gives the exception back, attributes included."""
+
+    @pytest.mark.parametrize(
+        ("args", "kwargs"),
+        [
+            pytest.param(("example.test", 443), {}, id="name-and-port"),
+            pytest.param(("example.test", None), {}, id="name"),
+            pytest.param(("example.test", 0), {}, id="port-0"),
+            pytest.param(("example.test", 65535), {}, id="port-65535"),
+            pytest.param(("203.0.113.7", 443), {"resolved_from": "api.example.test"}, id="ipv4"),
+            pytest.param(("2001:db8::8a2e:370:7334", 443), {}, id="ipv6-and-port"),
+            pytest.param(("2001:db8::8a2e:370:7334", None), {}, id="ipv6"),
+            pytest.param(("::1", 8080), {"resolved_from": "localhost"}, id="ipv6-resolved"),
+            pytest.param(("fe80::1%eth0", 22), {}, id="ipv6-zone"),
+            pytest.param(
+                ("example.test", 443), {"scope_label": "scope(api.example.test:443)"}, id="label"
+            ),
+            pytest.param(
+                ("example.test", None), {"scope_hint": "mylib needs api.example.test"}, id="hint"
+            ),
+            pytest.param(("<unreadable b'\\xff'>", None), {}, id="unreadable"),
+        ],
+    )
+    def test_every_attribute_comes_back(self, args, kwargs):
+        original = tethered.EgressBlocked(*args, **kwargs)
+
+        clone = _rebuilt_from_args(original)
+
+        _assert_same_exception(clone, original, _EGRESS_ATTRS)
+
+    def test_with_every_attribute_set(self):
+        original = _full_egress_blocked()
+
+        clone = _rebuilt_from_args(original)
+
+        _assert_same_exception(clone, original, _EGRESS_ATTRS)
+        assert clone.host == "203.0.113.7"
+        assert clone.port == 443
+        assert clone.resolved_from == "api.example.test"
+        assert clone.scope_label == "scope(api.example.test:443)"
+        assert clone.scope_hint == "mylib needs api.example.test:443"
+
+    def test_a_real_refusal(self, blocked_loopback_port):
+        with socket.socket() as sock, pytest.raises(tethered.EgressBlocked) as excinfo:
+            sock.connect(("127.0.0.1", blocked_loopback_port))
+
+        clone = _rebuilt_from_args(excinfo.value)
+
+        assert clone is not excinfo.value
+        _assert_blocked_loopback(clone, blocked_loopback_port)
+
+    def test_the_rebuilt_exception_can_be_raised_and_caught(self):
+        clone = _rebuilt_from_args(_full_egress_blocked())
+        with pytest.raises(tethered.EgressBlocked, match=r"203\.0\.113\.7:443"):
+            raise clone
+
+    def test_an_ipv6_address_with_a_port_is_written_like_an_allow_rule(self):
+        """``2001:db8::1:443`` would not say where the address ends."""
+        assert str(tethered.EgressBlocked("2001:db8::1", 443)) == (
+            "Blocked by tethered: [2001:db8::1]:443 is not in the allow list"
+        )
+        assert str(tethered.EgressBlocked("2001:db8::1", None)) == (
+            "Blocked by tethered: 2001:db8::1 is not in the allow list"
+        )
+
+    def test_the_message_is_kept_to_the_letter(self):
+        message = "Blocked by tethered: example.test:0443 is not in the allow list (see the log)"
+
+        clone = tethered.EgressBlocked(message)
+
+        assert str(clone) == message
+        assert clone.args == (message,)
+        assert (clone.host, clone.port) == ("example.test", 443)
+        assert clone.scope_label is None  # not the form a label is written in
+
+    def test_a_resolved_from_equal_to_the_host_was_never_in_the_message(self):
+        original = tethered.EgressBlocked("example.test", 443, resolved_from="example.test")
+
+        clone = _rebuilt_from_args(original)
+
+        assert str(clone) == str(original)
+        assert (clone.host, clone.port, clone.resolved_from) == ("example.test", 443, None)
+
+    def test_a_message_of_the_guardian_for_an_interpreter_outside_the_lock(self):
+        message = (
+            f"Blocked by tethered: forbidden.test ({_OUTSIDE_THE_LOCK} gets no network access)"
+        )
+
+        clone = tethered.EgressBlocked(message)
+
+        assert str(clone) == message
+        assert (clone.host, clone.port) == ("forbidden.test", None)
+        assert (clone.resolved_from, clone.scope_label, clone.scope_hint) == (None, None, None)
+
+    def test_a_message_written_before_addresses_were_bracketed(self):
+        """From a worker with an older tethered: the port stays where the message has it."""
+        clone = tethered.EgressBlocked(
+            "Blocked by tethered: 2001:db8::1:443 is not in the allow list"
+        )
+        assert (clone.host, clone.port) == ("2001:db8::1:443", None)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "example.test:https",
+            "example.test:",
+            "example.test:123456",
+            "example.test:٤٤٣",
+            "[2001:db8::1]",
+            "[2001:db8::1]:x",
+        ],
+    )
+    def test_what_is_not_a_port_stays_in_the_host(self, target):
+        clone = tethered.EgressBlocked(f"Blocked by tethered: {target} is not in the allow list")
+        assert (clone.host, clone.port) == (target, None)
+
+    def test_an_unfinished_resolved_from_is_none(self):
+        clone = tethered.EgressBlocked(
+            "Blocked by tethered: 203.0.113.7:443 (resolved from api is not in the allow list"
+        )
+        assert (clone.host, clone.port, clone.resolved_from) == ("203.0.113.7", 443, None)
+
+    @pytest.mark.parametrize(
+        "argument",
+        ["example.test", "", "blocked by tethered: x", b"Blocked by tethered: x", None, 443],
+    )
+    def test_anything_but_a_message_is_still_a_type_error(self, argument):
+        with pytest.raises(TypeError, match="takes a host and a port, or nothing but the message"):
+            tethered.EgressBlocked(argument)
+
+    def test_a_message_with_another_field_is_a_type_error(self):
+        message = str(tethered.EgressBlocked("example.test", 443))
+        with pytest.raises(TypeError, match="nothing but the message"):
+            tethered.EgressBlocked(message, scope_label="scope(example.test)")
+
+    def test_a_host_that_reads_like_a_message_stays_a_host_when_a_port_is_passed(self):
+        """The hook always passes a port, ``None`` included: it never takes a host apart."""
+        looks_like_a_message = str(tethered.EgressBlocked("allowed.test", 443))
+
+        exc = tethered.EgressBlocked(looks_like_a_message, None)
+
+        assert exc.host == looks_like_a_message
+        assert str(exc) == f"Blocked by tethered: {looks_like_a_message} is not in the allow list"
+
+
+class TestSubprocessBlockedFromItsMessage:
+    """``SubprocessBlocked(*exc.args)`` gives the exception back."""
+
+    @pytest.mark.parametrize(
+        ("event", "description"),
+        [
+            ("subprocess.Popen", "subprocess.Popen(curl)"),
+            ("os.system", "os.system('curl https://example.test (again)')"),
+            ("os.exec", "os.exec*(/bin/sh)"),
+            ("os.posix_spawn", "os.posix_spawn(/bin/sh)"),
+            ("os.spawn", "os.spawn*(/bin/sh)"),
+            ("os.startfile", "os.startfile(report.docx)"),
+            ("_winapi.CreateProcess", "_winapi.CreateProcess(curl.exe)"),
+            ("_posixsubprocess.fork_exec", "_posixsubprocess.fork_exec(/usr/bin/curl)"),
+            ("subprocess.Popen", "subprocess.Popen(python) — started with -S (no site)"),
+            ("os.putenv", "os.putenv refused: locked policy integrity violated"),
+            ("open", "open refused: locked policy integrity violated"),
+        ],
+    )
+    def test_event_and_description_come_back(self, event, description):
+        original = tethered.SubprocessBlocked(event, description)
+
+        clone = _rebuilt_from_args(original)
+
+        _assert_same_exception(clone, original, _SUBPROCESS_ATTRS)
+        assert (clone.event, clone.description) == (event, description)
+
+    def test_a_real_refusal(self):
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked) as excinfo:
+            subprocess.Popen(["tethered-test-no-such-tool"])  # refused before it is looked for
+
+        clone = _rebuilt_from_args(excinfo.value)
+
+        _assert_same_exception(clone, excinfo.value, _SUBPROCESS_ATTRS)
+        assert clone.event == "subprocess.Popen"
+
+    def test_a_refused_change_to_the_bootstrap_file_does_not_name_its_event(self):
+        original = tethered.SubprocessBlocked(
+            "os.remove", "refused deletion of /site-packages/tethered.pth in locked mode"
+        )
+
+        clone = _rebuilt_from_args(original)
+
+        assert type(clone) is tethered.SubprocessBlocked
+        assert str(clone) == str(original)
+        assert clone.description == original.description
+        assert clone.event == ""
+
+    def test_a_message_of_the_guardian_for_an_interpreter_outside_the_lock(self):
+        message = (
+            f"Blocked by tethered: subprocess.Popen ({_OUTSIDE_THE_LOCK} cannot launch processes)"
+        )
+
+        clone = tethered.SubprocessBlocked(message)
+
+        assert str(clone) == message
+        assert clone.event == "subprocess.Popen"
+        assert clone.description == message.removeprefix("Blocked by tethered: ")
+
+    @pytest.mark.parametrize("argument", ["subprocess.Popen", "", "refused", None])
+    def test_anything_but_a_message_is_still_a_type_error(self, argument):
+        with pytest.raises(
+            TypeError, match="takes an event and a description, or nothing but the message"
+        ):
+            tethered.SubprocessBlocked(argument)
+
+
+def test_tethered_locked_is_rebuilt_from_its_message():
+    original = tethered.TetheredLocked("tethered: activate() blocked — policy is locked.")
+    _assert_same_exception(_rebuilt_from_args(original), original, ())
 
 
 def _connect_to_loopback(port: int, hint: str | None = None) -> str:
