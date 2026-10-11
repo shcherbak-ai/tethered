@@ -253,11 +253,14 @@ class TestHubTraceback:
 
 
 @pytest.fixture(scope="class", params=["plain", "locked"])
-def warning(request: pytest.FixtureRequest) -> Server:
+def policy(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
+@pytest.fixture(scope="class")
+def warning(policy: str) -> Server:
     """One gevent worker under the default ``external_subprocess_policy`` (warn)."""
-    server = start_server(gunicorn("gevent", workers=1), env={"TETH_ACTIVATE": request.param})
-    server.locked = request.param == "locked"  # type: ignore[attr-defined]
-    return server
+    return start_server(gunicorn("gevent", workers=1), env={"TETH_ACTIVATE": policy})
 
 
 @pytest.fixture(scope="class")
@@ -269,11 +272,11 @@ def blocking() -> Server:
 
 class TestLaunchesUnderWarn:
     def test_a_child_started_with_sys_executable_inherits_and_nothing_is_added_to_its_output(
-        self, warning: Server
+        self, warning: Server, policy: str
     ) -> None:
         report = launch(warning, "executable")
         child = child_of(report)
-        assert (child["active"], child["locked"]) == (True, warning.locked), child
+        assert (child["active"], child["locked"]) == (True, policy == "locked"), child
         assert_refused(child)
         assert arrivals() == {}
         assert LAUNCH_WARNING.findall(report["stderr"]) == []
@@ -281,7 +284,7 @@ class TestLaunchesUnderWarn:
         assert "external subprocess" not in warning.log_of_this_test
 
     def test_a_child_given_an_environment_without_the_policy_is_launched_with_it(
-        self, warning: Server
+        self, warning: Server, policy: str
     ) -> None:
         """Under gevent this launch is an ``os.exec*`` of the same interpreter, which tethered
         carries out with the policy added, under a lock too.  (Under gunicorn's sync worker the
@@ -290,11 +293,11 @@ class TestLaunchesUnderWarn:
         """
         report = launch(warning, "clean_env")
         child = child_of(report)
-        assert (child["active"], child["locked"]) == (True, warning.locked), child
+        assert (child["active"], child["locked"]) == (True, policy == "locked"), child
         assert_refused(child)
         assert arrivals() == {}
         completed = [line for line in report["stderr"].splitlines() if EXEC_COMPLETED in line]
-        if warning.locked:
+        if policy == "locked":
             assert len(completed) == 1, report["stderr"]
             # The forked child logged it, and then became the Python child.
             assert completed[0].startswith(f"LOG pid={child['pid']} tethered WARNING"), completed
@@ -317,14 +320,14 @@ class TestLaunchesUnderWarn:
         assert "external subprocess" not in warning.log_of_this_test
 
     def test_a_child_started_as_python3_is_warned_about_once_per_path_entry_tried(
-        self, warning: Server
+        self, warning: Server, policy: str
     ) -> None:
         """Limit: the warning is repeated for every ``PATH`` directory ``os.execvp`` tries, in the
         child's captured stderr.  The child itself does inherit the policy.
         """
         report = launch(warning, "path_python")
         child = child_of(report)
-        assert (child["active"], child["locked"]) == (True, warning.locked), child
+        assert (child["active"], child["locked"]) == (True, policy == "locked"), child
         assert_refused(child)
         assert arrivals() == {}
         assert LAUNCH_WARNING.findall(report["stderr"]) == tried("python3")

@@ -12,6 +12,9 @@ calls ``tethered.activate()``.  The tests follow it through the entry points:
 
 The views make their outbound requests with ``requests``.  Django 6 needs
 Python 3.12, so on Python 3.11 the suite runs on the 5.2 long-term series.
+
+Not covered: the ASGI entry point and asynchronous views, which belong with
+the suites of the asynchronous servers.
 """
 
 from __future__ import annotations
