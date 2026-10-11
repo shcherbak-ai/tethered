@@ -54,7 +54,10 @@ REFUSED_TO_LOAD = "tethered: refused to load uvloop while a policy is active"
 ACTIVATE_REFUSED = "RuntimeError: tethered: activate() refused"
 UVLOOP_WARNING = "tethered: uvloop is loaded in this process."
 #: The remedies the RuntimeError names.
-REMEDIES = "(uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the environment)"
+REMEDIES = (
+    "(uvicorn: --loop asyncio on the command line, UVICORN_LOOP=asyncio in the environment "
+    'of that command, or loop="asyncio" in uvicorn.run())'
+)
 
 AT_ALLOWED = f"{ALLOWED_ADDR}:{ALLOWED_PORT}/tcp"
 AT_FORBIDDEN = f"{FORBIDDEN_ADDR}:{OTHER_PORT}/tcp"

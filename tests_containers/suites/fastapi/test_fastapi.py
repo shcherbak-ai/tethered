@@ -75,6 +75,11 @@ EGRESS_BLOCKED = "tethered._core.EgressBlocked"
 REFUSED_TO_LOAD = "tethered: refused to load uvloop while a policy is active"
 ACTIVATE_REFUSED = "RuntimeError: tethered: activate() refused"
 UVLOOP_WARNING = "tethered: uvloop is loaded in this process."
+#: The remedies the RuntimeError names.
+REMEDIES = (
+    "(uvicorn: --loop asyncio on the command line, UVICORN_LOOP=asyncio in the environment "
+    'of that command, or loop="asyncio" in uvicorn.run())'
+)
 #: uvicorn's exit status when the application's startup fails.
 STARTUP_FAILURE = 3
 
@@ -323,7 +328,7 @@ class TestWorkers:
             env={"TETH_ACTIVATE": "locked", "UVICORN_LOOP": "asyncio"},
             ready=two_workers_refused,
         )
-        assert "(uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the environment)" in server.log
+        assert REMEDIES in server.log
         assert server.running
         assert never_answers(server)
         assert arrivals() == {}

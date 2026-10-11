@@ -3797,7 +3797,11 @@ def _scoped_generator(label: str):
 
 
 def _uvloop_warnings(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if "uvloop is loaded" in r.getMessage()]
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("tethered: uvloop is loaded")
+    ]
 
 
 class TestUvloopWarning:
@@ -3928,6 +3932,7 @@ class TestUvloopRefusal:
         # Said once: servers swallow the error and try again in every worker.
         (message,) = _uvloop_refusals(caplog)
         assert "standard asyncio event loop" in message
+        assert "(uvicorn: --loop asyncio) and this is not logged" in message
         assert _core._uvloop_refusal_unlogged is False
 
     @pytest.mark.parametrize("name", ["uvloop", "uvloop.loop"])
@@ -3998,11 +4003,16 @@ class TestUvloopRefusal:
             pytest.raises(RuntimeError, match=r"activate\(\) refused — uvloop is loaded") as exc,
         ):
             tethered.activate(allow=["*.example.com"], **kwargs)
-        assert "--loop asyncio" in str(exc.value)
-        assert "before uvloop is imported" in str(exc.value)
+        message = str(exc.value)
+        assert "--loop asyncio" in message
+        assert 'loop="asyncio" in uvicorn.run()' in message
+        assert "before uvloop is imported" in message
         assert _core._config is None
         assert _core._CHILD_POLICY_ENV not in os.environ
         assert _uvloop_warnings(caplog) == []  # refused, not warned about
+        # ... and logged, for the caller that swallows the exception.
+        (record,) = caplog.records
+        assert (record.levelno, record.getMessage()) == (logging.ERROR, message)
 
     def test_a_refused_policy_leaves_the_active_one_in_place(self, uvloop_loaded):
         tethered.activate(allow=["*.example.com"], log_only=True)

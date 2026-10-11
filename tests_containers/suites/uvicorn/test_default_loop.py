@@ -68,6 +68,11 @@ NOT_LOADED = "uvloop was not loaded"
 ACTIVATE_REFUSED = "RuntimeError: tethered: activate() refused"
 #: Logged once when a log-only policy or a scope finds uvloop loaded.
 UVLOOP_WARNING = "tethered: uvloop is loaded in this process."
+#: The remedies the RuntimeError names.
+REMEDIES = (
+    "(uvicorn: --loop asyncio on the command line, UVICORN_LOOP=asyncio in the environment "
+    'of that command, or loop="asyncio" in uvicorn.run())'
+)
 
 AT_ALLOWED = f"{ALLOWED_ADDR}:{ALLOWED_PORT}/tcp"
 AT_FORBIDDEN = f"{FORBIDDEN_ADDR}:{OTHER_PORT}/tcp"
@@ -378,7 +383,7 @@ class TestWorkers:
         )
         log = server.log
         assert ACTIVATE_REFUSED in log, log
-        assert "(uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the environment)" in log, log
+        assert REMEDIES in log, log
         assert "activated tethered" not in log, log
         # Dead workers are replaced, and the replacements die the same way.
         server.wait_log(r"Child process \[\d+\] died")
@@ -584,7 +589,7 @@ class TestActivationInALifespanHandler:
     def test_uvicorn_takes_the_refusal_for_an_application_without_lifespan_and_serves(
         self,
     ) -> None:
-        """Limit: the server comes up on uvloop with no policy at all, and nothing says so.
+        """Limit: the server comes up on uvloop with no policy at all; one log line says so.
 
         The loop is chosen before the application's startup runs, so uvloop
         is loaded and ``activate()`` raises ``RuntimeError`` in the lifespan
@@ -592,8 +597,9 @@ class TestActivationInALifespanHandler:
         from that handler as "this application does not support lifespan"
         and serves, without logging the exception.  The application then
         runs without the policy it asked for: the forbidden destination is
-        reached by blocking code as well, and tethered's message appears
-        nowhere, because ``activate()`` only raises it.  A framework that
+        reached by blocking code as well.  What is left of the refusal is
+        the error ``activate()`` logs before it raises, once, at startup.
+        A framework that
         catches the exception and reports a failed startup (FastAPI,
         Starlette: see the ``fastapi`` suite) makes uvicorn exit instead, and
         so does ``--lifespan on``.
@@ -606,14 +612,16 @@ class TestActivationInALifespanHandler:
         log = server.log
         assert "ASGI 'lifespan' protocol appears unsupported." in log, log
         assert "Application startup complete." in log, log
-        assert "tethered" not in log, log
+        assert log.count("tethered: activate() refused — uvloop is loaded") == 1, log
+        assert REMEDIES in log, log
         assert "Traceback" not in log, log
 
         for op in ("open_connection", "connect"):
             report = server.probe(op, FORBIDDEN_NAME, OTHER_PORT)
             assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 2}
-        assert "tethered" not in server.log, server.log
+        # Nothing more is said while it serves.
+        assert server.log.count("tethered: ") == 1, server.log
 
     def test_with_lifespan_on_the_server_exits(self) -> None:
         done = run_to_exit([*LIFESPAN, "--port=0", "--lifespan=on"], env=AT_STARTUP)

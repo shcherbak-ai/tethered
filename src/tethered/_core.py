@@ -537,9 +537,10 @@ _UVLOOP_LOADED_MSG = (
     "does its networking outside Python's socket module and raises no audit event, so the "
     "policy would not be applied to the connections, name lookups, datagrams and process "
     "launches made through it. Nothing was changed. Run the application on the standard "
-    "asyncio event loop (uvicorn: --loop asyncio, or UVICORN_LOOP=asyncio in the "
-    "environment), or call activate() before uvloop is imported: it is then kept from "
-    "loading, and a server that chooses it automatically falls back on its own."
+    "asyncio event loop (uvicorn: --loop asyncio on the command line, UVICORN_LOOP=asyncio "
+    'in the environment of that command, or loop="asyncio" in uvicorn.run()), or call '
+    "activate() before uvloop is imported: it is then kept from loading, and a server that "
+    "chooses it automatically falls back on its own."
 )
 
 # DNS resolution events to intercept outside getaddrinfo.
@@ -951,7 +952,9 @@ def _refuse_uvloop_import() -> None:
             "tethered: refused to load uvloop while a policy is active — nothing that goes "
             "through a uvloop event loop is seen by tethered. A server that chooses its "
             "event loop automatically now runs on the standard asyncio event loop, where "
-            "the policy is enforced; code that requires uvloop fails with ImportError."
+            "the policy is enforced; code that requires uvloop fails with ImportError. Name "
+            "the standard loop in the server's configuration (uvicorn: --loop asyncio) and "
+            "this is not logged."
         )
     raise ImportError(_UVLOOP_IMPORT_REFUSED_MSG, name="uvloop")
 
@@ -3417,6 +3420,11 @@ def activate(
     # _refuse_uvloop_import).  A log-only policy refuses nothing, this
     # included, and gets the warning.
     if not log_only and "uvloop" in sys.modules:
+        # Logged as well as raised.  The exception does not always reach
+        # anyone: uvicorn takes any error in a hand-written ASGI lifespan
+        # handler for "lifespan not supported" and goes on to serve, with no
+        # policy and, but for this line, no trace of why.
+        logger.error(_UVLOOP_LOADED_MSG)
         raise RuntimeError(_UVLOOP_LOADED_MSG)
     if _uvloop_warning_pending:
         _warn_if_uvloop()
