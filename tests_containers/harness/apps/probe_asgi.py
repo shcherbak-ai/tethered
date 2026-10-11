@@ -10,6 +10,8 @@ It activates tethered when it is imported, as ``TETH_ACTIVATE`` says (see
     /datagram_connected    create_datagram_endpoint(remote_addr=...), one datagram
     /datagram_unconnected  create_datagram_endpoint(local_addr=...), sendto(data, addr)
     /to_thread             a blocking socket connection in asyncio.to_thread
+    /run_in_executor       a blocking socket connection in loop.run_in_executor
+    /thread                a blocking socket connection in a thread started for it
     /connect               a blocking socket connection in the event loop itself
     /child                 launch a Python child that tries host:port itself and reports
                            (how=executable|clean_env|no_site|path_python)
@@ -18,7 +20,9 @@ It activates tethered when it is imported, as ``TETH_ACTIVATE`` says (see
 
 Common parameters: ``uncaught=1`` lets the exception of a failed operation
 reach the server instead of reporting it; ``hold=<seconds>`` blocks the event
-loop before the answer, so that the other workers get the next requests.
+loop before the answer, so that the other workers get the next requests;
+``scope=<rule>,<rule>`` runs the operation inside a ``tethered.scope()`` with
+those rules (see ``probe_common.scoped``).
 
 Which event loop this runs on is the server's decision (``/whoami`` reports
 its class).  tethered sees these operations on asyncio's own loops only.
@@ -29,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl
 
@@ -159,6 +164,15 @@ async def _to_thread(host: str, port: int, params: dict[str, str]) -> dict[str, 
     return await asyncio.to_thread(probe_common.tcp_connect, host, port)
 
 
+async def _run_in_executor(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, probe_common.tcp_connect, host, port)
+
+
+async def _thread(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
+    return probe_common.connect_in_thread(host, port)
+
+
 async def _connect(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
     return probe_common.tcp_connect(host, port)
 
@@ -188,10 +202,28 @@ OPERATIONS: dict[str, Callable[[str, int, dict[str, str]], Awaitable[dict[str, A
     "datagram_connected": _datagram_connected,
     "datagram_unconnected": _datagram_unconnected,
     "to_thread": _to_thread,
+    "run_in_executor": _run_in_executor,
+    "thread": _thread,
     "connect": _connect,
     "child": _child,
     "tool": _tool,
 }
+
+
+async def _run_scoped(
+    op: str, host: str, port: int, params: dict[str, str], report: dict[str, Any]
+) -> dict[str, Any]:
+    """The asynchronous counterpart of ``probe_common.run_scoped``: the wait does not block."""
+    wait = float(params.get("scope_wait", "0"))
+    with probe_common.scoped(params):
+        if not wait:
+            return await OPERATIONS[op](host, port, params)
+        report["scope_entered"] = time.time()
+        try:
+            await asyncio.sleep(wait)
+            return await OPERATIONS[op](host, port, params)
+        finally:
+            report["scope_left"] = time.time()
 
 
 async def _respond(send: Callable[..., Awaitable[None]], status: int, report: dict) -> None:
@@ -230,10 +262,11 @@ async def app(scope: dict[str, Any], receive: Callable[..., Any], send: Callable
         host, port = params["host"], int(params["port"])
         report = {"op": op, "host": host, "port": port, **probe_common.whoami(_loop_name())}
         if params.get("uncaught"):
-            report.update(await OPERATIONS[op](host, port, params), outcome="reached")
+            report.update(await _run_scoped(op, host, port, params, report), outcome="reached")
         else:
             try:
-                report.update(await OPERATIONS[op](host, port, params), outcome="reached")
+                done = await _run_scoped(op, host, port, params, report)
+                report.update(done, outcome="reached")
             except Exception as exc:
                 report.update(probe_common.describe_failure(exc))
     else:

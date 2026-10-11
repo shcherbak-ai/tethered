@@ -14,10 +14,12 @@ worker as they do for a web server: the ``pid`` of a report is the process that
 ran the task.
 
 The operations are those of the WSGI probe application (``harness/apps``):
-``whoami``, ``connect``, ``urllib``, ``child`` (``how=...``) and ``tool``, with
-``uncaught=1`` to let the exception out of the task and ``hold=<seconds>`` to
-keep the worker busy.  ``record=1`` also appends the report to the file named
-by ``TC_RECORD``, for tasks nobody waits for (scheduled ones).
+``whoami``, ``connect``, ``urllib``, ``thread``, ``child`` (``how=...``) and
+``tool``, with ``uncaught=1`` to let the exception out of the task,
+``hold=<seconds>`` to keep the worker busy and ``scope=<rule>,<rule>`` to run
+the operation inside a ``tethered.scope()`` (see ``probe_common.scoped``).
+``record=1`` also appends the report to the file named by ``TC_RECORD``, for
+tasks nobody waits for (scheduled ones).
 
 This file is the same in every worker suite; a suite directory is all an
 image gets, so it cannot be shared.  It never imports the ``harness`` package
@@ -52,6 +54,10 @@ def _urllib(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
     return probe_common.urllib_get(host, port)
 
 
+def _thread(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
+    return probe_common.connect_in_thread(host, port)
+
+
 def _child(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
     argv, popen_args = probe_common.child_argv(params.get("how", "executable"), host, port)
     return probe_common.launch(argv, **popen_args)
@@ -64,6 +70,7 @@ def _tool(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
 OPERATIONS: dict[str, Callable[[str, int, dict[str, str]], dict[str, Any]]] = {
     "connect": _connect,
     "urllib": _urllib,
+    "thread": _thread,
     "child": _child,
     "tool": _tool,
 }
@@ -90,11 +97,14 @@ def perform(op: str, params: dict[str, str]) -> dict[str, Any]:
     else:
         host, port = params["host"], int(params["port"])
         report = {"op": op, "host": host, "port": port, **who}
+        operation = OPERATIONS[op]
         if params.get("uncaught"):
-            report.update(OPERATIONS[op](host, port, params), outcome="reached")
+            done = probe_common.run_scoped(operation, host, port, params, report)
+            report.update(done, outcome="reached")
         else:
             try:
-                report.update(OPERATIONS[op](host, port, params), outcome="reached")
+                done = probe_common.run_scoped(operation, host, port, params, report)
+                report.update(done, outcome="reached")
             except Exception as exc:
                 report.update(probe_common.describe_failure(exc))
     probe_common.hold(params)

@@ -20,6 +20,7 @@ harness starts.  They never import the ``harness`` package.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -29,13 +30,18 @@ import sys
 import threading
 import time
 import urllib.request
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 #: What every probe application allows, unless ``TETH_ALLOW`` says otherwise.
 DEFAULT_ALLOW = "allowed.test:9001"
 ACTIVATE_FLAGS = ("none", "plain", "locked", "fail_closed", "log_only")
 REQUEST = b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n"
 CHILD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_child.py")
+#: The label of the scope a request asks for (``scope=...``).
+SCOPE_LABEL = "probe-scope"
 #: The process in which this module was imported: the master, under a preloading server.
 IMPORTED_IN_PID = os.getpid()
 #: The external tool: bash makes the connection itself ($0 is the host, $1 the port).
@@ -114,6 +120,9 @@ def describe_failure(exc: BaseException) -> dict[str, Any]:
     if refusal is not None and refusal is not exc:
         # A refusal delivered inside an exception group: say what it was.
         report["refusal"] = {"exception": _type_name(refusal), "message": str(refusal)}
+    if getattr(refusal, "scope_label", None):
+        # Which scope refused it; absent when the policy of the process did.
+        report["scope_label"] = refusal.scope_label  # type: ignore[union-attr]
     notes = getattr(exc, "__notes__", None)
     if notes:
         report["notes"] = list(notes)
@@ -164,6 +173,54 @@ def whoami(loop: str | None = None) -> dict[str, Any]:
     }
 
 
+# ── A scope around the operation ──────────────────────────────────────
+
+
+def scoped(params: dict[str, str]) -> contextlib.AbstractContextManager[Any]:
+    """The scope a request asks for with ``scope=<rule>,<rule>``, or no scope at all.
+
+    The operation of the request then runs inside ``tethered.scope(allow=[...],
+    label="probe-scope")``.  ``scope=`` with nothing after it is a scope that
+    allows nothing; ``scope_log_only=1`` makes the scope log-only.  This is
+    the only place a probe application imports tethered for a request.
+    """
+    rules = params.get("scope")
+    if rules is None:
+        return contextlib.nullcontext()
+    import tethered
+
+    return tethered.scope(
+        allow=[rule for rule in rules.split(",") if rule],
+        label=SCOPE_LABEL,
+        log_only=bool(params.get("scope_log_only")),
+    )
+
+
+def run_scoped(
+    operation: Callable[[str, int, dict[str, str]], dict[str, Any]],
+    host: str,
+    port: int,
+    params: dict[str, str],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry out a blocking operation, inside the scope the request asks for if it asks for one.
+
+    ``scope_wait=<seconds>`` sleeps inside the scope before the operation,
+    so that a test can let another request run in the meantime; ``report``
+    is then told when the scope was entered and left (``time.time()``).
+    """
+    wait = float(params.get("scope_wait", "0"))
+    with scoped(params):
+        if not wait:
+            return operation(host, port, params)
+        report["scope_entered"] = time.time()
+        try:
+            time.sleep(wait)
+            return operation(host, port, params)
+        finally:
+            report["scope_left"] = time.time()
+
+
 # ── Blocking operations ───────────────────────────────────────────────
 
 
@@ -175,6 +232,24 @@ def tcp_connect(host: str, port: int) -> dict[str, Any]:
         while chunk := sock.recv(4096):
             data += chunk
     return {"reply": last_line(data)}
+
+
+def connect_in_thread(host: str, port: int) -> dict[str, Any]:
+    """A blocking connection in a thread started for it; what it raises is raised here."""
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["report"] = tcp_connect(host, port)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=work, name="probe-thread")
+    thread.start()
+    thread.join(30.0)
+    if "error" in outcome:
+        raise outcome["error"]
+    return {**outcome["report"], "ran_in": thread.name}
 
 
 def urllib_get(host: str, port: int) -> dict[str, Any]:

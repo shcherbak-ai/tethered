@@ -104,6 +104,7 @@ tests_containers/
         plugin.py             the pytest plugin: the world fixture, teardown, logs on failure
         helpers.py            constants, the world's counters, HTTP
         servers.py            start_server and run_python: the processes under test
+        scopes.py             checks of tethered.scope() that suites run against their own servers
         world.py              the destinations
         requirements.txt      pytest, pinned
         apps/                 the shared applications under test
@@ -213,11 +214,17 @@ Every route but `/whoami` takes `host` and `port`.
 | `/datagram_connected` | ASGI | `create_datagram_endpoint(remote_addr=...)` and one datagram. |
 | `/datagram_unconnected` | ASGI | `create_datagram_endpoint(local_addr=...)` and `sendto(data, addr)`. |
 | `/to_thread` | ASGI | A blocking socket connection in `asyncio.to_thread`. |
+| `/run_in_executor` | ASGI | A blocking socket connection in `loop.run_in_executor`. |
+| `/thread` | both | A blocking socket connection in a thread started for it. |
 | `/child` | both | Launches a Python child that tries `host:port` itself and prints its own report. `how=executable` (the default: `sys.executable`), `clean_env` (an explicit `env=` without the policy variable), `no_site` (`sys.executable -S`), `path_python` (`python3` from `PATH`). |
 | `/tool` | both | Launches an external tool (bash) that connects to `host:port` itself. |
 | `/whoami` | both | No operation: pid, parent pid, the pid the application was imported in, thread, interpreter id, event loop class, and whether tethered is imported, active, locked. |
 
 Parameters for every route: `uncaught=1` lets the exception of a failed operation reach the server instead of being reported (for "what does the server do with an uncaught `EgressBlocked`"), and `hold=<seconds>` keeps the worker busy before it answers (which is how `each_worker` reaches all of them).
+
+`scope=<rule>,<rule>` runs the operation inside `tethered.scope(allow=[...], label="probe-scope")`; `scope=` with nothing after it is a scope that allows nothing, and `scope_log_only=1` makes the scope log-only. `scope_wait=<seconds>` waits inside the scope before the operation, without blocking the other requests of the process, and the report then says when the scope was entered and left (`scope_entered`, `scope_left`). A refusal that came from a scope has `scope_label` in its report; one from the policy of the process has not. The task probes of the worker suites (`taskprobe.py`) take the same parameters.
+
+`harness/scopes.py` has the checks built on this, for a suite to run against its own server: `narrows(probe, op)`, `cannot_widen(probe, op)`, `overlapping(probe, op)` (two requests at the same time in one process, one inside a scope) and `child_is_held_to_the_scope(probe)`. `probe` is `Server.probe` or anything that takes the same arguments; `scopes.env()` is the environment of a server whose policy leaves a scope something to take away.
 
 A report has the fields of `/whoami` plus:
 
