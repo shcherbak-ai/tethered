@@ -1,0 +1,3 @@
+# Huey with Redis storage.
+huey==3.4.0
+redis==8.1.0

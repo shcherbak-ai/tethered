@@ -1,0 +1,14 @@
+description = "Huey: thread and process workers, recycled and replaced worker processes, restart, with Redis"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# redis-server is the queue and the result store, on 127.0.0.1.
+apt = ["redis-server"]
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["huey", "redis"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
