@@ -1,0 +1,2 @@
+# waitress is pure Python and has no dependencies.
+waitress==3.0.2
