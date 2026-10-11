@@ -30,6 +30,7 @@ from harness import (
     ALLOWED_ADDR,
     ALLOWED_NAME,
     ALLOWED_PORT,
+    FORBIDDEN_ADDR,
     FORBIDDEN_NAME,
     OTHER_PORT,
     Server,
@@ -145,6 +146,24 @@ def paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "g.sock", tmp_path / "g.pid"
 
 
+def gunicorn(application: str, paths: tuple[Path, Path], preload: bool) -> list[str]:
+    """Two sync workers on a TCP and a unix listener, with a pid file."""
+    socket_path, pid_file = paths
+    return [
+        "gunicorn",
+        application,
+        "--bind",
+        "127.0.0.1:{port}",
+        "--bind",
+        f"unix:{socket_path}",
+        "--workers",
+        "2",
+        "--pid",
+        str(pid_file),
+        *(["--preload"] if preload else []),
+    ]
+
+
 ARRANGEMENTS = [
     pytest.param("locked", None, True, id="locked-preload"),
     pytest.param("locked", "block", True, id="locked-block-preload"),
@@ -161,21 +180,8 @@ def test_sigusr2_starts_a_new_master_whose_workers_enforce_the_policy(
     socket_path, pid_file = paths
     new_pid_file = pid_file.with_name(pid_file.name + ".2")
     locked = activate == "locked"
-    command = [
-        "gunicorn",
-        "probe_wsgi:application",
-        "--bind",
-        "127.0.0.1:{port}",
-        "--bind",
-        f"unix:{socket_path}",
-        "--workers",
-        "2",
-        "--pid",
-        str(pid_file),
-        *(["--preload"] if preload else []),
-    ]
     env = {"TETH_ACTIVATE": activate, **({"TETH_ESP": esp} if esp else {})}
-    server = start_server(command, env=env)
+    server = start_server(gunicorn("probe_wsgi:application", paths, preload), env=env)
     old_master = server.pid
     assert int(pid_file.read_text()) == old_master
     # The environment gunicorn saved, and will re-execute with, has no policy in it.
@@ -268,4 +274,107 @@ def test_sigusr2_starts_a_new_master_whose_workers_enforce_the_policy(
     assert not socket_path.exists()
     assert not pid_file.exists()
     # The harness started the old master: its exit status, and nothing left to kill.
+    assert server.stop(check=False) == 0
+
+
+# ── An upgrade to a release that asks for another policy ──────────────
+
+TO_FORBIDDEN = probe_path("connect", FORBIDDEN_NAME, OTHER_PORT)
+DEFAULT_RULE = f"{ALLOWED_NAME}:{ALLOWED_PORT}"
+#: The rule the new release adds: it allows what the old policy forbids.
+ADDED_RULE = f"{FORBIDDEN_NAME}:{OTHER_PORT}"
+#: How gunicorn reports the exception that ends the new master while it preloads.
+LOCKED_AND_DIFFERENT = (
+    r"Error: tethered: activate\(\) blocked — a locked policy is active and the "
+    r"requested policy differs from it"
+)
+
+
+def allow_file(tmp_path: Path, *rules: str) -> Path:
+    path = tmp_path / "allow.txt"
+    path.write_text("\n".join(rules) + "\n", encoding="utf-8")
+    return path
+
+
+def start_then_change_the_policy(
+    tmp_path: Path, paths: tuple[Path, Path], activate: str, preload: bool
+) -> tuple[Server, dict[int, Any]]:
+    """A server under the default allow list, whose next import of the application adds a rule."""
+    rules = allow_file(tmp_path, DEFAULT_RULE)
+    env = {"TETH_ACTIVATE": activate, "TETH_ALLOW_FILE": str(rules)}
+    server = start_server(gunicorn("policy_from_file:application", paths, preload), env=env)
+    workers = server.each_worker(TO_FORBIDDEN, 2)
+    for report in workers.values():
+        assert report["outcome"] == "blocked", report
+    assert arrivals() == {}
+    allow_file(tmp_path, DEFAULT_RULE, ADDED_RULE)
+    return server, workers
+
+
+def test_an_upgrade_cannot_change_a_locked_policy_that_the_master_holds(
+    tmp_path: Path, paths: tuple[Path, Path]
+) -> None:
+    """Limit: under ``--preload`` the master holds the locked policy and the new master is
+    executed under it.  A new release that asks for another policy gets ``TetheredLocked``
+    when the new master imports it; the new master does not start, and the old one goes on
+    serving under the old policy.  Stop and start gunicorn to change a locked policy.
+    """
+    socket_path, pid_file = paths
+    server, old_workers = start_then_change_the_policy(tmp_path, paths, "locked", True)
+
+    server.send_signal(signal.SIGUSR2)
+    server.wait_log(LOCKED_AND_DIFFERENT)
+    wait_until(
+        lambda: sorted(server.pids()) == sorted([server.pid, *old_workers]),
+        "the new master is gone, and the old master and its workers are all there is",
+    )
+    assert not pid_file.with_name(pid_file.name + ".2").exists()
+    assert int(pid_file.read_text()) == server.pid
+
+    # The old server is untouched: both listeners, the old workers, the old policy.
+    for report in server.each_worker(TO_FORBIDDEN, 2).values():
+        assert report["pid"] in old_workers
+        assert report["outcome"] == "blocked", report
+    report = unix_get(socket_path, TO_FORBIDDEN)
+    assert report["pid"] in old_workers
+    assert report["outcome"] == "blocked", report
+    assert arrivals() == {}
+
+
+@pytest.mark.parametrize(
+    ("activate", "preload"),
+    [
+        pytest.param("locked", False, id="locked-no-preload"),
+        pytest.param("plain", True, id="unlocked-preload"),
+        pytest.param("plain", False, id="unlocked-no-preload"),
+    ],
+)
+def test_an_upgrade_changes_the_policy_when_no_lock_is_handed_on(
+    tmp_path: Path, paths: tuple[Path, Path], activate: str, preload: bool
+) -> None:
+    # Without --preload a master holds no policy, so the workers of the new
+    # master lock what the new release asks for.  An unlocked policy that
+    # the new master inherited is replaced when it imports the new release.
+    _, pid_file = paths
+    server, old_workers = start_then_change_the_policy(tmp_path, paths, activate, preload)
+
+    server.send_signal(signal.SIGUSR2)
+    new_pid_file = pid_file.with_name(pid_file.name + ".2")
+    new_master = int(
+        wait_until(
+            lambda: new_pid_file.exists() and new_pid_file.read_text().strip(),
+            "the new master writes its pid file",
+        )
+    )
+    for report in server.each_worker(TO_FORBIDDEN, 2, exclude=old_workers).values():
+        assert report["ppid"] == new_master
+        assert (report["active"], report["locked"]) == (True, activate == "locked"), report
+        assert report["outcome"] == "reached", report
+    # Only the new workers let it through; the old ones, still serving, refuse it.
+    assert set(arrivals()) == {f"{FORBIDDEN_ADDR}:{OTHER_PORT}/tcp"}
+
+    server.send_signal(signal.SIGTERM)
+    wait_until(lambda: not server.running, "the old master exits after SIGTERM")
+    server.send_signal(signal.SIGTERM, new_master)
+    wait_until(lambda: not server.pids(), "the new master and its workers exit after SIGTERM")
     assert server.stop(check=False) == 0

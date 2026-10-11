@@ -1,4 +1,4 @@
-description = "gunicorn: sync and gthread workers, with and without --preload, worker replacement, reload"
+description = "gunicorn: sync and gthread workers, with and without --preload, worker replacement, reload, binary upgrade"
 
 # tests_containers/images/<image>.Dockerfile
 image = "base"
