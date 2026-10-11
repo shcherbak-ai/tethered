@@ -1,0 +1,14 @@
+description = "RQ: a work horse forked or spawned per job, SimpleWorker, worker-pool, the scheduler, with Redis"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# redis-server is the queue, on 127.0.0.1.
+apt = ["redis-server"]
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["rq", "redis"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
