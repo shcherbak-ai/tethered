@@ -1246,7 +1246,9 @@ class TestJoinedInterpreter:
         assert result["state"]["locked"] is True
         assert result["state"]["log_only"] is True
         assert result["state"]["verify"] is True
-        assert result["warnings"] == [f"tethered: blocked connect to 127.0.0.1:{ports.forbidden}"]
+        assert result["warnings"] == [
+            f"tethered: would block connect to 127.0.0.1:{ports.forbidden}"
+        ]
 
     def test_a_process_it_launches_carries_the_locked_policy(self, ports, subinterpreter):
         """Launches are its own Python hook's to judge, and the child inherits the policy.
@@ -1524,11 +1526,11 @@ class TestLockedLogOnlyPolicy:
         assert result.pop("config") == [True, True]
         assert result.pop("quiet so far") == []
         warnings = result.pop("warnings")
-        assert "tethered: blocked connect to 203.0.113.9:443" in warnings
-        assert "tethered: blocked getaddrinfo for host.test" in warnings
+        assert "tethered: would block connect to 203.0.113.9:443" in warnings
+        assert "tethered: would block getaddrinfo for host.test" in warnings
         # One line per event, and once the hint that goes with the first
         # address nothing is known about.
-        blocked = [line for line in warnings if line.startswith("tethered: blocked ")]
+        blocked = [line for line in warnings if line.startswith("tethered: would block ")]
         assert len(blocked) == len(events["connect"]) + len(events["lookup"])
         (hint,) = [line for line in warnings if line not in blocked]
         assert hint.startswith("tethered: no hostname is known for the refused address 203.0.113.9")
@@ -1668,7 +1670,7 @@ class TestLockedLogOnlyPolicy:
         assert result["by name warnings"] == []
         assert result["elsewhere"] == "ok"
         blocked, hint = result["warnings"]
-        assert blocked == "tethered: blocked connect to 203.0.113.9:443"
+        assert blocked == "tethered: would block connect to 203.0.113.9:443"
         # The address is one no name was ever looked up for: said once.
         assert hint.startswith("tethered: no hostname is known for the refused address 203.0.113.9")
         # The extension loads in an interpreter of either kind, so the lookup

@@ -278,14 +278,14 @@ class TestLogOnly:
         report = log_only.probe(op, host, port)
         assert report["outcome"] == "reached", report
         assert sum(arrivals().values()) == 1, arrivals()
-        assert "tethered: blocked" not in log_only.log_of_this_test, log_only.log_of_this_test
+        assert "tethered: would block" not in log_only.log_of_this_test, log_only.log_of_this_test
 
     def test_a_lookup_made_through_the_loop_is_not_reported(self, log_only: Server) -> None:
         """Limit: nor a name lookup."""
         report = log_only.probe("getaddrinfo", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert report["addresses"] == [FORBIDDEN_ADDR]
-        assert "tethered: blocked" not in log_only.log_of_this_test, log_only.log_of_this_test
+        assert "tethered: would block" not in log_only.log_of_this_test, log_only.log_of_this_test
 
     @pytest.mark.parametrize(
         ("op", "host"),
@@ -302,7 +302,7 @@ class TestLogOnly:
         report = log_only.probe(op, host, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {f"{FORBIDDEN_ADDR}:{OTHER_PORT}/udp": 1}
-        assert "tethered: blocked" not in log_only.log_of_this_test, log_only.log_of_this_test
+        assert "tethered: would block" not in log_only.log_of_this_test, log_only.log_of_this_test
 
     def test_a_launch_made_through_the_loop_is_not_reported(self, log_only: Server) -> None:
         """Limit: nor a process launch; on the standard loop this one is warned about."""
@@ -318,7 +318,7 @@ class TestLogOnly:
         report = log_only.probe(op, FORBIDDEN_ADDR, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        log_only.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        log_only.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
 
 def test_log_only_on_the_standard_loop_reports_what_uvloop_hides() -> None:
@@ -326,8 +326,8 @@ def test_log_only_on_the_standard_loop_reports_what_uvloop_hides() -> None:
     server = start_server([*UVICORN, "--loop=asyncio"], env={"TETH_ACTIVATE": "log_only"})
     assert server.get("/whoami").json()["loop"] == STANDARD_LOOP
     assert server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)["outcome"] == "reached"
-    server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-    server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+    server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+    server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
     assert server.probe("tool", FORBIDDEN_NAME, OTHER_PORT)["outcome"] == "reached"
     server.wait_log(r"external subprocess launch detected: subprocess\.Popen\(bash\)")
     assert UVLOOP_WARNING not in server.log

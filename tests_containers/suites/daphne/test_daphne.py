@@ -461,8 +461,8 @@ class TestNotEnforcing:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
     @pytest.mark.parametrize("op", TWISTED_OPS)
     def test_log_only_reports_what_twisted_does_and_lets_it_through(self, op: str) -> None:
@@ -471,5 +471,5 @@ class TestNotEnforcing:
         assert report["outcome"] == "reached", report
         assert report["seconds"] < CONNECT_TIMEOUT
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")

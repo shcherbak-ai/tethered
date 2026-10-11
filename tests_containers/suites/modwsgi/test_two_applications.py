@@ -502,9 +502,9 @@ class TestImportedAtTheFirstRequest:
         assert outside_the_lock(whoami(server, other))
 
         is_unrestricted(server, f"/{other}")
-        assert "tethered: blocked" not in server.log
+        assert "tethered: would block" not in server.log
         is_unrestricted(server, f"/{holder}")
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
 
         reset_arrivals()
         launch = ask(server, f"/{other}", "child", FORBIDDEN_NAME, OTHER_PORT)

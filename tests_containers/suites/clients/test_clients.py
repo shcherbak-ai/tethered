@@ -249,12 +249,15 @@ def test_limit_ctypes_find_library_is_refused_when_external_launches_are_blocked
 def test_a_log_only_policy_reports_the_client_it_sees() -> None:
     batch = measure.run_batch(catalog.TABLE["requests"], measure.under("log_only"))
     assert arrived(batch) == ALL_FOUR
-    assert f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}" in batch.stderr["forbidden_name"]
     assert (
-        f"tethered: blocked connect to {FORBIDDEN_ADDR}:9003" in batch.stderr["forbidden_address"]
+        f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}" in batch.stderr["forbidden_name"]
     )
-    assert f"tethered: blocked connect to {ALLOWED_NAME}:9003" in batch.stderr["other_port"]
-    assert "tethered: blocked" not in batch.stderr["allowed"]
+    assert (
+        f"tethered: would block connect to {FORBIDDEN_ADDR}:9003"
+        in batch.stderr["forbidden_address"]
+    )
+    assert f"tethered: would block connect to {ALLOWED_NAME}:9003" in batch.stderr["other_port"]
+    assert "tethered: would block" not in batch.stderr["allowed"]
 
 
 def test_limit_a_log_only_policy_reports_nothing_for_a_client_it_does_not_see() -> None:
@@ -263,7 +266,7 @@ def test_limit_a_log_only_policy_reports_nothing_for_a_client_it_does_not_see() 
     assert arrived(batch) == ALL_FOUR
     for case in ALL_FOUR:
         assert "tethered: activated" in batch.stderr[case]
-        assert "tethered: blocked" not in batch.stderr[case]
+        assert "tethered: would block" not in batch.stderr[case]
 
 
 def test_limit_a_log_only_policy_reports_the_allowed_host_of_a_client_that_resolves_itself() -> (
@@ -272,9 +275,11 @@ def test_limit_a_log_only_policy_reports_the_allowed_host_of_a_client_that_resol
     """Limit: the allowed host is reported as blocked, by its address, and so is every other."""
     batch = measure.run_batch(catalog.TABLE["aiohttp-aiodns"], measure.under("log_only"))
     assert arrived(batch) == ALL_FOUR
-    assert f"tethered: blocked connect to {ALLOWED_ADDR}:9001" in batch.stderr["allowed"]
+    assert f"tethered: would block connect to {ALLOWED_ADDR}:9001" in batch.stderr["allowed"]
     # The forbidden name is reported by its address too: tethered never saw the name.
-    assert f"tethered: blocked connect to {FORBIDDEN_ADDR}:9002" in batch.stderr["forbidden_name"]
+    assert (
+        f"tethered: would block connect to {FORBIDDEN_ADDR}:9002" in batch.stderr["forbidden_name"]
+    )
     assert FORBIDDEN_NAME not in batch.stderr["forbidden_name"]
 
 

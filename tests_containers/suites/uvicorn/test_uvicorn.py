@@ -250,8 +250,8 @@ class TestNotEnforcing:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
 
 # ── --workers ─────────────────────────────────────────────────────────

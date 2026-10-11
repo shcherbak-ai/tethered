@@ -259,6 +259,51 @@ class TestLogOnly:
         assert len(blocked) > 0
         assert blocked[0][0] == "dns.google"
 
+    def test_the_log_says_would_block_for_what_goes_ahead(self, caplog):
+        """A line that said "blocked" read like a connection that was stopped."""
+        tethered.activate(allow=["*.example.com"], allow_localhost=False, log_only=True)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook("socket.connect", (None, ("192.0.2.1", 80)))
+            _audit_hook("socket.connect", (None, (b"\xff\xfe", 80)))
+            _audit_hook("socket.gethostbyname", ("elsewhere.test",))
+            _audit_hook("socket.getaddrinfo", ("localhost", 80, 0, 0, 0))
+        assert [r.getMessage() for r in caplog.records] == [
+            "tethered: would block connect to 192.0.2.1:80",
+            "tethered: would block connect for <unreadable (b'\\xff\\xfe', 80)> "
+            "(cannot be checked against the allow list)",
+            "tethered: would block socket.gethostbyname for elsewhere.test",
+            "tethered: would block getaddrinfo for localhost",
+        ]
+
+    def test_an_enforcing_policy_still_says_blocked(self, caplog):
+        tethered.activate(allow=["*.example.com"])
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.EgressBlocked),
+        ):
+            _audit_hook("socket.connect", (None, ("192.0.2.1", 80)))
+        assert [r.getMessage() for r in caplog.records] == [
+            "tethered: blocked connect to 192.0.2.1:80"
+        ]
+
+    def test_a_log_only_scope_says_would_block_and_an_enforcing_one_blocked(self, caplog):
+        quiet = tethered.scope(allow=[], allow_localhost=False, log_only=True, label="quiet")
+        strict = tethered.scope(allow=[], allow_localhost=False, label="strict")
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            quiet,
+            strict,
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook("socket.connect", (None, ("192.0.2.1", 80)))
+        assert exc_info.value.scope_label == "strict"
+        assert [r.getMessage() for r in caplog.records] == [
+            "tethered: quiet would block connect to 192.0.2.1:80 for 192.0.2.1 "
+            "(allowed by global policy)",
+            "tethered: strict blocked connect to 192.0.2.1:80 for 192.0.2.1 "
+            "(allowed by global policy)",
+        ]
+
 
 class TestOnBlocked:
     def test_callback_receives_host_and_port(self):

@@ -261,10 +261,10 @@ class TestCurlHttpClient:
         report = server.probe("http_client", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        assert "tethered: blocked" not in server.log, server.log
+        assert "tethered: would block" not in server.log, server.log
         # A connection made by tornado's own client is reported.
         server.probe("tcp_client", FORBIDDEN_NAME, OTHER_PORT)
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
 
 
 # ── fork_processes ────────────────────────────────────────────────────
@@ -403,5 +403,5 @@ class TestNotEnforcing:
         report = server.probe("http_client", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")

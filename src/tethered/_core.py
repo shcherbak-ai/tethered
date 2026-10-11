@@ -1168,6 +1168,16 @@ def _check_scopes(
     return denying
 
 
+def _refusal_verb(log_only: bool) -> str:
+    """Return the word the log uses for a call that a policy or scope does not allow.
+
+    A log-only layer refuses nothing: the call goes ahead.  A line that says
+    "blocked" for it reads, to whoever looks at the log later, like a
+    connection that was stopped.
+    """
+    return "would block" if log_only else "blocked"
+
+
 def _enforce_scope_block(
     sc: _ScopeConfig,
     host: str,
@@ -1184,7 +1194,14 @@ def _enforce_scope_block(
     denying scope; raises for an enforcing one.
     """
     extra = " (allowed by global policy)" if global_allowed else ""
-    logger.warning("tethered: %s blocked %s for %s%s", sc.label, event_desc, host, extra)
+    logger.warning(
+        "tethered: %s %s %s for %s%s",
+        sc.label,
+        _refusal_verb(sc.log_only),
+        event_desc,
+        host,
+        extra,
+    )
 
     if sc.on_blocked is not None:
         try:
@@ -1226,7 +1243,10 @@ def _deny_unreadable(
 
     if cfg is not None:
         logger.warning(
-            "tethered: blocked %s for %s (cannot be checked against the allow list)", what, host
+            "tethered: %s %s for %s (cannot be checked against the allow list)",
+            _refusal_verb(cfg.log_only),
+            what,
+            host,
         )
 
         if cfg.on_blocked is not None:
@@ -1333,7 +1353,7 @@ def _handle_dns_lookup(
 
         if not allowed:
             global_allowed = False
-            logger.warning("tethered: blocked %s for %s", event, host_lower)
+            logger.warning("tethered: %s %s for %s", _refusal_verb(cfg.log_only), event, host_lower)
 
             if cfg.on_blocked is not None:
                 try:
@@ -1446,7 +1466,9 @@ def _handle_getaddrinfo(
 
         if not allowed:
             global_allowed = False
-            logger.warning("tethered: blocked getaddrinfo for %s", host_lower)
+            logger.warning(
+                "tethered: %s getaddrinfo for %s", _refusal_verb(cfg.log_only), host_lower
+            )
 
             if cfg.on_blocked is not None:
                 try:
@@ -1732,7 +1754,8 @@ def _handle_connect(
             global_allowed = False
             display = resolved_from if resolved_from and resolved_from != host else host
             logger.warning(
-                "tethered: blocked %s to %s:%s%s",
+                "tethered: %s %s to %s:%s%s",
+                _refusal_verb(cfg.log_only),
                 event.split(".")[-1],
                 display,
                 port,

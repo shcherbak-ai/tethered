@@ -228,7 +228,7 @@ class TestLoopChoice:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        assert "tethered: blocked" not in server.log, server.log
+        assert "tethered: would block" not in server.log, server.log
 
     def test_log_only_on_the_standard_loop_reports_although_it_warns_about_uvloop(self) -> None:
         # The other side of the limit above: uvloop is installed and loaded
@@ -240,8 +240,8 @@ class TestLoopChoice:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
 
 # ── One worker on each loop a policy is enforced on ───────────────────
@@ -393,10 +393,10 @@ class TestUnconnectedDatagrams:
         report = server.probe("datagram_unconnected", FORBIDDEN_ADDR, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN_UDP: 1}
-        assert "tethered: blocked" not in server.log, server.log
+        assert "tethered: would block" not in server.log, server.log
         # A connection from the same worker is reported.
         server.probe("open_connection", FORBIDDEN_ADDR, OTHER_PORT)
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
 
 # ── What an audit hook sees of rloop, with no tethered involved ───────
@@ -703,5 +703,5 @@ class TestNotEnforcing:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")

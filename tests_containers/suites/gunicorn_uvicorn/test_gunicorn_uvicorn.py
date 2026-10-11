@@ -274,7 +274,7 @@ class TestOtherPolicies:
         assert set(arrivals()) == {AT_FORBIDDEN}
         log = server.log
         assert log.count(UVLOOP_WARNING) == 2, log
-        assert "tethered: blocked" not in log, log
+        assert "tethered: would block" not in log, log
 
     @pytest.mark.parametrize(
         "worker_class", ["uvicorn.workers.UvicornH11Worker", "uvicorn_worker.UvicornH11Worker"]

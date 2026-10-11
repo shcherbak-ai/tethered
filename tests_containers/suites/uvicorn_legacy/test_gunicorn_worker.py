@@ -159,4 +159,4 @@ def test_under_a_log_only_policy_the_workers_run_on_uvloop_and_report_nothing() 
         assert report["outcome"] == "reached", report
     assert set(arrivals()) == {AT_FORBIDDEN}
     assert server.log.count(UVLOOP_WARNING) == 2, server.log
-    assert "tethered: blocked" not in server.log, server.log
+    assert "tethered: would block" not in server.log, server.log

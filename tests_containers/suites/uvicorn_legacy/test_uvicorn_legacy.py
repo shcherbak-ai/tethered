@@ -320,8 +320,8 @@ class TestLogOnly:
         report = server.probe("open_connection", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
-        assert "tethered: blocked" not in server.log, server.log
+        assert "tethered: would block" not in server.log, server.log
 
         report = server.probe("to_thread", FORBIDDEN_ADDR, OTHER_PORT)
         assert report["outcome"] == "reached", report
-        server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")

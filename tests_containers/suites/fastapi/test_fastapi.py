@@ -367,7 +367,7 @@ def test_under_a_log_only_policy_fastapi_run_serves_on_uvloop_and_reports_nothin
     """Limit: a log-only policy does not keep uvloop out, and on uvloop it sees no async call.
 
     The request to a forbidden host is answered with 200, the connection
-    arrives, and no "tethered: blocked" line is written for it: what a
+    arrives, and no "tethered: would block" line is written for it: what a
     log-only policy is run for, the list of what would be blocked, stays
     empty for everything that goes through the loop.  One warning at
     startup says so.
@@ -382,11 +382,11 @@ def test_under_a_log_only_policy_fastapi_run_serves_on_uvloop_and_reports_nothin
     assert reply.status == 200, reply.text
     assert reply.json()["reply"] == f"reached {FORBIDDEN_ADDR}:{OTHER_PORT}"
     assert arrivals() == {AT_FORBIDDEN: 1}
-    assert "tethered: blocked" not in server.log, server.log
+    assert "tethered: would block" not in server.log, server.log
 
     # The synchronous client uses the socket module and is reported.
     assert server.get(probe_path("httpx_sync", FORBIDDEN_NAME, OTHER_PORT)).status == 200
-    server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+    server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
 
 
 # ── Activation in a lifespan handler ──────────────────────────────────
@@ -439,7 +439,7 @@ class TestActivationInALifespanHandler:
         assert server.log.count(UVLOOP_WARNING) == 1, server.log
         assert server.get(probe_path("httpx_async", FORBIDDEN_NAME, OTHER_PORT)).status == 200
         assert arrivals() == {AT_FORBIDDEN: 1}
-        assert "tethered: blocked" not in server.log, server.log
+        assert "tethered: would block" not in server.log, server.log
 
 
 # ── Starlette's TestClient ────────────────────────────────────────────

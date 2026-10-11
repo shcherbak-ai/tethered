@@ -426,5 +426,5 @@ class TestNotEnforcing:
         running = start("daemon", activate="log_only")
         reached(ask(running.server, running.mount, "connect", FORBIDDEN_NAME, OTHER_PORT))
         assert arrivals() == {AT_FORBIDDEN: 1}
-        running.server.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
-        running.server.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        running.server.wait_log(f"tethered: would block getaddrinfo for {FORBIDDEN_NAME}")
+        running.server.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")

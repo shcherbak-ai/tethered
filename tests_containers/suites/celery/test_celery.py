@@ -698,6 +698,6 @@ class TestNotEnforcing:
         assert report["outcome"] == "reached", report
         assert arrivals() == {AT_FORBIDDEN: 1}
         stack.worker.wait_log(
-            rf"WARNING/ForkPoolWorker-1\] tethered: blocked getaddrinfo for {FORBIDDEN_NAME}"
+            rf"WARNING/ForkPoolWorker-1\] tethered: would block getaddrinfo for {FORBIDDEN_NAME}"
         )
-        stack.worker.wait_log(f"tethered: blocked connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
+        stack.worker.wait_log(f"tethered: would block connect to {FORBIDDEN_ADDR}:{OTHER_PORT}")
