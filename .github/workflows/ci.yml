@@ -28,19 +28,45 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
+      # --locked: fail when uv.lock does not match pyproject.toml, where a
+      # plain sync would resolve again and run other versions of the tools.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
-      - name: Run pre-commit checks (includes ty)
-        run: uv run pre-commit run --all-files
+      # scripts/cppcheck.sh compiles cppcheck into a Docker image.  The image
+      # is kept in the cache under the hash of that script, so it is built
+      # once per cppcheck version and not once per run.  It is saved before
+      # the checks run: a run that fails a check still leaves it behind.
+      - name: Restore the cppcheck image
+        id: cppcheck-image
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cppcheck-image.tar
+          key: cppcheck-image-${{ hashFiles('scripts/cppcheck.sh') }}
 
-      - name: Run cppcheck on C extension
+      - name: Load the cppcheck image
+        if: steps.cppcheck-image.outputs.cache-hit == 'true'
+        run: docker load --input "$RUNNER_TEMP/cppcheck-image.tar"
+
+      - name: Build the cppcheck image
+        if: steps.cppcheck-image.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get install -y -qq cppcheck > /dev/null
-          cppcheck --error-exitcode=1 --enable=warning,performance,portability \
-            --suppress=missingIncludeSystem \
-            --suppress=missingReturn:src/tethered/_guardian.c \
-            src/tethered/_guardian.c
+          bash scripts/cppcheck.sh --version
+          docker save --output "$RUNNER_TEMP/cppcheck-image.tar" \
+            "$(docker image ls --format '{{.Repository}}:{{.Tag}}' tethered-cppcheck)"
+
+      - name: Save the cppcheck image
+        if: steps.cppcheck-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cppcheck-image.tar
+          key: ${{ steps.cppcheck-image.outputs.cache-primary-key }}
+
+      # Every checker runs from here in the version the repository pins: the
+      # Python tools from uv.lock, the hook repositories by commit, and
+      # cppcheck from the image scripts/cppcheck.sh builds.
+      - name: Run pre-commit checks (includes ty and cppcheck)
+        run: uv run pre-commit run --all-files
 
   test:
     runs-on: ${{ matrix.os }}
@@ -62,7 +88,7 @@ jobs:
       # Name the interpreter: without a request uv passes over a pre-release
       # build in favour of any stable Python already on the runner.
       - name: Install dependencies
-        run: uv sync --python ${{ matrix.python-version }}
+        run: uv sync --locked --python ${{ matrix.python-version }}
 
       - name: Run tests with coverage
         run: uv run pytest tests/ -v --cov=src/tethered --cov-report=xml --cov-report=term-missing --cov-fail-under=100

@@ -156,7 +156,7 @@ C static analysis runs via Docker in pre-commit. Requires Docker installed and r
 uv run pre-commit run cppcheck --all-files
 ```
 
-On first run, a `tethered-cppcheck` Docker image is built from `ubuntu:24.04` with `cppcheck` installed. The image is cached by Docker for subsequent runs.
+On first run, a `tethered-cppcheck:<version>` Docker image is built, with cppcheck compiled from the upstream source at the release `scripts/cppcheck.sh` names (this takes a minute or two). The image is cached by Docker for subsequent runs. CI runs the same hook, so it analyses with the same version. To upgrade cppcheck, change `CPPCHECK_VERSION` and `CPPCHECK_COMMIT` in that script; an image of an earlier version can then be removed with `docker image rm`.
 
 ## Code conventions
 
