@@ -32,7 +32,7 @@ tethered.activate(
 | Parameter | Description |
 |---|---|
 | `allow` | Required. Allowed destinations — see [Allow list syntax](../README.md#allow-list-syntax). Pass `[]` to block all non-localhost connections. A malformed rule raises `ValueError` (see *Rule validation* below). |
-| `log_only` | Log blocked connections instead of raising `EgressBlocked`. Default `False`. |
+| `log_only` | Log what would be blocked instead of raising `EgressBlocked`. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors, instead of failing open. Default `False`. |
 | `allow_localhost` | Allow loopback addresses (`127.0.0.0/8`, `::1`). Default `True`. |
 | `on_blocked` | Callback `(host, port) -> None` invoked on every blocked connection, including in log-only mode. |
@@ -77,7 +77,7 @@ tethered.scope(
 |---|---|
 | `allow` | Required. Allowed destinations — see [Allow list syntax](../README.md#allow-list-syntax). A malformed rule raises `ValueError`, as for `activate()`. |
 | `allow_localhost` | Allow loopback addresses. Default `True`. |
-| `log_only` | Log blocked connections instead of raising. Default `False`. |
+| `log_only` | Log what would be blocked instead of raising. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors. Default `False`. |
 | `on_blocked` | Callback `(host, port) -> None` on every blocked connection. |
 | `label` | Human-readable name for this scope. Appears in log messages and as `EgressBlocked.scope_label` when this scope produces a block. Library authors should use it to identify call sites — e.g. `label="WeatherClient.get_forecast"`. Defaults to an auto-derived `"scope(<first 3 allow rules>)"` summary. |
@@ -130,11 +130,13 @@ except tethered.EgressBlocked as e:
 | `scope_label` | `str \| None` | The label of the `scope()` that blocked the call (e.g. `"scope(api.mylib.com:443)"`), or `None` if the block came from the global `activate()` policy. Useful for libraries that wrap `EgressBlocked` and want to attribute the block to the right scope when multiple are nested. See [COOKBOOK.md#for-package-authors](COOKBOOK.md#for-package-authors). |
 | `scope_hint` | `str \| None` | The `hint=` set on the deepest hinted `scope()` on the stack at block-time, or `None` when no hinted scope was active. Named to mirror `scope_label`: both attributes are scope-derived, and `activate()` has no hint API by design. The deepest hinted scope wins regardless of which scope's rule produced the block — outer hints surface only when no closer scope set one. The hint also fires when the global `activate()` policy is what blocks (provided a hinted scope is active), so library guidance still surfaces in host-app-driven blocks. Wrapper exceptions can read `exc.scope_hint` to forward the guidance into their own UX without duplicating it in code. |
 
-When `scope_label` is non-`None`, the message includes a trailing `(blocked by <label>)` suffix so the source of the block is visible in tracebacks even without inspecting the attribute. When `scope_hint` is non-`None`, the message gains a trailing line of the form `Hint: <hint>` so the guidance is visible in tracebacks too.
+When `scope_label` is non-`None`, the message includes a trailing `(blocked by <label>)` suffix so the source of the block is visible in tracebacks even without inspecting the attribute. When `scope_hint` is non-`None`, the message gains a trailing line of the form `Hint: <hint>` so the guidance is visible in tracebacks too. An IPv6 address with a port is written the way an allow rule writes it: `[2001:db8::1]:443`.
 
 A host or address that tethered cannot read (for example a non-ASCII byte string) cannot match any rule and is refused; it surfaces as `host="<unreadable …>"` with `port=None`. `sendmsg()` called without an address is not such a case: it is a write on a connected socket, names no destination, and is let through.
 
 `EgressBlocked` can be pickled and copied with all its attributes, so a blocked call in a `multiprocessing.Pool` or `ProcessPoolExecutor` worker is re-raised in the parent as `EgressBlocked`. The same holds for a `concurrent.futures.InterpreterPoolExecutor` worker (Python 3.14+): an `EgressBlocked` that a task lets out reaches the submitter as `EgressBlocked` from `future.result()`.
+
+It can also be rebuilt from its message alone, `tethered.EgressBlocked(*exc.args)`, which is how a transport that does not pickle hands an exception on. Celery's JSON result serializer keeps the class name and `args`, and `result.get()` in a producer that has tethered loaded raises `EgressBlocked`. The message is kept as it is and the attributes are read back out of it, as far as it holds them: a `resolved_from` equal to `host` was never written into it, and a message from an older tethered, which wrote an IPv6 address with a port as `2001:db8::1:443`, gives all of that as `host`. Any other single argument is a `TypeError`.
 
 The exception is raised inside the socket call, and the code around that call decides what its caller sees. Most client libraries pass it on unchanged; some wrap it, and a few hide it (Twisted reports a timeout, kafka-python and nats-py an error of their own): [COMPATIBILITY.md](COMPATIBILITY.md#client-libraries) lists what was measured. Two cases under asyncio differ from a plain `raise`. `httpx.AsyncClient` (and anyio's `connect_tcp`) deliver a refused connection inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch; a refused lookup arrives bare. Use `except* tethered.EgressBlocked`, or look inside the group. And `transport.sendto(data, addr)` on an unconnected asyncio datagram transport raises nothing: the datagram is not sent, asyncio closes the transport and passes the `EgressBlocked` to the protocol's `connection_lost()`. [COOKBOOK.md](COOKBOOK.md#django--fastapi-middleware) has a handler for both shapes.
 
@@ -157,7 +159,7 @@ For launches it comes out of whichever call raised the audit event: `subprocess`
 | `event` | `str` | The audit event that was refused, e.g. `"subprocess.Popen"`, `"os.system"`, `"_winapi.CreateProcess"`, `"os.remove"`. |
 | `description` | `str` | What was refused and, where it applies, why — e.g. `subprocess.Popen(curl)`, `os.system('curl evil.test')`. A `subprocess` launch is described by its program, without its arguments. |
 
-Like `EgressBlocked`, it can be pickled and copied with its attributes.
+Like `EgressBlocked`, it can be pickled and copied with its attributes, and rebuilt from its message alone (`tethered.SubprocessBlocked(*exc.args)`). `description` comes back from the message, and `event` where the description starts with it, as it does for every launch; otherwise `event` is the empty string.
 
 ## `tethered.TetheredLocked`
 
@@ -210,7 +212,7 @@ tethered.activate(
 )
 ```
 
-tethered logs to the `"tethered"` logger via stdlib `logging`. To see log-only warnings, ensure your application has logging configured (e.g., `logging.basicConfig()`).
+tethered logs to the `"tethered"` logger via stdlib `logging`. To see log-only warnings, ensure your application has logging configured (e.g., `logging.basicConfig()`). What a log-only policy or scope lets through is logged as `tethered: would block ...` (`would block connect to evil.test:443`); an enforcing one logs `tethered: blocked ...` for what it refuses.
 
 `log_only` is per layer: the global policy and each scope have their own. A log-only layer never switches off an enforcing one. When a log-only global policy denies, the scopes are still checked. Scopes are evaluated outermost first: each denying log-only scope logs and calls its `on_blocked`, and the first denying scope that enforces raises `EgressBlocked`.
 

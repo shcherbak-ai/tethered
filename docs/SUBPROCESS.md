@@ -92,6 +92,8 @@ What counts as "external" vs auto-inheriting:
 | `os.system("rm -rf /")` | Yes (non-Python) |
 | Direct `_winapi.CreateProcess` of a non-Python program (Windows) | Yes (non-Python) |
 
+For a launch of `sys.executable` that counts as external, the warning and the `SubprocessBlocked` end with the reason: `tethered: external subprocess launch detected: subprocess.Popen(/usr/local/bin/python) — -S skips site.py and the tethered.pth bootstrap with it: the child holds no policy`.
+
 Interpreter options are read with the boundaries CPython itself uses, so `-S` counts only where the interpreter would treat it as an option. On Windows it is recognized when quoted inside a command-line string and when `executable=` is given. `multiprocessing` launches are classified on Windows and, from Python 3.14, on POSIX; on POSIX with Python 3.11–3.13 they raise no audit event.
 
 ```python
@@ -147,7 +149,7 @@ Whatever tethered logs for such a launch is logged by the forked child and writt
 
 ### When `sys.executable` is not Python
 
-tethered recognizes a Python child by `sys.executable`. Where Python is embedded in another program that is not true: under uWSGI `sys.executable` is the uwsgi binary. `subprocess.run([sys.executable, "script.py"])` then starts uWSGI, and tethered treats it as a Python launch; a launch of the real interpreter is treated as external (warned about, refused under `"block"`) although the child does inherit the policy. `uwsgi --py-sys-executable /path/to/python` makes `sys.executable` name the interpreter and puts both right. See [COOKBOOK.md](COOKBOOK.md#uwsgi).
+tethered recognizes a Python child by `sys.executable`. Where Python is embedded in another program, that need not be an interpreter: under uWSGI it is the uwsgi binary, and `subprocess.run([sys.executable, "script.py"])` starts uWSGI. tethered checks for this once, when it is imported. An interpreter that was started by its own executable has its command line in `sys.orig_argv`; an embedded one has none, and an embedded interpreter whose `sys.executable` is not named `python…` or `pypy…` is taken for a program that is not Python (mod_wsgi is embedded too, and leaves the path of a real interpreter there). `activate()` then logs a warning, and every launch is treated as external, with the reason in the log line: a launch of `sys.executable`, and a launch of the real interpreter too, although that child does inherit the policy. `uwsgi --py-sys-executable /path/to/python` makes `sys.executable` name the interpreter and puts it right. See [COOKBOOK.md](COOKBOOK.md#uwsgi).
 
 ### What `"block"` also refuses
 

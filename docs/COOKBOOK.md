@@ -395,7 +395,7 @@ The plain deployment works as it is: with `activate()` at the top of the WSGI fi
 uwsgi --http :8000 --wsgi-file app.py --master --processes 2
 ```
 
-**Add `--py-sys-executable` if the application launches Python children.** Under uWSGI `sys.executable` is the uwsgi binary. `subprocess.run([sys.executable, "script.py"])` therefore starts uWSGI, not Python, and a launch of the real interpreter is warned about as external (and refused under `"block"`), although that child does inherit the policy. Naming the interpreter puts both right:
+**Add `--py-sys-executable` if the application launches Python children.** Under uWSGI `sys.executable` is the uwsgi binary, so `subprocess.run([sys.executable, "script.py"])` starts uWSGI, not Python. tethered says so when the policy is activated (`tethered: sys.executable is /usr/local/bin/uwsgi, the program that embeds Python here, not a Python interpreter. ...`) and counts every launch as external: warned about, and refused under `"block"`, a launch of the real interpreter included, although that child does inherit the policy. Naming the interpreter puts it right:
 
 ```bash
 uwsgi --http :8000 --wsgi-file app.py --master --processes 2 --py-sys-executable /usr/local/bin/python
@@ -515,7 +515,7 @@ def activate_tethered(**kwargs):
 - **The broker has to be allowed.** Loopback is allowed by default. A broker addressed by name has to be in the allow list, otherwise the worker ends at start-up with `EgressBlocked` for the broker's address.
 - **`external_subprocess_policy="block"` stops `celery worker` from starting**: its banner calls `platform.platform()`, which launches `uname` and catches only `OSError`. Call `platform.platform()` once before `activate()`; it caches the answer.
 - **The eventlet pool** resolves names with its own resolver, which tethered does not see: a host the allow list names is refused. Set `EVENTLET_NO_GREENDNS=yes`, or allow the address.
-- **What the producer sees.** With Celery's default JSON result serializer, `result.get()` for a refused task raises a bare `Exception` whose text names `EgressBlocked` when the producer has tethered loaded, so `except tethered.EgressBlocked` does not match there. With `result_serializer="pickle"` it raises `tethered.EgressBlocked`.
+- **What the producer sees.** `result.get()` for a refused task raises `tethered.EgressBlocked` in a producer that has tethered loaded, with Celery's default JSON result serializer and with `result_serializer="pickle"`. With JSON, Celery rebuilds the exception from its message, and `host`, `port` and the other attributes are read back out of it. A producer that has not imported tethered gets a class of Celery's own that is named `EgressBlocked`; with pickle, reading the result imports tethered.
 
 **RQ.** Call `activate()` in the settings module and start the worker with `rq worker -c settings`: the worker holds the policy, and every job starts with it, whichever worker class runs it. With `activate()` only in the module that defines the jobs, every job is still covered, because RQ imports that module where the job runs, but the worker process itself holds no policy.
 
