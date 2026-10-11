@@ -352,16 +352,35 @@ class TestAutoactivateIntegration:
         assert _CHILD_POLICY_ENV not in minimal_env
 
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
-    def test_env_strip_in_locked_mode_blocked(self):
-        """env={} in locked mode raises SubprocessBlocked before the launch."""
+    def test_env_strip_in_locked_mode_is_completed(self):
+        """A sanitized env= in locked mode: the child is launched and holds the locked policy."""
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+        minimal_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() in {"PATH", "SYSTEMROOT", "PATHEXT", "TEMP", "TMP"}
+        }
+        result = subprocess.run(  # nosec B603 B607
+            [
+                sys.executable,
+                "-c",
+                ("import tethered._core as c; print('locked' if c._config.locked else 'unlocked')"),
+            ],
+            capture_output=True,
+            timeout=15,
+            env=minimal_env,
+        )
+        assert result.returncode == 0, result.stderr.decode()
+        assert result.stdout.strip() == b"locked"
+        assert _CHILD_POLICY_ENV not in minimal_env
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="os.posix_spawn is POSIX only")
+    def test_env_strip_in_locked_mode_blocked_where_it_cannot_be_completed(self):
+        """``os.posix_spawn`` takes its environment as it is: env={} is refused."""
         tethered.activate(allow=[], locked=True, lock_token=object())
         with pytest.raises(tethered.SubprocessBlocked, match=r"strips _TETHERED_CHILD_POLICY"):
-            subprocess.run(  # nosec B603 B607
-                [sys.executable, "-c", "pass"],
-                env={},
-                capture_output=True,
-                timeout=10,
-            )
+            os.posix_spawn(sys.executable, [sys.executable, "-c", "pass"], {})
 
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     def test_env_with_explicit_policy_carry_through_in_locked_mode(self):

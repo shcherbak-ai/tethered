@@ -1131,7 +1131,11 @@ class TestLockedPayloadIntegrity:
         monkeypatch.setenv(_CHILD_POLICY_ENV, self._CANONICAL)
 
     def test_locked_strip_blocks_popen(self, caplog, monkeypatch):
-        """subprocess.Popen with env={} in locked mode raises SubprocessBlocked."""
+        """With no ``_execute_child`` frame to give the variable to, env={} is refused.
+
+        (From ``subprocess`` itself the environment is completed instead:
+        ``TestLockedEnvIsCompleted``.)
+        """
         self._set_canonical_env(monkeypatch)
         cfg = self._locked_cfg()
         with (
@@ -3256,10 +3260,19 @@ class TestLockedEnvIsReadAsAMapping:
         monkeypatch.setenv(_CHILD_POLICY_ENV, self._payload())
 
     @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
-    def test_stripped_env_is_refused(self, kind):
+    def test_stripped_env_is_seen_as_stripped(self, kind):
+        """Not approved on the strength of the parent's environment.
+
+        It is completed where that is possible (``TestLockedEnvIsCompleted``);
+        here there is no ``_execute_child`` frame, so the launch is refused.
+        """
         env = _as_mapping(kind, {"PATH": "/usr/bin"})
-        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips _TETHERED_CHILD_POLICY"):
+        with pytest.raises(tethered.SubprocessBlocked, match=r"could not be established"):
             _handle_subprocess(_launch_cfg(locked=True), "subprocess.Popen", _popen_args(env))
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips _TETHERED_CHILD_POLICY"):
+            _handle_subprocess(
+                _launch_cfg(locked=True), "subprocess.Popen", _popen_args(env, "/bin/sh")
+            )
 
     @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
     def test_canonical_payload_is_accepted(self, kind):
@@ -3284,7 +3297,7 @@ class TestLockedEnvIsReadAsAMapping:
         _handle_subprocess(cfg, "subprocess.Popen", _popen_args(os.environ))
         monkeypatch.delenv(_CHILD_POLICY_ENV)
         with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
-            _handle_subprocess(cfg, "subprocess.Popen", _popen_args(os.environ))
+            _handle_subprocess(cfg, "subprocess.Popen", _popen_args(os.environ, "/bin/sh"))
 
     def test_bytes_value_is_read_the_way_the_child_decodes_it(self):
         """POSIX launch APIs accept ``bytes`` values."""
@@ -3311,20 +3324,126 @@ class TestLockedEnvIsReadAsAMapping:
         with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
             _handle_subprocess(_launch_cfg(locked=True), event, args)
 
+
+class TestLockedEnvIsCompleted:
+    """Under a lock, an explicit environment that lacks the variable is given it.
+
+    Locked mode used to refuse every launch whose ``env=`` did not carry the
+    policy.  But an environment built from a list of its own is what ordinary
+    code passes, CPython included: ``ctypes.util.find_library`` runs
+    ``ldconfig`` with ``env={"LC_ALL": "C", "LANG": "C"}``, so under a locked
+    policy ``import trio`` (and every other library that looks a shared
+    object up while it is imported) raised ``SubprocessBlocked``.  The lock
+    promises that no Python starts without the policy; it keeps that by
+    adding the variable, through the copy ``_execute_child`` is given, to a
+    Python child and to an external program alike (which may start Python
+    itself).  A different or invalid value is still refused, and so is a
+    route with no way of adding it.
+    """
+
+    @staticmethod
+    def _in_frame(cfg, env, executable=sys.executable, scope_stack=()):
+        args = _popen_args(env, executable)
+        return _call_in_execute_child(
+            lambda: _handle_subprocess(cfg, "subprocess.Popen", args, scope_stack), env
+        )
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    @pytest.mark.parametrize("executable", [sys.executable, "/bin/sh"], ids=["python", "external"])
+    def test_the_child_gets_a_completed_copy(self, kind, executable, caplog):
+        cfg = _launch_cfg(locked=True)
+        env_arg = _as_mapping(kind, {"PATH": "/usr/bin"})
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            injected = self._in_frame(cfg, env_arg, executable)
+        assert injected == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        assert dict(env_arg) == {"PATH": "/usr/bin"}  # the caller's mapping is not written to
+        assert caplog.records == []  # the policy for external launches is "allow" here
+
+    def test_an_active_scope_travels_with_it(self):
+        cfg = _launch_cfg(locked=True)
+        scope_cfg = _ScopeConfig(policy=AllowPolicy(["api.example.com"]), label="narrow")
+        for executable in (sys.executable, "/bin/sh"):
+            injected = self._in_frame(cfg, {"PATH": "/usr/bin"}, executable, (scope_cfg,))
+            payload = json.loads(injected[_CHILD_POLICY_ENV])
+            assert payload["global"] == json.loads(_core._canonical_payload(cfg))["global"]
+            assert [s["label"] for s in payload["scopes"]] == ["narrow"]
+
+    @pytest.mark.parametrize("policy", ["warn", "block"])
+    def test_an_external_program_is_still_judged_as_external(self, policy, caplog):
+        cfg = _launch_cfg(locked=True, external_subprocess_policy=policy)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(tethered.SubprocessBlocked) as exc_info:
+                    self._in_frame(cfg, {"PATH": "/usr/bin"}, "/bin/sh")
+                assert "strips" not in str(exc_info.value)
+            else:
+                injected = self._in_frame(cfg, {"PATH": "/usr/bin"}, "/bin/sh")
+                assert _CHILD_POLICY_ENV in injected
+        (record,) = caplog.records
+        assert "external subprocess launch" in record.getMessage()
+
+    @pytest.mark.parametrize(
+        ("value", "reason"),
+        [
+            ('{"global": {"allow": ["*"]}, "scopes": []}', "substitution attempt"),
+            ("{not json", "not valid JSON"),
+        ],
+    )
+    @pytest.mark.parametrize("executable", [sys.executable, "/bin/sh"], ids=["python", "external"])
+    def test_another_value_is_still_refused(self, value, reason, executable):
+        cfg = _launch_cfg(locked=True)
+        with pytest.raises(tethered.SubprocessBlocked, match=reason):
+            self._in_frame(cfg, {_CHILD_POLICY_ENV: value}, executable)
+
+    def test_an_external_program_is_refused_when_the_frame_cannot_be_written(self, monkeypatch):
+        monkeypatch.setattr(_core, "_inject_scope_env", lambda frame, env: False)
+        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
+            self._in_frame(_launch_cfg(locked=True), {"PATH": "/usr/bin"}, "/bin/sh")
+
+    def test_without_a_lock_an_external_program_is_left_its_environment(self):
+        """Only a lock promises that nothing started later runs without the policy."""
+        cfg = _launch_cfg()
+        env_arg = {"PATH": "/usr/bin"}
+        assert self._in_frame(cfg, env_arg, "/bin/sh") is env_arg
+
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
-    def test_locked_parent_refuses_a_sanitized_env_of_any_type(self, kind):
-        """End to end, with the parent's own environment intact."""
+    def test_locked_parent_completes_a_sanitized_env_of_any_type(self, kind):
+        """End to end, under ``block`` as well: the child is not external once it has the policy."""
         tethered.activate(
-            allow=[], locked=True, lock_token=object(), external_subprocess_policy="block"
+            allow=["*.example.com"],
+            locked=True,
+            lock_token=object(),
+            external_subprocess_policy="block",
         )
-        with pytest.raises(tethered.SubprocessBlocked, match=r"env strips"):
-            subprocess.run(  # nosec B603
-                [sys.executable, "-c", "print('ran')"],
-                env=_as_mapping(kind, _minimal_child_env()),
-                capture_output=True,
-                timeout=30,
-            )
+        state = _launch_probe(env=_as_mapping(kind, _minimal_child_env()))
+        assert state["active"] is True
+        assert state["locked"] is True
+        assert state["allow"] == ["*.example.com"]
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_an_external_program_started_under_a_lock_carries_the_policy(self):
+        """``-S`` makes this interpreter an external program: it reports what it was given."""
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+        code = f"import os; print(os.environ.get({_CHILD_POLICY_ENV!r}, 'MISSING'))"
+        r = subprocess.run(  # nosec B603
+            [sys.executable, "-S", "-c", code],
+            env=_minimal_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == _core._canonical_payload(_core._config)
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    @pytest.mark.skipif(sys.platform != "linux", reason="find_library runs ldconfig on Linux only")
+    def test_find_library_works_under_a_locked_policy(self):
+        """The call that made ``import trio`` fail: ``ldconfig -p`` with ``env={"LC_ALL": ...}``."""
+        import ctypes.util
+
+        tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())
+        assert ctypes.util.find_library("c")
 
     @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
     @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)

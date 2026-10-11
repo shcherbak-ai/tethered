@@ -13,8 +13,9 @@ Every library in ``catalog.TABLE`` is measured under the policy
 The world's counters and its DNS responder are the ground truth.  A row that
 is not "enforced" is a limit: it is asserted as what happens today.
 
-Covered besides the table: every row again under a locked policy, where the
-libraries that call ``ctypes.util.find_library`` cannot be used at all; a
+Covered besides the table: every row again under a locked policy, the
+libraries that call ``ctypes.util.find_library`` when they are imported
+included (a locked policy used to refuse the launch that makes); a
 fail-closed policy; what a log-only policy reports; what makes a refused
 allowed host reachable; what a library does when its C module cannot be
 imported; how Twisted delivers a refusal; and a DNS query sent straight to a
@@ -46,8 +47,8 @@ from measure import Attempt
 ALL_FOUR = ["forbidden_name", "forbidden_address", "allowed", "other_port"]
 #: One row of every kind, for the questions that do not need the whole table.
 REPRESENTATIVES = ["requests", "gevent", "psycopg2", "psycopg-binary-sync", "aiohttp-aiodns"]
-#: How a locked policy refuses the launch ``ctypes.util.find_library`` makes.
-LDCONFIG_REFUSED = "subprocess.Popen(/sbin/ldconfig) — env strips _TETHERED_CHILD_POLICY"
+#: The warning for the launch ``ctypes.util.find_library`` makes on Linux.
+LDCONFIG_WARNING = "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)"
 
 
 def rows(verdict: str) -> list[object]:
@@ -160,41 +161,35 @@ def same_row_under(variant: catalog.Variant, activate: str) -> None:
         measure.under_lock[variant.id] = "the same"
 
 
-def locked_rows(*, usable: bool) -> list[object]:
+def locked_rows(*, find_library: bool) -> list[object]:
     return [
         pytest.param(variant, id=variant.id)
         for variant in catalog.TABLE.values()
-        if (not variant.lock_breaks_import_of) is usable
+        if bool(variant.calls_find_library_in) is find_library
     ]
 
 
-@pytest.mark.parametrize("variant", locked_rows(usable=True))
+@pytest.mark.parametrize("variant", locked_rows(find_library=False))
 def test_a_locked_policy_sees_what_a_plain_one_sees(variant: catalog.Variant) -> None:
     """A locked policy changes no row: what a plain policy does not see, it does not see either."""
     same_row_under(variant, "locked")
 
 
-@pytest.mark.parametrize("variant", locked_rows(usable=False))
-def test_limit_the_library_cannot_be_used_under_a_locked_policy(variant: catalog.Variant) -> None:
-    """Limit: a locked policy refuses ``ctypes.util.find_library``, which the library calls.
+@pytest.mark.parametrize("variant", locked_rows(find_library=True))
+def test_a_library_that_calls_find_library_is_usable_under_a_locked_policy(
+    variant: catalog.Variant,
+) -> None:
+    """The row is the plain policy's, although importing the library launches ``ldconfig``.
 
-    On Linux ``find_library`` launches ``/sbin/ldconfig`` with an environment
-    of its own, which lacks the policy variable; a locked policy refuses such
-    a launch.  The library, or one it imports, calls it when it is imported,
-    so every attempt ends in ``SubprocessBlocked``, the allowed host included.
+    On Linux ``ctypes.util.find_library`` launches ``/sbin/ldconfig`` with an
+    environment of its own, which lacks the policy variable.  A locked policy
+    used to refuse that launch, so the library, or one it imports, could not
+    be imported and nothing worked, the allowed host included.  The launch
+    is now given the variable instead.
     """
     if measure.PYTHON in variant.missing_on:
         pytest.skip(variant.missing_on[measure.PYTHON])
-    batch = measure.run_batch(variant, measure.under("locked"))
-    assert arrived(batch) == [], batch.reports
-    for case in ALL_FOUR:
-        said = batch.reports[case]
-        assert LDCONFIG_REFUSED in said["message"], said
-        raised = [said["exception"], *said["chain"]]
-        assert any(kind.endswith(".SubprocessBlocked") for kind in raised), said
-    measure.under_lock[variant.id] = (
-        f"UNUSABLE: importing {variant.lock_breaks_import_of} raises SubprocessBlocked"
-    )
+    same_row_under(variant, "locked")
 
 
 def test_httpx_is_usable_under_a_locked_policy_where_trio_is_not_installed() -> None:
@@ -203,8 +198,7 @@ def test_httpx_is_usable_under_a_locked_policy_where_trio_is_not_installed() -> 
 
 
 def test_httpx_is_usable_under_a_locked_policy_when_httpcore_was_imported_before() -> None:
-    # The lookup of libpthread was made before there was a lock.  A child
-    # process cannot do that: it holds the locked policy before its first import.
+    # The lookup of libpthread was made before there was a lock.
     same_row_under(catalog.HTTPCORE_IMPORTED_FIRST, "locked")
 
 
@@ -225,21 +219,18 @@ print(json.dumps(report))
 """
 
 
-def test_ctypes_find_library_works_under_a_plain_policy_with_a_warning() -> None:
-    done = run_python(FIND_LIBRARY)
-    assert done.json() == {"found": "libc.so.6"}
-    assert "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)" in done.stderr
-
-
-def test_limit_ctypes_find_library_is_refused_under_a_locked_policy() -> None:
-    """Limit: the launch of ``/sbin/ldconfig`` carries an environment without the policy."""
+@pytest.mark.parametrize("activate", ["plain", "locked"])
+def test_ctypes_find_library_works_under_a_policy_with_a_warning(activate: str) -> None:
+    """``ldconfig`` is an external program, launched with an environment of its own."""
     assert run_python(FIND_LIBRARY, activate="none").json() == {"found": "libc.so.6"}
-    refused = run_python(FIND_LIBRARY, activate="locked").json()
-    assert refused["exception"] == "SubprocessBlocked", refused
-    assert LDCONFIG_REFUSED in refused["message"]
-    # Allowing external launches does not help: this refusal is the lock's own.
-    refused = run_python(FIND_LIBRARY, activate="locked", esp="allow").json()
-    assert LDCONFIG_REFUSED in refused["message"], refused
+    done = run_python(FIND_LIBRARY, activate=activate)
+    assert done.json() == {"found": "libc.so.6"}
+    assert LDCONFIG_WARNING in done.stderr
+    assert "strips" not in done.stderr, done.stderr
+    # Allowed external launches are not mentioned at all.
+    done = run_python(FIND_LIBRARY, activate=activate, esp="allow")
+    assert done.json() == {"found": "libc.so.6"}
+    assert "ldconfig" not in done.stderr, done.stderr
 
 
 def test_limit_ctypes_find_library_is_refused_when_external_launches_are_blocked() -> None:

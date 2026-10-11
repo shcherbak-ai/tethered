@@ -202,12 +202,16 @@ class TestLaunchesUnderALock:
         assert arrivals() == {}
         locked.wait_log(r"external subprocess launch detected: subprocess\.Popen\(python3\)")
 
-    def test_a_child_given_an_environment_without_the_policy_is_not_launched(
+    def test_a_child_given_an_environment_without_the_policy_gets_the_lock_all_the_same(
         self, locked: Server
     ) -> None:
+        # The lock promises that no Python starts without the policy.  It
+        # keeps that by adding the variable to the child's environment (it
+        # used to refuse the launch).
         report = locked.probe("child", FORBIDDEN_NAME, OTHER_PORT, how="clean_env")
-        assert_refused(report, SUBPROCESS_BLOCKED)
-        assert "env strips _TETHERED_CHILD_POLICY" in report["message"]
+        assert report["outcome"] == "reached", report
+        assert_locked(report["child"])
+        assert_refused(report["child"])
         assert arrivals() == {}
 
     def test_a_child_started_without_site_is_warned_about_and_holds_no_policy(
@@ -231,17 +235,20 @@ class TestLaunchesUnderALock:
 
 
 class TestLaunchesUnderBlock:
+    @pytest.mark.parametrize("how", ["executable", "clean_env"])
     def test_a_child_started_with_sys_executable_is_launched_and_inherits(
-        self, blocking: Server
+        self, blocking: Server, how: str
     ) -> None:
-        report = blocking.probe("child", FORBIDDEN_NAME, OTHER_PORT)
+        # With or without the policy in the environment it is given: a child
+        # that gets the policy is not an external launch.
+        report = blocking.probe("child", FORBIDDEN_NAME, OTHER_PORT, how=how)
         assert report["outcome"] == "reached", report
         assert_locked(report["child"])
         assert report["child"]["external_subprocess_policy"] == "block"
         assert_refused(report["child"])
         assert arrivals() == {}
 
-    @pytest.mark.parametrize("how", ["path_python", "no_site", "clean_env"])
+    @pytest.mark.parametrize("how", ["path_python", "no_site"])
     def test_any_other_python_child_is_not_launched(self, blocking: Server, how: str) -> None:
         report = blocking.probe("child", FORBIDDEN_NAME, OTHER_PORT, how=how)
         assert_refused(report, SUBPROCESS_BLOCKED)

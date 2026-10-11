@@ -2604,14 +2604,23 @@ def _handle_subprocess(
     #   - Explicit: read once through the mapping interface, whatever the
     #     type (dict, UserDict, MappingProxyType, os.environ ...), so the
     #     check sees what the launch API will read.  Locked mode refuses
-    #     absence ("strip"), corruption ("not valid JSON"), a differing
-    #     'global' ("substitution") and more than one spelling of the key.
-    #     A differing scope list is not refused: scopes can only narrow
+    #     corruption ("not valid JSON"), a differing 'global'
+    #     ("substitution") and more than one spelling of the key.  A
+    #     differing scope list is not refused: scopes can only narrow
     #     within the checked global ceiling, so they can't widen child
-    #     enforcement past the parent.  One route is not refused for
-    #     absence, in locked mode either: an ``os.exec*`` of this
-    #     interpreter is carried out with the payload added
-    #     (_exec_with_policy).
+    #     enforcement past the parent.
+    #
+    #     Absence ("strip") is what ordinary code produces all the time:
+    #     an environment built from a list of its own.  CPython does it
+    #     itself (``ctypes.util.find_library`` runs ``ldconfig`` with
+    #     ``env={"LC_ALL": "C", "LANG": "C"}``, at the import of every
+    #     library that looks a shared object up).  Locked mode refuses it
+    #     only where the variable cannot be added: ``subprocess.Popen``
+    #     gets it through the copy ``_execute_child`` is given, for an
+    #     external program too (whatever Python that starts must inherit
+    #     the policy), and an ``os.exec*`` of this interpreter is carried
+    #     out with it (_exec_with_policy).  ``os.posix_spawn`` and
+    #     ``os.spawn*`` have no such way and are refused.
     #
     # The comparison never raises, so no stray exception escapes the audit
     # hook in place of ``SubprocessBlocked``.  Locked mode requires
@@ -2619,6 +2628,7 @@ def _handle_subprocess(
     payload = _canonical_payload(cfg)
     acceptable = True  # the environment carries the canonical global, once
     needs_rewrite = False  # ... but not exactly what this launch must carry
+    complete_external = False  # an external program's environment gets the payload
     if env_value is None:
         state = _process_env_state(payload)
         if state != "exact":
@@ -2645,7 +2655,9 @@ def _handle_subprocess(
             # unless the exec itself fails, and then with that error.
             _exec_with_policy(cfg, args, pairs, payload)
         if cfg.locked and not acceptable:
-            _refuse_launch(event, _describe_launch(event, args, launch_args), "env", state)
+            if not (popen and state == "missing"):
+                _refuse_launch(event, _describe_launch(event, args, launch_args), "env", state)
+            complete_external = not is_python
         needs_rewrite = state != "exact"
 
     # ── Python children: make the environment right ────────────────────
@@ -2697,6 +2709,10 @@ def _handle_subprocess(
             return
         else:
             reason = f" — its environment lacks {_CHILD_POLICY_ENV} and cannot be rewritten"
+    elif complete_external and _inject_launch_env(event, args, scope_stack, cfg) is not None:
+        # Locked, and the variable could not be added (no _execute_child
+        # frame, a failed frame write): refused, as on every other route.
+        _refuse_launch(event, _describe_launch(event, args, launch_args), "env", "missing")
 
     # ── External launches ──────────────────────────────────────────────
     # os.system, an external executable, Python with ``-S``, or a Python
