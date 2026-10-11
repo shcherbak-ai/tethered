@@ -1,0 +1,21 @@
+description = "client libraries: which of them tethered sees (HTTP, databases, brokers, RPC, cloud SDKs, resolvers, other runtimes)"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+#   libpq5                       psycopg 3's Python implementation loads the system libpq
+#   tdsodbc                      the FreeTDS ODBC driver that pyodbc is tested with
+#   default-libmysqlclient-dev, pkg-config
+#                                mysqlclient has no Linux wheel on any Python version
+#   cmake, unixodbc-dev          Python 3.15 only: pycares and pyodbc have no cp315 wheel yet
+apt = ["libpq5", "tdsodbc", "default-libmysqlclient-dev", "pkg-config", "cmake", "unixodbc-dev"]
+# mysqlclient is built from source everywhere; on Python 3.15 so are hiredis,
+# pymongo, pycares, pyodbc and zope.interface.
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["requests", "aiohttp", "psycopg2-binary", "grpcio", "gevent"]
+
+# Python versions the suite does not run on, each with the reason.  Single
+# libraries that cannot be installed on a version are left out in
+# requirements.txt and in catalog.py (``missing_on``), with the reason there.
+[unsupported_python]
