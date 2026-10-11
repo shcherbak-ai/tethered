@@ -297,9 +297,8 @@ class TestTwistedApi:
         report = twisted.probe(op, host, port)
         assert report["outcome"] == "error", report
         assert report["exception"] == TWISTED_TIMEOUT, report
-        # Well after an immediate refusal would have come back.  Not the whole
-        # timeout: Twisted starts its clock before the handler starts this one.
-        assert report["seconds"] >= CONNECT_TIMEOUT * 0.5, report
+        # (No bound on how long it took: Twisted starts its clock before the handler
+        # starts the one in the report, by as much as the machine is busy.)
         assert arrivals() == {}
         address = FORBIDDEN_ADDR if host == FORBIDDEN_ADDR else ALLOWED_ADDR
         twisted.wait_log(rf"tethered: blocked connect to .*{address}")
@@ -308,9 +307,8 @@ class TestTwistedApi:
         """Limit: ``reactor.connectTCP`` to a forbidden name ends in Twisted's ``TimeoutError``."""
         report = twisted.probe("connect_tcp", FORBIDDEN_NAME, OTHER_PORT)
         assert report["exception"] == TWISTED_TIMEOUT, report
-        # Well after an immediate refusal would have come back.  Not the whole
-        # timeout: Twisted starts its clock before the handler starts this one.
-        assert report["seconds"] >= CONNECT_TIMEOUT * 0.5, report
+        # (No bound on how long it took: Twisted starts its clock before the handler
+        # starts the one in the report, by as much as the machine is busy.)
         assert arrivals() == {}
         twisted.wait_log(f"tethered: blocked getaddrinfo for {FORBIDDEN_NAME}")
 
