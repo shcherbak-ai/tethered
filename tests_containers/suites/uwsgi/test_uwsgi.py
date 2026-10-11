@@ -9,11 +9,12 @@ workers.  Every server here also gets ``--die-on-term``, because uWSGI treats
 What makes uWSGI unlike the other servers, and what the classes below pin:
 
 - **``sys.executable`` is the uwsgi binary**, not a Python interpreter.
-  tethered recognizes a Python child by ``sys.executable``, so a launch of the
+  tethered recognizes a Python child by ``sys.executable``, so here it
+  recognizes none and says so when the policy is activated: a launch of the
   real interpreter counts as external (warned about, refused under ``"block"``)
-  although the child does inherit the policy, and a launch of
-  ``sys.executable`` counts as a Python launch although it starts uWSGI.
-  ``--py-sys-executable`` puts that right.
+  although the child does inherit the policy, and so does a launch of
+  ``sys.executable``, which starts uWSGI.  ``--py-sys-executable`` puts that
+  right.
 - **A reload re-executes the binary** (``SIGHUP``, ``--py-autoreload``,
   ``--touch-reload``) with the environment of the process, which carries the
   policy.  The new process inherits the policy as a child would: a locked
@@ -74,6 +75,12 @@ AT_LOOPBACK = f"{LOOPBACK_ADDR}:{OTHER_PORT}/tcp"
 
 #: The Python interpreter uWSGI was built against: the one this process runs on.
 PYTHON = sys.executable
+UWSGI = shutil.which("uwsgi") or "uwsgi"
+#: Why tethered counts a launch of ``sys.executable`` as external under uWSGI.
+NOT_AN_INTERPRETER = (
+    "sys.executable is the program that embeds Python here, not an interpreter, "
+    "so this starts that program"
+)
 #: The allow list every application asks for unless a test says otherwise ...
 DEFAULT_RULE = f"{ALLOWED_NAME}:{ALLOWED_PORT}"
 #: ... and a rule for the destination that list forbids.
@@ -488,24 +495,31 @@ def blocking() -> Server:
 
 
 class TestLaunchesUnderALock:
-    def test_sys_executable_is_the_uwsgi_binary(self, locked: Server) -> None:
+    def test_sys_executable_is_the_uwsgi_binary_and_activate_says_so(self, locked: Server) -> None:
         me = ask(locked, "/whoami")
-        assert me["executable"] == shutil.which("uwsgi")
+        assert me["executable"] == UWSGI
         assert me["executable"] != PYTHON
+        locked.wait_log(
+            rf"tethered: sys\.executable is {re.escape(UWSGI)}, the program that embeds Python "
+            r"here, not a Python interpreter\. .* \(uWSGI: --py-sys-executable /path/to/python\)\."
+        )
 
-    def test_a_launch_of_sys_executable_starts_uwsgi_and_tethered_takes_it_for_python(
+    def test_a_launch_of_sys_executable_starts_uwsgi_and_is_warned_about(
         self, locked: Server
     ) -> None:
         """Limit: the usual way to start a Python child starts uWSGI under uWSGI, which fails
-        on the script it is given for a configuration file.  tethered says nothing: to it a
-        launch of ``sys.executable`` is a launch of the interpreter.
+        on the script it is given for a configuration file.  tethered cannot make it start
+        Python; it counts the launch as external and says why.
         """
         report = launch(locked, child("{executable}"))
         assert report["outcome"] == "reached", report
         assert report["returncode"] != 0, report
         assert "unable to load configuration from" in report["stderr"], report
         assert arrivals() == {}
-        assert "external subprocess" not in locked.log_of_this_test
+        locked.wait_log(
+            rf"external subprocess launch detected: subprocess\.Popen\({re.escape(UWSGI)}\) — "
+            + re.escape(NOT_AN_INTERPRETER)
+        )
 
     def test_a_child_started_with_the_real_interpreter_inherits_and_is_warned_about(
         self, locked: Server
@@ -563,19 +577,17 @@ class TestLaunchesUnderBlock:
         assert_refused(report, SUBPROCESS_BLOCKED)
         assert arrivals() == {}
 
-    def test_uwsgi_given_options_python_does_not_have_is_not_launched(
-        self, blocking: Server
-    ) -> None:
-        # tethered reads the arguments as the interpreter's; what it cannot parse is external.
+    def test_uwsgi_given_options_is_not_launched(self, blocking: Server) -> None:
         report = launch(blocking, ["{executable}", "--exec-asap", "true"])
         assert_refused(report, SUBPROCESS_BLOCKED)
 
-    def test_uwsgi_given_a_configuration_file_runs_a_command_from_it(
+    def test_uwsgi_given_a_configuration_file_is_not_launched(
         self, blocking: Server, tmp_path: Path
     ) -> None:
-        """Limit: ``[sys.executable, "file.ini"]`` reads to tethered like ``python file.ini``, a
-        Python child that will inherit, so ``"block"`` does not refuse it.  It is uWSGI, and
-        uWSGI runs the ``exec-asap`` command of that file without ever starting Python.
+        """``[sys.executable, "file.ini"]`` reads like ``python file.ini``, a Python child that
+        would inherit.  It is uWSGI, and uWSGI would run the ``exec-asap`` command of that file
+        without ever starting Python: tethered used to let it, and the command reached the
+        forbidden destination.
         """
         tool = (
             f"exec 3<>/dev/tcp/{FORBIDDEN_NAME}/{OTHER_PORT} "
@@ -584,10 +596,12 @@ class TestLaunchesUnderBlock:
         configuration = tmp_path / "launch.ini"
         configuration.write_text(f"[uwsgi]\nexec-asap = bash -c '{tool}'\n", encoding="utf-8")
         report = launch(blocking, ["{executable}", str(configuration)])
-        assert report["outcome"] == "reached", report
-        assert f"reached {FORBIDDEN_ADDR}:{OTHER_PORT}" in report["stdout"] + report["stderr"]
-        assert arrivals() == {AT_FORBIDDEN: 1}
-        assert "external subprocess" not in blocking.log_of_this_test
+        assert_refused(report, SUBPROCESS_BLOCKED)
+        assert arrivals() == {}
+        blocking.wait_log(
+            rf"blocked external subprocess launch: subprocess\.Popen\({re.escape(UWSGI)}\) — "
+            + re.escape(NOT_AN_INTERPRETER)
+        )
 
 
 class TestPySysExecutable:
@@ -597,6 +611,7 @@ class TestPySysExecutable:
         command = uwsgi("--py-sys-executable", PYTHON, processes=1)
         server = start_server(command, env={"TETH_ACTIVATE": "locked"})
         assert ask(server, "/whoami")["executable"] == PYTHON
+        assert "the program that embeds Python here" not in server.log
         report = server.probe("child", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report
         assert_locked(report["child"])
