@@ -4625,7 +4625,13 @@ class TestSysExecutableThatIsNotPython:
             (["python", "-c", "pass"], "/usr/bin/python3.13", True),
             (["anything"], "/opt/app/bin/renamed", True),  # started as an interpreter
             ([], "/usr/bin/python3.13", True),  # embedded, a real python (mod_wsgi)
-            ([], r"C:\\Python313\\pythonw.exe", True),
+            pytest.param(
+                [],
+                r"C:\Python313\pythonw.exe",
+                True,
+                marks=pytest.mark.skipif(os.name != "nt", reason="a Windows path"),
+                id="embedded-pythonw",
+            ),
             ([], "/usr/bin/pypy3", True),
             ([], "/usr/local/bin/uwsgi", False),  # embedded, the host program
             ([], "", False),
