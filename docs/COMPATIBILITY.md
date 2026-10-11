@@ -370,13 +370,12 @@ A `tethered.scope()` around the work of one request or one task, in a process wh
 | A scope in an application that never calls `activate()` | Enforced inside the scope; nothing is refused outside it. | `gunicorn`, `uvicorn`, `gunicorn_gevent` |
 | A scope that allows what the policy refuses | Refused by the policy. A scope cannot widen it. | `gunicorn`, `uvicorn`, `gunicorn_gevent`, `celery` |
 | A log-only scope | Refuses nothing and logs `would block`. | `gunicorn` |
-| A Python child launched inside the scope with `subprocess` or, on the standard loop, `asyncio.create_subprocess_exec` | The child holds, from its start, the policy of the process narrowed by the scope. Also from a Celery task in the eventlet pool. | `gunicorn`, `uvicorn`, `celery` |
+| A Python child launched inside the scope with `subprocess` or, on the standard loop, `asyncio.create_subprocess_exec` | The child holds, from its start, the policy of the process narrowed by the scope. Also under gevent, whose `Popen` forks and calls `os.exec*` itself (gunicorn's gevent workers, Celery's gevent pool), and from a Celery task in the eventlet pool. | `gunicorn`, `uvicorn`, `gunicorn_gevent`, `celery` |
 
 What a scope does not reach:
 
 - **Another thread.** A thread started inside the block, and work handed to `loop.run_in_executor`, run without the scope and reach what it refuses; the policy of the process still applies to them. `asyncio.to_thread` copies the context and stays inside the scope. Under gevent a "thread" is a greenlet, and it starts without the scope in the same way. Suites: `gunicorn`, `uvicorn`, `gunicorn_gevent`.
 - **A name lookup made in a pool thread.** asyncio's loop and gevent's default resolver call `getaddrinfo` in a thread of a pool, which does not carry the scope. The DNS query for a name the scope refuses therefore leaves the process; a connection to that name is refused by the scope. A blocking lookup in the thread that entered the scope is refused before any query is sent. Suites: `uvicorn`, `gunicorn_gevent`.
-- **A child process under gevent.** gevent's `Popen` forks and calls `os.exec*` from Python, and a scope reaches a child only through the standard library's `Popen`. A Python child launched inside a scope from a gevent worker, or from a Celery task in the gevent pool, holds the policy of the process and not the scope. Suites: `gunicorn_gevent`, `celery`.
 
 Scopes were not measured under the other servers and task queues of this page.
 
