@@ -599,6 +599,11 @@ When your library is used from asyncio:
 - **The event loop belongs to the application**, so a library can fix neither of the two. State in your documentation that enforcement under asyncio needs asyncio's own selector event loop: not uvloop, and on Windows `asyncio.SelectorEventLoop` in place of the default `ProactorEventLoop`.
 - **`httpx.AsyncClient` wraps connect-time refusals.** A refused connection reaches your code inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch; use `except*` (see [Django / FastAPI middleware](#django--fastapi-middleware)). Keep that in mind for the wrapper patterns below, which are written with a plain `except`.
 
+Whatever the application runs on:
+
+- **A thread you start does not carry your scope.** A scope belongs to the thread, task or greenlet that entered it. A `threading.Thread` started inside the block, a `ThreadPoolExecutor` job and `loop.run_in_executor` run without it; `asyncio.to_thread` takes it along. Enter the scope inside the function the thread runs (the decorator form does that).
+- **Under gevent, a child process does not receive your scope.** gevent replaces `subprocess.Popen` with a class of its own, and a scope reaches a child only through the standard library's. The child still inherits the application's `activate()` policy.
+
 ### Surface actionable guidance via `hint=`
 
 When a `scope()` blocks a connection inside your library, the host process sees `EgressBlocked` with a default message that names the host and the scope label — but not what to do next. `hint=` gives you a single source of truth for the egress contract (and the docs URL) so that one line of guidance lands in the host's traceback automatically:

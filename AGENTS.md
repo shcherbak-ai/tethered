@@ -45,7 +45,7 @@ tests_containers/
     README.md          # How the container suites work, the helpers, adding a suite, the gating rule
     conftest.py        # Stops a pytest that is pointed at this directory on the host
     images/            # base.Dockerfile: a wheel of tethered built from the tree, installed into python:X.Y-slim like a user's
-    harness/           # In-container code shared by the suites: pytest plugin, the world (destinations that count arrivals), start_server, probe applications
+    harness/           # In-container code shared by the suites: pytest plugin, the world (destinations that count arrivals), start_server, probe applications (a request can ask for its operation inside a `tethered.scope()`), the scope checks the suites share (`scopes.py`)
     suites/<name>/     # One directory per server, task queue or library family: suite.toml, pinned requirements.txt, test_*.py
 benchmarks/
     overhead.py        # Standalone microbenchmark — per-event overhead activated vs deactivated vs locked

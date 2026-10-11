@@ -23,6 +23,7 @@ What tethered enforces under the servers, task queues and client libraries peopl
   - [Flask and Django](#flask-and-django)
   - [What holds under every server](#what-holds-under-every-server)
 - [Task queues and process pools](#task-queues-and-process-pools)
+- [Scopes](#scopes)
 - [Client libraries](#client-libraries)
 - [Installing, upgrading and removing tethered](#installing-upgrading-and-removing-tethered)
 - [What was not tested](#what-was-not-tested)
@@ -355,6 +356,29 @@ In every system below, each process that runs task code held the policy, plain a
 | Huey | `Unhandled exception in task ...` | `retries=2` gives three attempts | `TaskException`. |
 | arq | `... failed, EgressBlocked: ...` | Not retried | The `EgressBlocked` itself, with its attributes. |
 | The standard library's process pools | | | `EgressBlocked` from `.get()` / `.result()`; the pool is not broken. |
+
+## Scopes
+
+A `tethered.scope()` around the work of one request or one task, in a process whose policy allows more than the scope does. Measured with gunicorn 26.2.0, uvicorn 0.54.0 on the standard loop, gevent 26.9.0, Celery 5.6.3 and eventlet 0.41.2.
+
+| Where the scope is entered | Result | Pinned by |
+|---|---|---|
+| A request under gunicorn's sync and gthread workers | Enforced. Inside the scope only what the scope allows is reached. The request that follows on the same thread is not restricted, and a request served at the same time on another thread is not affected. | `gunicorn` |
+| A request under uvicorn, on the standard loop | Enforced for everything the request does on the loop (streams, `loop.create_connection`, `loop.sock_connect`, datagrams), for a blocking call made in the loop and for `asyncio.to_thread`. A request handled at the same time by another task is not affected. | `uvicorn` |
+| A request under gunicorn's gevent workers (`gevent`, `gevent_pywsgi`) | Enforced. A request served at the same time by another greenlet is not affected. | `gunicorn_gevent` |
+| A Celery task, in the prefork, threads, solo, gevent and eventlet pools | Enforced. Tasks that run at the same time in one process (threads, gevent, eventlet) do not see each other's scope. | `celery` |
+| A scope in an application that never calls `activate()` | Enforced inside the scope; nothing is refused outside it. | `gunicorn`, `uvicorn`, `gunicorn_gevent` |
+| A scope that allows what the policy refuses | Refused by the policy. A scope cannot widen it. | `gunicorn`, `uvicorn`, `gunicorn_gevent`, `celery` |
+| A log-only scope | Refuses nothing and logs `would block`. | `gunicorn` |
+| A Python child launched inside the scope with `subprocess` or, on the standard loop, `asyncio.create_subprocess_exec` | The child holds, from its start, the policy of the process narrowed by the scope. Also from a Celery task in the eventlet pool. | `gunicorn`, `uvicorn`, `celery` |
+
+What a scope does not reach:
+
+- **Another thread.** A thread started inside the block, and work handed to `loop.run_in_executor`, run without the scope and reach what it refuses; the policy of the process still applies to them. `asyncio.to_thread` copies the context and stays inside the scope. Under gevent a "thread" is a greenlet, and it starts without the scope in the same way. Suites: `gunicorn`, `uvicorn`, `gunicorn_gevent`.
+- **A name lookup made in a pool thread.** asyncio's loop and gevent's default resolver call `getaddrinfo` in a thread of a pool, which does not carry the scope. The DNS query for a name the scope refuses therefore leaves the process; a connection to that name is refused by the scope. A blocking lookup in the thread that entered the scope is refused before any query is sent. Suites: `uvicorn`, `gunicorn_gevent`.
+- **A child process under gevent.** gevent's `Popen` forks and calls `os.exec*` from Python, and a scope reaches a child only through the standard library's `Popen`. A Python child launched inside a scope from a gevent worker, or from a Celery task in the gevent pool, holds the policy of the process and not the scope. Suites: `gunicorn_gevent`, `celery`.
+
+Scopes were not measured under the other servers and task queues of this page.
 
 ## Client libraries
 
