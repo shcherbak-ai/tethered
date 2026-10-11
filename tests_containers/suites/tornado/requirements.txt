@@ -1,0 +1,3 @@
+# tornado, and pycurl for tornado.curl_httpclient (the wheel brings its own libcurl).
+tornado==6.5.10
+pycurl==7.48.0
