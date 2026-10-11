@@ -1,0 +1,3 @@
+# Dramatiq with the Redis broker and result backend.
+dramatiq[redis]==2.2.1
+redis==8.1.0

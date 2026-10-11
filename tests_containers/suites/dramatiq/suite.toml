@@ -1,0 +1,14 @@
+description = "Dramatiq: worker processes and threads, forked, from a fork server or spawned, reload, with Redis"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# redis-server is the broker and the result backend, on 127.0.0.1.
+apt = ["redis-server"]
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["dramatiq", "redis"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
