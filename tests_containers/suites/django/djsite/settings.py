@@ -34,6 +34,6 @@ INSTALLED_APPS = ["djapp"]
 MIDDLEWARE = {
     "": [],
     "printed": ["djapp.middleware.EgressBlockedMiddleware"],
-    "process_exception": ["djapp.middleware_process_exception.EgressBlockedMiddleware"],
+    "try_except": ["djapp.middleware_try_except.EgressBlockedMiddleware"],
 }[os.environ.get("TETH_MIDDLEWARE", "")]
 USE_TZ = True

@@ -1,14 +1,15 @@
-"""The Django middleware of docs/COOKBOOK.md ("Django / FastAPI middleware"), as printed.
+"""The Django middleware of ``docs/COOKBOOK.md``, exactly as it is printed there.
 
-Everything from the ``# middleware.py`` line on is the code block of the
-cookbook, character for character; keep it that way when the cookbook
-changes, so that the suite tests what the documentation tells people to write.
+Everything between the two marker lines is the code block under "Django /
+FastAPI middleware" in the cookbook, character for character: the code blocks
+of the cookbook are meant to work as printed, and this suite is what checks
+it for this one.  Do not tidy it up.  When the cookbook changes, copy the
+block again (``tests/test_docs_recipes.py`` fails until the two agree).
 """
-# ruff: noqa: I001, E501
+
+# ruff: noqa: I001, I002
 # fmt: off
-
-from __future__ import annotations
-
+# --- docs/COOKBOOK.md: begin ---
 # middleware.py
 import logging
 
@@ -23,8 +24,17 @@ class EgressBlockedMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        try:
-            return self.get_response(request)
-        except tethered.EgressBlocked as e:
-            logger.error("Egress blocked: %s:%s (resolved_from=%s)", e.host, e.port, e.resolved_from)
-            return HttpResponse("Service unavailable", status=503)
+        return self.get_response(request)
+
+    def process_exception(self, request, exception):
+        if not isinstance(exception, tethered.EgressBlocked):
+            return None
+        logger.error(
+            "Egress blocked: %s:%s (resolved_from=%s)",
+            exception.host,
+            exception.port,
+            exception.resolved_from,
+        )
+        return HttpResponse("Service unavailable", status=503)
+# --- docs/COOKBOOK.md: end ---
+# fmt: on

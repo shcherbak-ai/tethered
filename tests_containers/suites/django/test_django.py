@@ -192,12 +192,13 @@ class TestUnderGunicorn:
 
 
 class TestCookbookMiddleware:
-    def test_the_middleware_as_printed_does_not_see_the_refusal_of_a_view(self) -> None:
-        """Limit: the recipe wraps ``get_response()`` in ``try`` / ``except``, and Django has
-        turned the view's exception into a 500 response before that call returns.  The
-        connection is refused all the same; the request ends as a 500, not the recipe's 503.
+    def test_a_middleware_that_catches_around_get_response_does_not_see_the_refusal(self) -> None:
+        """Limit: a ``try`` / ``except`` around ``get_response()`` is too late in Django, which
+        has turned the view's exception into a 500 response before that call returns.  The
+        connection is refused all the same; the request ends as a 500.  (The cookbook printed
+        its recipe this way once; it uses ``process_exception()`` now, tested below.)
         """
-        env = {"TETH_ACTIVATE": "locked", "TETH_MIDDLEWARE": "printed"}
+        env = {"TETH_ACTIVATE": "locked", "TETH_MIDDLEWARE": "try_except"}
         server = start_server(GUNICORN, env=env)
         reply = server.get(TO_FORBIDDEN + "&uncaught=1")
         assert reply.status == 500
@@ -209,8 +210,8 @@ class TestCookbookMiddleware:
         assert server.get(TO_ALLOWED + "&uncaught=1").json()["outcome"] == "reached"
         assert arrivals() == {AT_ALLOWED: 1}
 
-    def test_a_middleware_with_process_exception_answers_the_refusal_with_a_503(self) -> None:
-        env = {"TETH_ACTIVATE": "locked", "TETH_MIDDLEWARE": "process_exception"}
+    def test_the_middleware_as_printed_answers_the_refusal_with_a_503(self) -> None:
+        env = {"TETH_ACTIVATE": "locked", "TETH_MIDDLEWARE": "printed"}
         server = start_server(GUNICORN, env=env)
         reply = server.get(TO_FORBIDDEN + "&uncaught=1")
         assert (reply.status, reply.text) == (503, "Service unavailable")
