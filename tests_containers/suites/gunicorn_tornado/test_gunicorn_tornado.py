@@ -130,9 +130,11 @@ class TestWorkers:
 
     def test_launches_are_handled_as_under_any_gunicorn_worker(self, server: Server) -> None:
         # The standard library's subprocess: the events are subprocess.Popen events.
+        # A child given an environment without the policy gets the lock all the same.
         report = server.probe("child", FORBIDDEN_NAME, OTHER_PORT, how="clean_env")
-        assert_refused(report, SUBPROCESS_BLOCKED)
-        assert "env strips _TETHERED_CHILD_POLICY" in report["message"]
+        assert report["outcome"] == "reached", report
+        assert report["child"]["locked"] is True, report
+        assert_refused(report["child"])
         assert arrivals() == {}
         report = server.probe("tool", FORBIDDEN_NAME, OTHER_PORT)
         assert report["outcome"] == "reached", report

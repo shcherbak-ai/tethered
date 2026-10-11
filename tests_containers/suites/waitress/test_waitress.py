@@ -135,12 +135,15 @@ class TestThreads:
         assert arrivals() == {}
         assert "external subprocess" not in server.log_of_this_test
 
-    def test_a_child_given_an_environment_without_the_policy_is_not_launched(
+    def test_a_child_given_an_environment_without_the_policy_gets_the_lock_all_the_same(
         self, server: Server
     ) -> None:
+        # The lock adds the variable to the child's environment (it used to
+        # refuse the launch).
         report = server.probe("child", FORBIDDEN_NAME, OTHER_PORT, how="clean_env")
-        assert_refused(report, SUBPROCESS_BLOCKED)
-        assert "env strips _TETHERED_CHILD_POLICY" in report["message"]
+        assert report["outcome"] == "reached", report
+        assert_locked(report["child"])
+        assert_refused(report["child"])
         assert arrivals() == {}
 
     def test_a_tool_is_warned_about_and_is_not_restricted(self, server: Server) -> None:
@@ -153,11 +156,12 @@ class TestThreads:
 class TestOtherPolicies:
     def test_under_block_only_a_child_started_with_sys_executable_is_launched(self) -> None:
         server = start_server(WAITRESS, env={"TETH_ACTIVATE": "locked", "TETH_ESP": "block"})
-        report = server.probe("child", FORBIDDEN_NAME, OTHER_PORT)
-        assert report["outcome"] == "reached", report
-        assert_locked(report["child"])
-        assert_refused(report["child"])
-        for how in ("path_python", "no_site", "clean_env"):
+        for how in ("executable", "clean_env"):
+            report = server.probe("child", FORBIDDEN_NAME, OTHER_PORT, how=how)
+            assert report["outcome"] == "reached", report
+            assert_locked(report["child"])
+            assert_refused(report["child"])
+        for how in ("path_python", "no_site"):
             assert_refused(
                 server.probe("child", FORBIDDEN_NAME, OTHER_PORT, how=how), SUBPROCESS_BLOCKED
             )
