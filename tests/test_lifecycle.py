@@ -9,6 +9,7 @@ environment variable read by child processes.
 from __future__ import annotations
 
 import _thread
+import contextlib
 import ctypes
 import inspect
 import json
@@ -1595,3 +1596,115 @@ class TestHookInstallation:
             "scopes": 0,
             "active_scope_count": 0,
         }
+
+
+_FORK_WITH_A_HELD_LOCK = """
+import os, signal, socket, threading
+import tethered
+import tethered._core as core
+
+tethered.activate(allow=["*.example.com"])
+held = threading.Event()
+
+
+def hold():
+    core._ip_map_lock.acquire()
+    core._lifecycle_lock.acquire()
+    held.set()
+    threading.Event().wait()
+
+
+threading.Thread(target=hold, daemon=True).start()
+assert held.wait(10)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(20)
+    try:
+        socket.getaddrinfo("localhost", 80)  # records the address: needs _ip_map_lock
+        tethered.activate(allow=["*.example.org"])  # needs _lifecycle_lock
+    except BaseException:
+        os._exit(3)
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+print("child", os.waitstatus_to_exitcode(status), flush=True)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "register_at_fork"), reason="a process cannot fork on this platform"
+)
+class TestLocksAfterFork:
+    """A lock that another thread held when the process forked must not hang the child.
+
+    ``os.fork()`` copies one thread; a lock held by any other is copied
+    locked, with nobody left to release it.  tethered resets its locks in
+    the child, in place.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _held_by_another_thread(lock):
+        """Run the block while another thread holds ``lock``."""
+        taken, done = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            lock.acquire()
+            taken.set()
+            done.wait(60)
+            # Reset behind this thread's back if the test went well; still
+            # held, and to be given back, if it did not.
+            with contextlib.suppress(RuntimeError):
+                lock.release()
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        assert taken.wait(10)
+        try:
+            yield
+        finally:
+            done.set()
+            thread.join(10)
+
+    @pytest.mark.parametrize("name", ["_state_lock", "_ip_map_lock", "_scope_count_lock"])
+    def test_a_lock_another_thread_held_is_free_again(self, name):
+        lock = getattr(_core, name)
+        with self._held_by_another_thread(lock):
+            assert lock.acquire(blocking=False) is False
+            _core._reinit_locks_after_fork()
+            assert getattr(_core, name) is lock  # reset in place: the pinned object
+            assert lock.acquire(blocking=False) is True
+            lock.release()
+
+    def test_the_lifecycle_lock_another_thread_held_is_free_again(self):
+        with self._held_by_another_thread(_core._lifecycle_lock):
+            assert _core._lifecycle_lock.acquire(blocking=False) is False
+            _core._reinit_locks_after_fork()
+            assert _core._lifecycle_lock.acquire(blocking=False) is True
+            _core._lifecycle_lock.release()
+
+    def test_a_lifecycle_lock_the_forking_thread_holds_stays_its_own(self):
+        with _core._lifecycle_lock:
+            _core._reinit_locks_after_fork()
+            assert _core._lifecycle_lock._is_owned()
+        # ... and was released by the with: taking it again from here works.
+        assert _core._lifecycle_lock.acquire(blocking=False) is True
+        _core._lifecycle_lock.release()
+
+    def test_the_stand_in_claim_is_reset_too(self, monkeypatch):
+        """Without the C extension the claim is a lock of this module's own."""
+        claim = _core._UnsharedClaim()
+        monkeypatch.setattr(_core, "_activation_claim", claim)
+        with self._held_by_another_thread(claim._lock):
+            _core._reinit_locks_after_fork()
+            assert claim._lock.acquire(blocking=False) is True
+            claim._lock.release()
+
+    def test_a_forked_child_is_not_stuck_behind_a_lock_of_another_thread(self, tmp_path):
+        """End to end: before the reset, the child waited for ever at its first lookup."""
+        script = tmp_path / "fork_with_a_held_lock.py"
+        script.write_text(_FORK_WITH_A_HELD_LOCK, encoding="utf-8")
+        result = subprocess.run(  # nosec B603
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+        )
+        assert result.stdout.strip() == "child 0", result.stderr

@@ -342,6 +342,45 @@ _active_scope_count: int = 0
 _scope_count_lock = threading.Lock()
 
 
+if hasattr(os, "register_at_fork"):  # pragma: no cover — POSIX only
+
+    def _reinit_locks_after_fork() -> None:
+        """Make this module's locks usable in a forked child, whoever held them in the parent.
+
+        ``os.fork()`` copies one thread.  A lock that another thread held at
+        that moment is copied locked, and nobody is left in the child to
+        release it: the child's next lookup, connection or ``activate()``
+        would wait for ever.  (The C guardian gives up its activation claim
+        in a forked child for the same reason.)  ``_at_fork_reinit`` resets
+        a lock in place, which is what ``logging`` and ``threading`` do with
+        their own: the objects stay the ones the guardian has pinned.  A
+        re-entrant lock that the forking thread itself holds is left alone,
+        since its owner is alive and will release it.
+
+        What the locks guard is left as the other thread had it.  That is
+        safe here: the address map and the scope count are changed in single
+        steps, and a transition that was under way in the parent is one the
+        child either sees committed or does not see at all (the commit is
+        one assignment).
+
+        Defined only where a process can fork: locks have no
+        ``_at_fork_reinit`` elsewhere.  Coverage is not counted for it (the
+        figure is taken on every platform); ``TestLocksAfterFork`` tests it
+        wherever it exists.
+        """
+        # Both methods are private to the lock types and absent from their
+        # stubs, hence called by name.
+        reinit = operator.methodcaller("_at_fork_reinit")
+        is_owned = operator.methodcaller("_is_owned")
+        for lock in (_state_lock, _ip_map_lock, _scope_count_lock):
+            reinit(lock)
+        for rlock in (_lifecycle_lock, getattr(_activation_claim, "_lock", None)):
+            if rlock is not None and not is_owned(rlock):
+                reinit(rlock)
+
+    os.register_at_fork(after_in_child=_reinit_locks_after_fork)
+
+
 def _adjust_scope_count(delta: int) -> None:
     """Add ``delta`` to the process-wide count of active scope entries."""
     global _active_scope_count
