@@ -164,6 +164,10 @@ def _cleanup():
     _core._active_scope_count = 0
     os.environ.pop(_CHILD_POLICY_ENV, None)
     _core._env_dirty = False
+    # The once-per-process hint for a refused address is off unless a test
+    # asks for it: it would otherwise appear in whichever test refuses an
+    # address first.
+    _core._unnamed_address_hint_pending = False
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -46,7 +46,13 @@ from measure import Attempt
 
 ALL_FOUR = ["forbidden_name", "forbidden_address", "allowed", "other_port"]
 #: One row of every kind, for the questions that do not need the whole table.
-REPRESENTATIVES = ["requests", "gevent", "psycopg2", "psycopg-binary-sync", "aiohttp-aiodns"]
+REPRESENTATIVES = [
+    "requests",
+    "gevent",
+    "psycopg2",
+    "psycopg-binary-sync",
+    "aiohttp-aiodns-imported-first",
+]
 #: The warning for the launch ``ctypes.util.find_library`` makes on Linux.
 LDCONFIG_WARNING = "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)"
 
@@ -272,6 +278,53 @@ def test_limit_a_log_only_policy_reports_the_allowed_host_of_a_client_that_resol
     assert FORBIDDEN_NAME not in batch.stderr["forbidden_name"]
 
 
+PYCARES_UNDER_A_POLICY = """
+import json
+
+report = {}
+for name in ("pycares", "aiodns"):
+    try:
+        __import__(name)
+        report[name] = "loaded"
+    except ImportError as exc:
+        report[name] = str(exc)
+import aiohttp.resolver
+
+report["aiohttp"] = aiohttp.resolver.DefaultResolver.__name__
+print(json.dumps(report))
+"""
+
+
+@pytest.mark.parametrize("activate", ["plain", "locked", "fail_closed"])
+def test_pycares_is_not_loaded_under_a_policy_and_aiohttp_falls_back(activate: str) -> None:
+    """tethered refuses the import; aiodns then counts as not installed for aiohttp.
+
+    c-ares resolves in C, where tethered sees neither the lookup nor which
+    host an address belongs to, so with it every host allowed by name was
+    refused.  Code that asks for pycares or aiodns by name gets the reason.
+    """
+    report = run_python(PYCARES_UNDER_A_POLICY, activate=activate).json()
+    assert report["pycares"].startswith("tethered: pycares was not loaded"), report
+    assert report["aiodns"].startswith("tethered: pycares was not loaded"), report
+    assert report["aiohttp"] == "ThreadedResolver", report
+
+
+@pytest.mark.parametrize("activate", ["none", "log_only"])
+def test_pycares_is_loaded_where_nothing_is_refused(activate: str) -> None:
+    report = run_python(PYCARES_UNDER_A_POLICY, activate=activate).json()
+    assert report == {"pycares": "loaded", "aiodns": "loaded", "aiohttp": "AsyncResolver"}
+
+
+def test_a_refused_address_without_a_name_is_explained_once() -> None:
+    """The first refusal by address says where the name went; the others do not repeat it."""
+    variant = catalog.TABLE["aiohttp-aiodns-imported-first"]
+    batch = measure.run_batch(variant, measure.under("plain"))
+    for case in ALL_FOUR:
+        hints = batch.stderr[case].count("tethered: no hostname is known for the refused address")
+        assert hints == 1, batch.stderr[case]
+    assert "aiohttp.ThreadedResolver()" in batch.stderr["allowed"]
+
+
 # ── What makes it work ────────────────────────────────────────────────
 
 
@@ -305,7 +358,7 @@ def test_knowing_the_allowed_name_is_enough_to_match_its_address() -> None:
     not have to come from a lookup of the application: an exact host name of
     the allow list would do as a candidate just as well.
     """
-    variant = catalog.TABLE["aiohttp-aiodns"]
+    variant = catalog.TABLE["aiohttp-aiodns-imported-first"]
     lookup = {"CLIENT_LOOKUP_FIRST": "gethostbyname"}
     batch = measure.run_batch(variant, measure.under("plain"), env=lookup)
     assert arrived(batch) == ["allowed"], batch.reports
@@ -316,7 +369,7 @@ def test_knowing_the_allowed_name_is_enough_to_match_its_address() -> None:
 
 def test_an_address_rule_makes_the_allowed_host_reachable() -> None:
     # The rule names the address: no name is needed to allow the connection.
-    variant = catalog.TABLE["aiohttp-aiodns"]
+    variant = catalog.TABLE["aiohttp-aiodns-imported-first"]
     rule = {"TETH_ALLOW": f"{ALLOWED_ADDR}:9001"}
     batch = measure.run_batch(variant, measure.under("plain"), env=rule)
     assert arrived(batch) == ["allowed"], batch.reports

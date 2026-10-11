@@ -82,6 +82,10 @@ UNSEEN = Expect(False, False, "ARRIVED", True, "ARRIVED", "arrived", "ARRIVED", 
 #: The library resolves the name itself and connects through Python: tethered
 #: sees a connection to an address it has no name for.
 OWN_LOOKUP = Expect(False, True, "blocked", True, "blocked", "REFUSED", "blocked")
+#: Left to itself the library resolves in C (no lookup event in the control
+#: run); under a policy tethered keeps that resolver from loading and the
+#: library falls back to Python's, so everything is checked.
+SEEN_BY_FALLBACK = Expect(False, True, "blocked", False, "blocked", "arrived", "blocked")
 #: The library looks the name up through Python and hands the address to a C
 #: library that connects: the name is checked, the address and the port are not.
 LOOKUP_ONLY = Expect(True, False, "blocked", False, "ARRIVED", "arrived", "ARRIVED")
@@ -200,11 +204,20 @@ TABLE = _variants(
     ),
     Variant(
         "aiohttp-aiodns",
-        "aiohttp, aiodns installed (its default resolver is then c-ares)",
+        "aiohttp, aiodns installed (tethered keeps pycares from loading: its threaded resolver)",
+        "clients_http:aiohttp_get",
+        ("aiohttp", "aiodns", "pycares"),
+        SEEN_BY_FALLBACK,
+        "c-ares without tethered; under a policy pycares is not loaded: " + LOOP,
+    ),
+    Variant(
+        "aiohttp-aiodns-imported-first",
+        "aiohttp, aiodns installed, imported before the policy (its resolver is then c-ares)",
         "clients_http:aiohttp_get",
         ("aiohttp", "aiodns", "pycares"),
         OWN_LOOKUP,
         CARES,
+        import_first=("aiohttp",),
     ),
     Variant(
         "aiohttp-no-aiodns",
@@ -533,19 +546,21 @@ TABLE = _variants(
     ),
     Variant(
         "pycares-then-connect",
-        "pycares lookup, then a socket connection to the address",
+        "pycares imported before the policy: a lookup, then a socket connection to the address",
         "clients_lowlevel:pycares_then_connect",
         ("pycares",),
         OWN_LOOKUP,
         CARES,
+        import_first=("pycares",),
     ),
     Variant(
         "aiodns-then-connect",
-        "aiodns lookup, then asyncio.open_connection to the address",
+        "aiodns imported before the policy: a lookup, then asyncio.open_connection to the address",
         "clients_lowlevel:aiodns_then_connect",
         ("aiodns", "pycares"),
         OWN_LOOKUP,
         CARES,
+        import_first=("aiodns",),
     ),
     # ── Other runtimes ────────────────────────────────────────────────
     Variant(
@@ -705,12 +720,13 @@ DNS_SERVER_VARIANTS = _variants(
     ),
     Variant(
         "pycares-query-server",
-        "pycares, a query to a name server",
+        "pycares imported before the policy, a query to a name server",
         "clients_lowlevel:pycares_query_server",
         ("pycares",),
         UNSEEN,
         "c-ares sends in C",
         proto="udp",
+        import_first=("pycares",),
     ),
 )
 

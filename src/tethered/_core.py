@@ -511,18 +511,31 @@ _proactor_warning_pending: bool = sys.platform == "win32"
 # through it — see _warn_if_uvloop.
 _uvloop_warning_pending: bool = sys.platform != "win32"
 
-# The ``import`` events at which loading uvloop is refused while a policy is
-# active — see _refuse_uvloop_import.  ``import uvloop`` raises one for the
-# package.  ``importlib.import_module("uvloop")`` raises none for it, only for
-# what the package's ``__init__`` imports, of which ``uvloop.loop`` is the
-# extension that holds the event loop.  Neither is raised again once uvloop is
-# loaded, so a uvloop that was imported before the policy is not touched here.
-_UVLOOP_IMPORT_NAMES = frozenset(("uvloop", "uvloop.loop"))
+# Libraries that are not loaded while a policy is active — see
+# _refuse_import.  Both do their networking where no audit event is raised,
+# and what prefers them takes Python's socket module when they cannot be
+# imported: uvloop (uvicorn then runs on the standard asyncio event loop) and
+# pycares, the c-ares binding behind aiodns (aiohttp then uses its threaded
+# resolver).
+#
+# The keys are the names of the ``import`` audit events at which each is
+# refused.  ``import uvloop`` raises one for the package.
+# ``importlib.import_module("uvloop")`` raises none for it, only for what the
+# package's ``__init__`` imports, of which ``uvloop.loop`` is the extension
+# that holds the event loop (and ``pycares._cares`` the one that holds
+# c-ares).  Neither event is raised again once the library is loaded, so one
+# that was imported before the policy is not touched here.
+_REFUSED_IMPORTS = {
+    "uvloop": "uvloop",
+    "uvloop.loop": "uvloop",
+    "pycares": "pycares",
+    "pycares._cares": "pycares",
+}
 
-# True until that refusal has been logged.  Servers that pick uvloop on their
-# own catch the ImportError and fall back to another loop without a word, so
-# the log line is the only sign of why they run on it.
-_uvloop_refusal_unlogged: bool = True
+# The libraries whose refusal has been logged.  What prefers them catches the
+# ImportError and falls back without a word, so the log line is the only sign
+# of why.
+_import_refusals_logged: set[str] = set()
 
 _UVLOOP_IMPORT_REFUSED_MSG = (
     "tethered: uvloop was not loaded — a policy is active, and a uvloop event loop does "
@@ -531,6 +544,42 @@ _UVLOOP_IMPORT_REFUSED_MSG = (
     "a server that chooses uvloop automatically (uvicorn) does so on its own after this "
     "error."
 )
+
+_PYCARES_IMPORT_REFUSED_MSG = (
+    "tethered: pycares was not loaded — a policy is active, and c-ares looks names up "
+    "outside Python's socket module, where tethered sees neither the lookup nor which "
+    "host an address belongs to: connections to the hosts it resolved would be refused, "
+    "allowed ones included. Resolve through the system resolver; aiohttp does so on its "
+    "own after this error (aiodns then counts as not installed)."
+)
+
+# What is said, once per library, when its import is refused: the level, the
+# log line, and the message of the ImportError.
+_IMPORT_REFUSALS = {
+    "uvloop": (
+        logging.WARNING,
+        "tethered: refused to load uvloop while a policy is active — nothing that goes "
+        "through a uvloop event loop is seen by tethered. A server that chooses its "
+        "event loop automatically now runs on the standard asyncio event loop, where "
+        "the policy is enforced; code that requires uvloop fails with ImportError. Name "
+        "the standard loop in the server's configuration (uvicorn: --loop asyncio) and "
+        "this is not logged.",
+        _UVLOOP_IMPORT_REFUSED_MSG,
+    ),
+    "pycares": (
+        logging.INFO,
+        "tethered: refused to load pycares (c-ares) while a policy is active — names it "
+        "resolves are looked up where tethered does not see them, so no hostname rule "
+        "could be applied to them. aiohttp now resolves through Python's socket module "
+        "(aiodns counts as not installed); code that requires pycares or aiodns fails "
+        "with ImportError.",
+        _PYCARES_IMPORT_REFUSED_MSG,
+    ),
+}
+
+# True until the hint for a refused address that no hostname is known for has
+# been logged — see _hint_at_unnamed_address.
+_unnamed_address_hint_pending: bool = True
 
 _UVLOOP_LOADED_MSG = (
     "tethered: activate() refused — uvloop is loaded in this process. A uvloop event loop "
@@ -836,14 +885,15 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
     if cfg is None:
         return
 
-    # An event loop the hook cannot see into is not loaded under a policy.
-    # A log-only policy refuses nothing; it gets the warning instead, at the
-    # first socket uvloop creates (_warn_if_uvloop).
+    # A library whose networking the hook cannot see is not loaded under a
+    # policy (_REFUSED_IMPORTS).  A log-only policy refuses nothing; for
+    # uvloop it gets the warning instead, at the first socket the loop
+    # creates (_warn_if_uvloop).
     if event == "import":
         if args and not cfg.log_only:
             name = args[0]
-            if isinstance(name, str) and name in _UVLOOP_IMPORT_NAMES:
-                _refuse_uvloop_import()
+            if isinstance(name, str) and name in _REFUSED_IMPORTS:
+                _refuse_import(_REFUSED_IMPORTS[name])
         return
 
     # Locked-mode-only tamper detection on FS access to tethered.pth.
@@ -925,38 +975,69 @@ def _warn_if_uvloop() -> None:
     )
 
 
-def _refuse_uvloop_import() -> None:
-    """Raise ``ImportError`` for an import of uvloop made while a policy is active.
+def _refuse_import(library: str) -> None:
+    """Raise ``ImportError`` for an import of ``library`` made while a policy is active.
 
-    Nothing that goes through a uvloop event loop raises an audit event, so
-    a process that runs on one has a policy that is applied to none of its
-    asynchronous networking.  That cannot be put right once the loop runs,
-    but it can be prevented while uvloop is still to be loaded: the servers
-    that prefer uvloop (uvicorn and its gunicorn worker among them) take it
-    only if importing it works, and run on the standard asyncio event loop,
-    where the policy is enforced, when it does not.  Code that asks for
-    uvloop by name fails at that import, with the reason, in place of
-    running unprotected.
+    uvloop: nothing that goes through a uvloop event loop raises an audit
+    event, so a process that runs on one has a policy that is applied to
+    none of its asynchronous networking.  That cannot be put right once the
+    loop runs, but it can be prevented while uvloop is still to be loaded:
+    the servers that prefer uvloop (uvicorn and its gunicorn worker among
+    them) take it only if importing it works, and run on the standard
+    asyncio event loop, where the policy is enforced, when it does not.
 
-    This is a guard against a deployment that would silently not be
-    enforced, not a barrier to code that is out to get around tethered:
-    such code can load any other extension that does its own networking.
-    A uvloop that is already loaded is the business of ``activate()``,
-    which refuses (``_UVLOOP_LOADED_MSG``), and of ``_warn_if_uvloop``.
+    pycares: c-ares looks names up in C.  tethered then sees a connection
+    to an address it has no name for, so every hostname rule fails to match
+    and allowed hosts are refused; and the lookup of a forbidden name still
+    leaves the process.  aiohttp uses it whenever aiodns is installed, and
+    falls back to ``socket.getaddrinfo`` in a thread when it is not.
+
+    Code that asks for either by name fails at the import, with the reason,
+    in place of running unprotected or unusable.  This is a guard against a
+    deployment that would silently not be enforced, not a barrier to code
+    that is out to get around tethered: such code can load any other
+    extension that does its own networking.  A uvloop that is already loaded
+    is the business of ``activate()``, which refuses (``_UVLOOP_LOADED_MSG``),
+    and of ``_warn_if_uvloop``; a pycares that is already loaded is left
+    alone (what it resolves is refused: see ``_hint_at_unnamed_address``).
     """
-    global _uvloop_refusal_unlogged
-    if _uvloop_refusal_unlogged:
-        # Cleared before logging: a log handler may itself import something.
-        _uvloop_refusal_unlogged = False
-        logger.warning(
-            "tethered: refused to load uvloop while a policy is active — nothing that goes "
-            "through a uvloop event loop is seen by tethered. A server that chooses its "
-            "event loop automatically now runs on the standard asyncio event loop, where "
-            "the policy is enforced; code that requires uvloop fails with ImportError. Name "
-            "the standard loop in the server's configuration (uvicorn: --loop asyncio) and "
-            "this is not logged."
-        )
-    raise ImportError(_UVLOOP_IMPORT_REFUSED_MSG, name="uvloop")
+    level, line, message = _IMPORT_REFUSALS[library]
+    if library not in _import_refusals_logged:
+        # Recorded before logging: a log handler may itself import something.
+        _import_refusals_logged.add(library)
+        logger.log(level, line)
+    raise ImportError(message, name=library)
+
+
+def _hint_at_unnamed_address(cfg: _Config, address: str) -> None:
+    """Say, once, why a connection to an allowed host may have been refused by address.
+
+    Called for a refused connection to an IP address that no hostname is
+    known for, the fallback search included.  Usually that is simply an
+    address nothing allows.  But a library that resolves names without
+    ``socket.getaddrinfo`` (aiodns / c-ares when it was loaded before the
+    policy, dnspython, eventlet's greendns, gevent's ares resolver) leaves
+    tethered with the address alone, and then every host that is allowed by
+    name is refused.  The refusal reads like any other; this is the line
+    that says what to look at.  Nothing is said for a policy with no
+    hostname rules.
+    """
+    global _unnamed_address_hint_pending
+    policy = cfg.policy
+    if not (policy._host_rule_fields or policy._exact_hosts or policy._exact_hosts_any_port):
+        return
+    # Cleared before logging: a log handler may itself connect somewhere.
+    _unnamed_address_hint_pending = False
+    logger.warning(
+        "tethered: no hostname is known for the refused address %s. If it belongs to a host "
+        "the allow list names, the name was looked up outside Python's socket module "
+        "(aiodns / c-ares, dnspython, eventlet's greendns and gevent's ares resolver do "
+        "that), and a hostname rule cannot match a connection whose name tethered never "
+        "saw. Use the system resolver (aiohttp: resolver=aiohttp.ThreadedResolver() on the "
+        "connector, or activate() before aiohttp is imported; eventlet: "
+        "EVENTLET_NO_GREENDNS=yes), or allow the address itself. This is said once.",
+        address,
+    )
 
 
 def _hint_from_stack(scope_stack: tuple[_ScopeConfig, ...]) -> str | None:
@@ -1581,6 +1662,8 @@ def _handle_connect(
                 port,
                 f" (IP: {host})" if resolved_from and resolved_from != host else "",
             )
+            if _unnamed_address_hint_pending and ip_key is not None and not resolved_from:
+                _hint_at_unnamed_address(cfg, host)
 
             if cfg.on_blocked is not None:
                 try:
@@ -3433,7 +3516,7 @@ def activate(
     # to.  A uvloop that is loaded cannot be taken away again, so the call is
     # refused, as it is when the audit hook cannot be installed (while a
     # policy is active uvloop is not loaded in the first place: see
-    # _refuse_uvloop_import).  A log-only policy refuses nothing, this
+    # _refuse_import).  A log-only policy refuses nothing, this
     # included, and gets the warning.
     if not log_only and "uvloop" in sys.modules:
         # Logged as well as raised.  The exception does not always reach

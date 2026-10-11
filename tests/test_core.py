@@ -3909,7 +3909,7 @@ class TestUvloopRefusal:
         (package / "loop.py").write_text("class Loop:\n    pass\n", encoding="utf-8")
         (package / "extra.py").write_text("VALUE = 1\n", encoding="utf-8")
         monkeypatch.syspath_prepend(str(tmp_path))
-        monkeypatch.setattr(_core, "_uvloop_refusal_unlogged", True)
+        monkeypatch.setattr(_core, "_import_refusals_logged", set())
         monkeypatch.setattr(_core, "_uvloop_warning_pending", False)
         yield
         for name in [m for m in sys.modules if m == "uvloop" or m.startswith("uvloop.")]:
@@ -3933,7 +3933,7 @@ class TestUvloopRefusal:
         (message,) = _uvloop_refusals(caplog)
         assert "standard asyncio event loop" in message
         assert "(uvicorn: --loop asyncio) and this is not logged" in message
-        assert _core._uvloop_refusal_unlogged is False
+        assert _core._import_refusals_logged == {"uvloop"}
 
     @pytest.mark.parametrize("name", ["uvloop", "uvloop.loop"])
     def test_the_hook_refuses_both_events(self, uvloop_on_path, name, caplog):
@@ -4034,6 +4034,159 @@ class TestUvloopRefusal:
         monkeypatch.delitem(sys.modules, "uvloop", raising=False)
         tethered.activate(allow=["*.example.com"], fail_closed=True)
         assert _core._config is not None
+
+
+class TestPycaresRefusal:
+    """pycares, the c-ares binding behind aiodns, is not loaded under a policy either.
+
+    c-ares looks names up in C.  tethered then sees connections to addresses
+    it has no names for, so no hostname rule matches and every host that is
+    allowed by name is refused; aiohttp resolves that way whenever aiodns is
+    installed.  With pycares unimportable, aiodns is too, and aiohttp falls
+    back to ``socket.getaddrinfo`` in a thread, which tethered sees.  The
+    stand-ins have the shape of the real packages: ``pycares`` imports its
+    ``_cares`` extension, ``aiodns`` imports ``pycares``.
+    """
+
+    @pytest.fixture
+    def pycares_on_path(self, tmp_path, monkeypatch):
+        for name, lines in {
+            "pycares/__init__.py": "from ._cares import ffi\n",
+            "pycares/_cares.py": "ffi = object()\n",
+            "aiodns/__init__.py": "import pycares\n",
+        }.items():
+            path = tmp_path / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(lines, encoding="utf-8")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(_core, "_import_refusals_logged", set())
+        yield
+        for name in [m for m in sys.modules if m.split(".")[0] in ("pycares", "aiodns")]:
+            del sys.modules[name]
+
+    @pytest.mark.parametrize("name", ["pycares", "pycares._cares"])
+    def test_the_hook_refuses_both_events(self, pycares_on_path, name, caplog):
+        event = ("import", (name, None, None, None, None))
+        tethered.activate(allow=["*.example.com"])
+        with caplog.at_level(logging.INFO, logger="tethered"):
+            for _ in range(2):
+                with pytest.raises(ImportError, match="tethered: pycares was not loaded") as exc:
+                    _audit_hook(*event)
+        assert exc.value.name == "pycares"
+        # Said once, and as information: this is a default installation working as it should.
+        (record,) = [r for r in caplog.records if "refused to load pycares" in r.getMessage()]
+        assert record.levelno == logging.INFO
+        assert _core._import_refusals_logged == {"pycares"}
+
+    def test_every_way_of_importing_it_is_refused(self, pycares_on_path):
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(ImportError, match="pycares was not loaded"):
+            __import__("pycares")
+        with pytest.raises(ImportError, match="pycares was not loaded"):
+            importlib.import_module("pycares")  # no event for the package: refused at _cares
+        assert "pycares" not in sys.modules
+
+    def test_what_prefers_it_can_fall_back(self, pycares_on_path):
+        """The shape of aiohttp's choice of resolver: aiodns if it imports."""
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(ImportError, match="pycares was not loaded"):
+            __import__("aiodns")
+        assert "aiodns" not in sys.modules
+
+    def test_a_log_only_policy_lets_it_load(self, pycares_on_path):
+        tethered.activate(allow=["*.example.com"], log_only=True)
+        assert __import__("aiodns").pycares.ffi is not None
+
+    def test_a_pycares_that_is_loaded_does_not_stop_activation(self, pycares_on_path):
+        """Unlike uvloop: what it resolves is refused, so nothing gets out unnoticed."""
+        __import__("aiodns")
+        tethered.activate(allow=["*.example.com"], fail_closed=True)
+        assert _core._config is not None
+
+
+class TestUnnamedAddressHint:
+    """One line, once, for a refused address that no hostname is known for.
+
+    A library that resolves names without ``socket.getaddrinfo`` leaves
+    tethered with the address alone, and then every host that is allowed by
+    name is refused, with a message that names an address the user has never
+    seen.  The hint says what to look at.  (The test-suite fixture keeps the
+    flag clear; these tests set it.)
+    """
+
+    _CONNECT = ("socket.connect", (None, ("203.0.113.9", 443)))
+
+    @pytest.fixture(autouse=True)
+    def _hint_pending(self, monkeypatch):
+        monkeypatch.setattr(_core, "_unnamed_address_hint_pending", True)
+
+    @staticmethod
+    def _hints(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("tethered: no hostname is known for the refused address")
+        ]
+
+    @pytest.mark.parametrize(
+        "allow", [["*.example.com"], ["api.example.com"], ["db.internal:5432"]]
+    )
+    def test_said_once_for_a_policy_with_hostname_rules(self, allow, caplog):
+        tethered.activate(allow=allow)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            for _ in range(2):
+                with pytest.raises(tethered.EgressBlocked):
+                    _audit_hook(*self._CONNECT)
+        (hint,) = self._hints(caplog)
+        assert "203.0.113.9" in hint
+        assert "aiohttp.ThreadedResolver()" in hint
+        assert "EVENTLET_NO_GREENDNS=yes" in hint
+        assert len(caplog.records) == 3  # two refusals, one hint
+        assert _core._unnamed_address_hint_pending is False
+
+    def test_said_under_a_log_only_policy_too(self, caplog):
+        tethered.activate(allow=["*.example.com"], log_only=True)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            _audit_hook(*self._CONNECT)
+        assert len(self._hints(caplog)) == 1
+
+    def test_not_said_for_a_policy_without_hostname_rules(self, caplog):
+        tethered.activate(allow=["10.0.0.0/8", "192.0.2.1:443"])
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.EgressBlocked),
+        ):
+            _audit_hook(*self._CONNECT)
+        assert self._hints(caplog) == []
+        assert _core._unnamed_address_hint_pending is True  # still to be said, if it comes to it
+
+    def test_not_said_when_the_address_has_a_name(self, caplog):
+        tethered.activate(allow=["*.example.com"])
+        with _core._ip_map_lock:
+            _core._record_ip_name("203.0.113.9", "elsewhere.example.org")
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.EgressBlocked) as exc_info,
+        ):
+            _audit_hook(*self._CONNECT)
+        assert exc_info.value.resolved_from == "elsewhere.example.org"
+        assert self._hints(caplog) == []
+
+    def test_not_said_for_a_destination_given_by_name(self, caplog):
+        tethered.activate(allow=["*.example.com"])
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.EgressBlocked),
+        ):
+            _audit_hook("socket.connect", (None, ("elsewhere.example.org", 443)))
+        assert self._hints(caplog) == []
+
+    def test_not_said_once_the_flag_is_clear(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_unnamed_address_hint_pending", False)
+        monkeypatch.setattr(_core, "_hint_at_unnamed_address", _raise_runtime)
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(tethered.EgressBlocked):
+            _audit_hook(*self._CONNECT)
 
 
 class TestScopeExitOutOfOrder:

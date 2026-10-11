@@ -1526,8 +1526,13 @@ class TestLockedLogOnlyPolicy:
         warnings = result.pop("warnings")
         assert "tethered: blocked connect to 203.0.113.9:443" in warnings
         assert "tethered: blocked getaddrinfo for host.test" in warnings
-        assert len(warnings) == len(events["connect"]) + len(events["lookup"])
-        assert len(result) == 5 + len(warnings)
+        # One line per event, and once the hint that goes with the first
+        # address nothing is known about.
+        blocked = [line for line in warnings if line.startswith("tethered: blocked ")]
+        assert len(blocked) == len(events["connect"]) + len(events["lookup"])
+        (hint,) = [line for line in warnings if line not in blocked]
+        assert hint.startswith("tethered: no hostname is known for the refused address 203.0.113.9")
+        assert len(result) == 5 + len(blocked)
         assert set(result.values()) == {"ok"}
         assert _connection_arrived(listener)
         assert _connection_arrived(listener)
@@ -1662,7 +1667,10 @@ class TestLockedLogOnlyPolicy:
         assert result["names"] == ["localhost"]
         assert result["by name warnings"] == []
         assert result["elsewhere"] == "ok"
-        assert result["warnings"] == ["tethered: blocked connect to 203.0.113.9:443"]
+        blocked, hint = result["warnings"]
+        assert blocked == "tethered: blocked connect to 203.0.113.9:443"
+        # The address is one no name was ever looked up for: said once.
+        assert hint.startswith("tethered: no hostname is known for the refused address 203.0.113.9")
         # The extension loads in an interpreter of either kind, so the lookup
         # that learns the name always goes through the guardian.
         assert result["through the guardian"] is True
