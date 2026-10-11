@@ -1,0 +1,28 @@
+# Celery with the Redis transport and result backend (the "redis" extra keeps
+# redis-py inside the range kombu supports).  packaging is also a requirement
+# of pytest: keep the pin equal to harness/requirements.txt.
+celery[redis]==5.6.3
+amqp==5.4.1
+billiard==4.3.1
+click==8.5.0
+click-didyoumean==0.3.1
+click-plugins==1.1.1.2
+click-repl==0.4.1
+kombu==5.6.2
+packaging==26.3
+prompt_toolkit==3.0.53
+python-dateutil==2.9.0.post0
+redis==6.4.0
+six==1.17.0
+typing_extensions==4.16.0
+tzdata==2026.5
+tzlocal==5.4.4
+vine==5.1.0
+wcwidth==0.9.2
+# The green pools: --pool gevent and --pool eventlet.
+gevent==26.9.0
+greenlet==3.5.6
+zope.event==6.2
+zope.interface==8.6
+eventlet==0.41.2
+dnspython==2.9.0
