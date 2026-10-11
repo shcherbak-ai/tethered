@@ -1,0 +1,2 @@
+# Nothing beyond the harness's own requirements: the pools under test are the
+# standard library's (pool_server.py).
