@@ -1,0 +1,13 @@
+description = "Django: activation in settings.py, under gunicorn, in management commands, and under runserver with its autoreloader"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+apt = []
+compiler = false
+# The packages whose versions the runner prints in its summary.
+key_packages = ["django", "gunicorn", "requests"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]

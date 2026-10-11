@@ -1,0 +1,16 @@
+# Django and what it needs.  Django 6 requires Python 3.12, so Python 3.11
+# gets the newest release of the 5.2 long-term series.
+Django==6.1.2; python_version >= "3.12"
+Django==5.2.18; python_version < "3.12"
+asgiref==3.12.1
+sqlparse==0.6.0
+# The server.  packaging is also a requirement of pytest: keep the pin equal
+# to harness/requirements.txt.
+gunicorn==26.2.0
+packaging==26.3
+# The HTTP client the views use, and what it needs.
+requests==2.34.2
+urllib3==2.8.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
