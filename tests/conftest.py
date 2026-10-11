@@ -146,6 +146,25 @@ def _unlock_guardian() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_exec(monkeypatch):
+    """Fail a test that lets tethered replace the test process.
+
+    tethered's launch hook carries out some ``os.exec*`` calls itself
+    (``_core._exec_with_policy``).  A test that reaches that with the real
+    ``os.execve`` in place does not fail: pytest is gone, and the run ends
+    without a summary.  Tests about that route put their own stand-in here.
+    """
+
+    def refuse(path, argv, env):
+        raise AssertionError(
+            f"a test would have replaced the test process with {path!r}: "
+            "replace os.execve in the test"
+        )
+
+    monkeypatch.setattr(os, "execve", refuse)
+
+
+@pytest.fixture(autouse=True)
 def _cleanup():
     """Reset tethered state after each test.
 

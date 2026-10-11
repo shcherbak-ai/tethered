@@ -2776,7 +2776,7 @@ def _inject_launch_env(
 
 
 def _exec_with_policy(
-    cfg: _Config, args: tuple[Any, ...], pairs: list[tuple[Any, Any]], payload: str
+    args: tuple[Any, ...], pairs: list[tuple[Any, Any]], payload: str, *, announce: bool = False
 ) -> None:
     """Carry out an ``os.exec*`` of this interpreter with the policy in its environment.
 
@@ -2803,10 +2803,21 @@ def _exec_with_policy(
     Locked mode takes this way only for an environment that simply lacks
     the variable, which is what a caller with a list of its own produces.
     One that carries a different policy is still refused.
+
+    The same call carries an active scope to the new program.  A scope is
+    never in the environment of the process, and on this route there is no
+    frame to write a per-launch copy into as there is under
+    ``subprocess.Popen``; but the caller of an exec is in the context that
+    entered the scope, also after a fork, so the hook knows the scope chain
+    and can put it into ``payload``.  That is how a child launched inside a
+    scope under gevent receives it: gevent's ``Popen`` forks and calls
+    ``os.exec*`` from Python.
+
+    ``announce`` logs the completion, for a locked policy.
     """
     env = {key: value for key, value in pairs if not _is_policy_env_key(key)}
     env[_CHILD_POLICY_ENV] = payload
-    if cfg.locked:
+    if announce:
         logger.warning(
             "tethered: %s was given an environment without %s; carried out with the "
             "locked policy added",
@@ -2950,16 +2961,31 @@ def _handle_subprocess(
     if cfg is None:
         # scope() without activate(): no global payload and no
         # external_subprocess_policy.  The scope chain reaches a Python
-        # child through the ``_execute_child`` frame; no other route has an
-        # env channel tethered can write to.
-        if scope_stack and popen and _is_auto_inheriting_python_launch(event, args):
+        # child through the ``_execute_child`` frame, or through an exec
+        # that is carried out here; no other route has an env channel
+        # tethered can write to.
+        if not (scope_stack and (popen or event == "os.exec")):
+            return
+        if not _is_auto_inheriting_python_launch(event, args):
+            return
+        if popen:
             failure = _inject_launch_env(event, args, scope_stack, None)
-            if failure is not None:
-                logger.warning(
-                    "tethered: scope subprocess propagation unavailable (%s); "
-                    "the child will not inherit the active scope",
-                    failure,
-                )
+        else:
+            expected = _launch_payload(None, scope_stack)
+            _has_env, env_value = _extract_subprocess_env(event, args)
+            pairs = _snapshot_env(os.environ if env_value is None else env_value)
+            if pairs is not None:
+                # (The exec made below raises this event again, with the scope in place.)
+                if _launch_env_state(pairs, expected, expected) != "exact":
+                    _exec_with_policy(args, pairs, expected)
+                return
+            failure = "the launch environment could not be read as a mapping"
+        if failure is not None:
+            logger.warning(
+                "tethered: scope subprocess propagation unavailable (%s); "
+                "the child will not inherit the active scope",
+                failure,
+            )
         return
 
     # ── What is being launched, and with which environment ─────────────
@@ -3029,6 +3055,11 @@ def _handle_subprocess(
     acceptable = True  # the environment carries the canonical global, once
     needs_rewrite = False  # ... but not exactly what this launch must carry
     complete_external = False  # an external program's environment gets the payload
+    # The one route that is carried out here: an exec of this interpreter
+    # does not come back unless the exec itself fails, and then with that
+    # error.  It is how the variable is added to an environment that lacks
+    # it, and how an active scope travels where there is no Popen frame.
+    exec_python = event == "os.exec" and is_python
     if env_value is None:
         state = _process_env_state(payload)
         if state != "exact":
@@ -3040,20 +3071,20 @@ def _handle_subprocess(
                 )
         # Scopes never live in os.environ; they need the per-launch copy.
         needs_rewrite = popen and bool(scope_stack)
+        if exec_python and scope_stack:
+            inherited = _snapshot_env(os.environ)
+            if inherited is not None:
+                _exec_with_policy(args, inherited, _launch_payload(cfg, scope_stack))
     elif cfg.locked or is_python:
-        expected = _launch_payload(cfg, scope_stack) if popen else payload
+        per_launch = popen or exec_python
+        expected = _launch_payload(cfg, scope_stack) if per_launch else payload
         pairs = _snapshot_env(env_value)
         state = "unreadable" if pairs is None else _launch_env_state(pairs, expected, payload)
         acceptable = state in ("exact", "same-global")
-        if (
-            event == "os.exec"
-            and is_python
-            and pairs is not None
-            and (state == "missing" or not (acceptable or cfg.locked))
-        ):
-            # The one route that is carried out here: it does not come back
-            # unless the exec itself fails, and then with that error.
-            _exec_with_policy(cfg, args, pairs, payload)
+        if exec_python and pairs is not None:
+            lacks_the_scope = state == "same-global" and bool(scope_stack)
+            if state == "missing" or lacks_the_scope or not (acceptable or cfg.locked):
+                _exec_with_policy(args, pairs, expected, announce=cfg.locked and state == "missing")
         if cfg.locked and not acceptable:
             if not (popen and state == "missing"):
                 _refuse_launch(event, _describe_launch(event, args, launch_args), "env", state)
@@ -3106,6 +3137,8 @@ def _handle_subprocess(
         elif acceptable:
             # No env channel to write to on this route.  The child gets the
             # at-rest global; an active scope does not travel (documented).
+            # (An exec of this interpreter inside a scope never gets here:
+            # it was carried out above, with the scope in its environment.)
             return
         else:
             reason = f" — its environment lacks {_CHILD_POLICY_ENV} and cannot be rewritten"

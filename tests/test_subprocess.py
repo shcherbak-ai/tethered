@@ -4652,11 +4652,18 @@ class TestLaunchEnvEstablished:
             _handle_subprocess(cfg, event, (*prefix, sys.executable, [sys.executable], None))
         assert _CHILD_POLICY_ENV not in os.environ
 
-    def test_scope_does_not_make_a_route_without_a_frame_external(self, monkeypatch):
-        """Documented limit: the child gets the at-rest global, the scope does not travel."""
+    @pytest.mark.parametrize(("event", "prefix"), [("os.posix_spawn", ()), ("os.spawn", (0,))])
+    def test_scope_does_not_make_a_route_without_a_frame_external(self, event, prefix, monkeypatch):
+        """Documented limit: the child gets the at-rest global, the scope does not travel.
+
+        (An ``os.exec`` is carried out by the hook with the scope in its
+        environment: see ``TestExecCarriesTheScope``.)
+        """
+        monkeypatch.setattr(os, "execve", _fail_if_called)
         cfg = _launch_cfg(external_subprocess_policy="block")
         monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
-        _handle_subprocess(cfg, "os.exec", (sys.executable, [sys.executable], None), (self._SCOPE,))
+        args = (*prefix, sys.executable, [sys.executable], None)
+        _handle_subprocess(cfg, event, args, (self._SCOPE,))
 
     # ── external launches ──────────────────────────────────────────────
 
@@ -4695,10 +4702,14 @@ class TestLaunchEnvEstablished:
     def test_scope_only_leaves_other_launches_alone(self, monkeypatch):
         monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
         monkeypatch.delenv(_CHILD_POLICY_ENV, raising=False)
+        monkeypatch.setattr(os, "execve", _fail_if_called)
         _handle_subprocess(None, "subprocess.Popen", _popen_args(None, "/bin/sh"), (self._SCOPE,))
-        _handle_subprocess(
-            None, "os.exec", (sys.executable, [sys.executable], None), (self._SCOPE,)
-        )
+        # Routes without a way to hand an environment on (an exec has one: the hook
+        # carries it out, see TestExecCarriesTheScope).
+        for event, prefix in (("os.posix_spawn", ()), ("os.spawn", (0,))):
+            args = (*prefix, sys.executable, [sys.executable], None)
+            _handle_subprocess(None, event, args, (self._SCOPE,))
+        _handle_subprocess(None, "os.exec", ("/bin/sh", ["/bin/sh"], None), (self._SCOPE,))
         _handle_subprocess(None, "subprocess.Popen", _popen_args(None), ())
         assert _CHILD_POLICY_ENV not in os.environ
 
@@ -4969,6 +4980,8 @@ class _Replaced(Exception):
     """Raised by the stand-in for ``os.execve``, which really would not return."""
 
 
+_LOCKED_ACTIVATE = 'tethered.activate(allow=["*.example.com"], locked=True, lock_token=object())'
+
 _EXEC_PROBE_PARENT = """\
 import os, sys
 import tethered
@@ -5122,6 +5135,218 @@ class TestExecWithPolicy:
         assert state["active"] is True
         assert state["locked"] is kwargs.get("locked", False)
         assert state["allow"] == ["*.example.com"]
+
+
+_EXEC_IN_SCOPE_PARENT = """\
+import os, sys
+import tethered
+{activate}
+sys.stdout.flush()
+with tethered.scope(allow=["api.example.com"], label="exec-scope"):
+    {call}
+"""
+
+
+class TestExecCarriesTheScope:
+    """An ``os.exec*`` of this interpreter made inside a scope hands the scope on.
+
+    A scope is never in the environment of the process, and an exec has no
+    frame to write a per-launch copy into as ``subprocess.Popen`` has.  The
+    hook is called in the context that entered the scope, also after a fork,
+    so it carries the exec out itself with the scope chain in the payload.
+    gevent's ``Popen`` forks and calls ``os.exec*`` from Python: before
+    this, a child launched inside a scope under gevent held the policy of
+    the process and not the scope.
+    """
+
+    _SCOPE = _ScopeConfig(policy=AllowPolicy(["api.example.com"]), label="exec-scope")
+
+    @pytest.fixture
+    def exec_calls(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def execve(path, argv, env):
+            calls.append((path, argv, env))
+            raise _Replaced
+
+        monkeypatch.setattr(os, "execve", execve)
+        return calls
+
+    def _exec(self, cfg, env, scope_stack=(_SCOPE,), executable=sys.executable):
+        args = (executable, [executable, "-c", "pass"], env)
+        _handle_subprocess(cfg, "os.exec", args, scope_stack)
+
+    @staticmethod
+    def _scoped(cfg):
+        """The payload a launch inside the scope must carry: the global and one scope."""
+        payload = _core._launch_payload(cfg, (TestExecCarriesTheScope._SCOPE,))
+        parsed = json.loads(payload)
+        assert len(parsed["scopes"]) == 1, payload
+        assert (parsed["global"] is None) is (cfg is None), payload
+        return payload
+
+    # ── Under a policy ────────────────────────────────────────────────
+
+    def test_an_inherited_environment_is_replaced_by_one_with_the_scope(
+        self, exec_calls, monkeypatch
+    ):
+        cfg = _launch_cfg_in_force(monkeypatch)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        monkeypatch.setenv("TETHERED_SENTINEL", "kept")
+        with pytest.raises(_Replaced):
+            self._exec(cfg, None)
+        ((path, argv, env),) = exec_calls
+        assert (path, argv) == (sys.executable, [sys.executable, "-c", "pass"])
+        # Everything the process had, and the scope in the one policy entry.
+        expected = dict(os.environ)
+        expected[_CHILD_POLICY_ENV] = self._scoped(cfg)
+        assert env == expected
+        assert env["TETHERED_SENTINEL"] == "kept"
+        # The environment of the process itself still holds no scope.
+        assert os.environ[_CHILD_POLICY_ENV] == _core._canonical_payload(cfg)
+
+    @pytest.mark.parametrize("kind", _ENV_MAPPING_KINDS)
+    def test_an_explicit_environment_without_the_variable_gets_the_scope(self, kind, exec_calls):
+        cfg = _launch_cfg()
+        env = _as_mapping(kind, {"PATH": "/usr/bin"})
+        with pytest.raises(_Replaced):
+            self._exec(cfg, env)
+        assert exec_calls[0][2] == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._scoped(cfg)}
+        assert dict(env) == {"PATH": "/usr/bin"}  # the caller's mapping is not written to
+
+    @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+    def test_an_environment_with_the_policy_but_not_the_scope_gets_the_scope(
+        self, locked, exec_calls, caplog
+    ):
+        """What ``env=dict(os.environ)`` hands over: the policy as it is at rest."""
+        cfg = _launch_cfg(locked=locked, external_subprocess_policy="block")
+        env = {"PATH": "/usr/bin", _CHILD_POLICY_ENV: _core._canonical_payload(cfg)}
+        with caplog.at_level(logging.WARNING, logger="tethered"), pytest.raises(_Replaced):
+            self._exec(cfg, env)
+        assert exec_calls[0][2] == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._scoped(cfg)}
+        assert caplog.records == []  # a scope only narrows: nothing to report, locked or not
+
+    @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+    def test_an_environment_that_carries_the_scope_is_left_to_the_caller(self, locked, exec_calls):
+        """The exec the hook makes raises the event again; that one goes through."""
+        cfg = _launch_cfg(locked=locked, external_subprocess_policy="block")
+        self._exec(cfg, {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._scoped(cfg)})
+        assert exec_calls == []
+
+    def test_a_locked_policy_announces_only_the_variable_it_added(self, exec_calls, caplog):
+        cfg = _launch_cfg(locked=True)
+        with caplog.at_level(logging.WARNING, logger="tethered"), pytest.raises(_Replaced):
+            self._exec(cfg, {"PATH": "/usr/bin"})
+        assert exec_calls[0][2][_CHILD_POLICY_ENV] == self._scoped(cfg)
+        (record,) = caplog.records
+        assert "carried out with the locked policy added" in record.getMessage()
+
+    def test_a_locked_policy_still_refuses_another_policy(self, exec_calls):
+        cfg = _launch_cfg(locked=True)
+        with pytest.raises(tethered.SubprocessBlocked, match="substitution attempt"):
+            self._exec(cfg, {_CHILD_POLICY_ENV: _PERMISSIVE_PAYLOAD})
+        assert exec_calls == []
+
+    def test_without_a_scope_an_inherited_environment_is_left_alone(self, exec_calls, monkeypatch):
+        cfg = _launch_cfg_in_force(monkeypatch)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        self._exec(cfg, None, scope_stack=())
+        assert exec_calls == []
+
+    def test_another_program_is_not_given_the_scope(self, exec_calls, monkeypatch):
+        cfg = _launch_cfg_in_force(monkeypatch)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        self._exec(cfg, None, executable="/bin/sh")
+        self._exec(cfg, {"PATH": "/usr/bin"}, executable="/bin/sh")
+        assert exec_calls == []
+
+    def test_an_environment_of_the_process_that_cannot_be_read_is_not_replaced(
+        self, exec_calls, monkeypatch
+    ):
+        cfg = _launch_cfg_in_force(monkeypatch)
+        monkeypatch.setenv(_CHILD_POLICY_ENV, _core._canonical_payload(cfg))
+        monkeypatch.setattr(_core, "_snapshot_env", lambda env: None)
+        self._exec(cfg, None)  # the exec goes ahead as the caller made it
+        assert exec_calls == []
+
+    # ── A scope with no policy under it ───────────────────────────────
+
+    def test_scope_only_an_inherited_environment_gets_the_scope(self, exec_calls, monkeypatch):
+        monkeypatch.setenv("TETHERED_SENTINEL", "kept")
+        with pytest.raises(_Replaced):
+            self._exec(None, None)
+        expected = dict(os.environ)
+        expected[_CHILD_POLICY_ENV] = self._scoped(None)
+        assert exec_calls[0][2] == expected
+
+    def test_scope_only_an_explicit_environment_gets_the_scope(self, exec_calls):
+        with pytest.raises(_Replaced):
+            self._exec(None, {"PATH": "/usr/bin"})
+        assert exec_calls[0][2] == {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._scoped(None)}
+
+    def test_scope_only_an_environment_that_carries_the_scope_is_left_alone(self, exec_calls):
+        self._exec(None, {"PATH": "/usr/bin", _CHILD_POLICY_ENV: self._scoped(None)})
+        assert exec_calls == []
+
+    def test_scope_only_an_environment_that_cannot_be_read_is_reported(self, exec_calls, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            self._exec(None, object())
+        assert exec_calls == []
+        (record,) = caplog.records
+        assert "scope subprocess propagation unavailable" in record.getMessage()
+        assert "could not be read as a mapping" in record.getMessage()
+
+    def test_scope_only_nothing_is_done_for_another_program_or_without_a_scope(self, exec_calls):
+        self._exec(None, {"PATH": "/usr/bin"}, executable="/bin/sh")
+        self._exec(None, {"PATH": "/usr/bin"}, scope_stack=())
+        self._exec(None, None, scope_stack=())
+        assert exec_calls == []
+
+    def test_a_failed_exec_fails_the_way_the_callers_own_would(self, monkeypatch):
+        def execve(path, argv, env):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(os, "execve", execve)
+        with pytest.raises(FileNotFoundError):
+            self._exec(None, None)
+
+    # ── End to end ────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "activate",
+        ['tethered.activate(allow=["*.example.com"])', "", _LOCKED_ACTIVATE],
+        ids=["under-a-policy", "scope-only", "under-a-locked-policy"],
+    )
+    @pytest.mark.parametrize(
+        "call",
+        [
+            "os.execv(sys.executable, [sys.executable, '-c', PROBE])",
+            "os.execve(sys.executable, [sys.executable, '-c', PROBE], dict(os.environ))",
+            "os.execvp(sys.executable, [sys.executable, '-c', PROBE])",
+        ],
+        ids=["execv", "execve", "execvp"],
+    )
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.exec* on Windows starts a second process, joins its argv unquoted, and "
+        "ends the caller with an access violation here with no tethered involved",
+    )
+    def test_a_real_exec_inside_a_scope_arrives_with_the_scope(self, activate, call, tmp_path):
+        """End to end: the program that replaces the process holds the scope it was started in."""
+        script = tmp_path / "exec_in_scope.py"
+        script.write_text(
+            f"PROBE = {_CHILD_STATE_PROBE!r}\n"
+            + _EXEC_IN_SCOPE_PARENT.format(activate=activate, call=call),
+            encoding="utf-8",
+        )
+        r = subprocess.run(  # nosec B603
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+        )
+        assert "SubprocessBlocked" not in r.stderr, r.stderr
+        state = json.loads(r.stdout)
+        assert state["scopes"] == 1, state
+        assert state["active"] is bool(activate), state
+        assert state["locked"] is ("locked=True" in activate), state
 
 
 class TestLaunchEnvPerformance:
