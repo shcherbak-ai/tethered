@@ -1,0 +1,26 @@
+# daphne, the ASGI server of Django Channels, with everything it depends on.
+daphne==4.2.3
+asgiref==3.12.1
+autobahn==26.7.1
+Twisted==26.4.0
+# autobahn
+cbor2==6.1.5
+cffi==2.1.1
+cryptography==50.0.2
+hyperlink==21.0.0
+msgpack==1.2.3
+pycparser==3.11
+txaio==26.6.1
+ujson==6.0.0
+# Twisted, with the "tls" extra that daphne asks for
+attrs==26.1.0
+Automat==25.4.16
+constantly==23.10.4
+idna==3.20
+Incremental==24.11.0
+pyOpenSSL==26.4.0
+service-identity==26.1.0
+typing_extensions==4.16.0
+zope.interface==8.6
+# Also a requirement of pytest: keep the pin equal to harness/requirements.txt.
+packaging==26.3

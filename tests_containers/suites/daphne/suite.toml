@@ -1,0 +1,14 @@
+description = "daphne: one process on Twisted's asyncio reactor, and Twisted's own client API in a handler"
+
+# tests_containers/images/<image>.Dockerfile
+image = "base"
+# Extra Debian packages for the image, and whether it needs a C compiler.
+# The compiler is for autobahn, which has no wheel for Python 3.15 yet.
+apt = []
+compiler = true
+# The packages whose versions the runner prints in its summary.
+key_packages = ["daphne", "twisted"]
+
+# Python versions the suite does not run on, each with the reason:
+#   "3.15" = "no wheel yet for ..."
+[unsupported_python]
