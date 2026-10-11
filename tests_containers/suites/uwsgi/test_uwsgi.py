@@ -26,6 +26,10 @@ What makes uWSGI unlike the other servers, and what the classes below pin:
 
 The applications are in ``uwsgi_app.py``.  The virtualenv tests install the
 wheel of tethered that the image keeps in ``/wheels``.
+
+Not covered: the emperor, mules and the spooler, uWSGI's event-loop plugins
+(gevent, asyncio), and uWSGI behind a web server that speaks the uwsgi
+protocol: every server here is asked over HTTP (``--http``, ``--http-socket``).
 """
 
 from __future__ import annotations
@@ -251,6 +255,18 @@ class TestOtherArrangements:
         assert len({pid for pid, _ in answered}) == 2, answered
         assert len(answered) >= 4, answered
         assert arrivals() == {}
+
+    def test_a_thread_the_application_starts_is_held_to_the_policy(self) -> None:
+        server = start_server(uwsgi("--enable-threads"), env={"TETH_ACTIVATE": "locked"})
+        path = probe_path("thread", FORBIDDEN_NAME, OTHER_PORT)
+        for report in server.each_worker(path, 2).values():
+            assert_refused(report)
+        assert arrivals() == {}
+        path = probe_path("thread", ALLOWED_NAME, ALLOWED_PORT)
+        for report in server.each_worker(path, 2).values():
+            assert report["outcome"] == "reached", report
+            assert report["ran_in"] == "application-thread", report
+        assert set(arrivals()) == {AT_ALLOWED}
 
     def test_an_unlocked_policy_is_enforced_in_every_worker(self) -> None:
         server = start_server(uwsgi(), env={"TETH_ACTIVATE": "plain"})
@@ -775,6 +791,33 @@ class TestMountedApplications:
         assert ask(server, "/b" + TO_ALLOWED)["outcome"] == "reached"
         assert ask(server, "/b" + TO_LOOPBACK)["outcome"] == "reached"
         assert arrivals() == {AT_ALLOWED: 1, AT_LOOPBACK: 1}
+
+    def test_after_a_reload_the_first_application_is_held_to_the_lock_of_the_second(self) -> None:
+        """Limit: the same two applications after a reload.  The reloaded process inherits the
+        policy that "b" locked and holds it in the main interpreter before any application is
+        loaded, so "a", which had no network at all, is now restricted by the policy of "b".
+        """
+        env = {"TETH_ACTIVATE_A": "none", "TETH_ACTIVATE_B": "locked"}
+        server = start_server(mounts(), env=env, ready="/a/whoami")
+        before = ask(server, "/a/whoami")
+        assert before["active"] is False, before
+        assert ask(server, "/a" + TO_ALLOWED)["outcome"] == "error"
+        assert arrivals() == {}
+
+        server.send_signal(signal.SIGHUP)
+        server.wait_log("binary reloading uWSGI")
+        (after,) = server.each_worker("/a/pyinfo", 1, exclude={before["pid"]}).values()
+        assert after["interpreter"] == 0
+        assert_locked(after)
+        assert after["bootstrap_ran"] is True, after
+        assert ask(server, "/a" + TO_ALLOWED)["outcome"] == "reached"
+        assert arrivals() == {AT_ALLOWED: 1}
+        assert_refused(ask(server, "/a" + TO_FORBIDDEN))
+        # "b" joined the lock this time, and its own activate() changed nothing.
+        assert_locked(ask(server, "/b/whoami"))
+        assert_refused(ask(server, "/b" + TO_FORBIDDEN))
+        assert arrivals() == {AT_ALLOWED: 1}
+        server.wait_log(rf"app=b tethered INFO {ACTIVATE_NO_OP}")
 
     def test_an_unlocked_policy_in_the_main_interpreter_is_overruled_by_a_later_lock(self) -> None:
         """Limit: "a" activates a policy of its own without locking it; "b" then locks.  "a" is

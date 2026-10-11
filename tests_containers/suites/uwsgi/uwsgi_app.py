@@ -16,6 +16,7 @@ file that calls it (``app_a.py``, ``app_b.py``):
 The routes are those of ``probe_wsgi`` (``/connect``, ``/urllib``, ``/child``,
 ``/tool``, ``/whoami``, with ``hold`` and ``uncaught``), plus:
 
+    /thread    the connection of ``/connect``, made by a thread the application starts
     /launch    run ``argv`` (a JSON list; "{executable}" stands for sys.executable,
                "{child}" for the probe child script), ``env=clean`` for an environment
                without the policy variable
@@ -31,6 +32,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl
 
@@ -115,9 +117,29 @@ def _child(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
     return probe_common.launch(argv, **popen_args)
 
 
+def _in_thread(host: str, port: int, params: dict[str, str]) -> dict[str, Any]:
+    """The connection, made by a thread that the application starts itself."""
+    result: dict[str, Any] = {}
+
+    def work() -> None:
+        result["ran_in"] = threading.current_thread().name
+        try:
+            result.update(probe_common.tcp_connect(host, port))
+        except Exception as exc:
+            result["raised"] = exc
+
+    worker = threading.Thread(target=work, name="application-thread")
+    worker.start()
+    worker.join(30.0)
+    if "raised" in result:
+        raise result["raised"]
+    return result
+
+
 OPERATIONS: dict[str, Callable[[str, int, dict[str, str]], dict[str, Any]]] = {
     "connect": lambda host, port, params: probe_common.tcp_connect(host, port),
     "urllib": lambda host, port, params: probe_common.urllib_get(host, port),
+    "thread": _in_thread,
     "child": _child,
     "tool": lambda host, port, params: probe_common.launch(probe_common.tool_argv(host, port)),
 }
