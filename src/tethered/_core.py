@@ -6,6 +6,7 @@ import _socket as _csocket  # C-level socket; immune to gevent/eventlet monkey-p
 import collections
 import contextvars
 import functools
+import importlib.util
 import inspect
 import ipaddress
 import json
@@ -589,7 +590,9 @@ _UVLOOP_LOADED_MSG = (
     "asyncio event loop (uvicorn: --loop asyncio on the command line, UVICORN_LOOP=asyncio "
     'in the environment of that command, or loop="asyncio" in uvicorn.run()), or call '
     "activate() before uvloop is imported: it is then kept from loading, and a server that "
-    "chooses it automatically falls back on its own."
+    "chooses it automatically falls back on its own. A server that imports uvloop whenever "
+    "it is installed, whichever loop it runs on (granian, sanic), leaves only the second "
+    "way: activate in a launcher script before the server is imported, or uninstall uvloop."
 )
 
 # DNS resolution events to intercept outside getaddrinfo.
@@ -893,7 +896,7 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
         if args and not cfg.log_only:
             name = args[0]
             if isinstance(name, str) and name in _REFUSED_IMPORTS:
-                _refuse_import(_REFUSED_IMPORTS[name])
+                _refuse_import(name)
         return
 
     # Locked-mode-only tamper detection on FS access to tethered.pth.
@@ -975,8 +978,28 @@ def _warn_if_uvloop() -> None:
     )
 
 
-def _refuse_import(library: str) -> None:
-    """Raise ``ImportError`` for an import of ``library`` made while a policy is active.
+def _is_installed(library: str) -> bool:
+    """Return True unless the import system knows nothing by the name ``library``.
+
+    Asked before an import is refused: a server that merely probes for a
+    loop it prefers (``try: import uvloop``) must get Python's own "No
+    module named" where there is none, and tethered must not log that it
+    kept out something that was never there.  ``find_spec`` of a top-level
+    name imports nothing.  If it fails, the library is taken to exist: the
+    refusal then says so with good reason or without harm.
+    """
+    try:
+        return importlib.util.find_spec(library) is not None
+    except Exception:
+        return True
+
+
+def _refuse_import(name: str) -> None:
+    """Raise ``ImportError`` for an import, made under a policy, of a library that is kept out.
+
+    ``name`` is the name the ``import`` event carries, one of
+    ``_REFUSED_IMPORTS``: the library itself or the extension module inside
+    it.
 
     uvloop: nothing that goes through a uvloop event loop raises an audit
     event, so a process that runs on one has a policy that is applied to
@@ -1001,6 +1024,9 @@ def _refuse_import(library: str) -> None:
     and of ``_warn_if_uvloop``; a pycares that is already loaded is left
     alone (what it resolves is refused: see ``_hint_at_unnamed_address``).
     """
+    library = _REFUSED_IMPORTS[name]
+    if name == library and not _is_installed(library):
+        return
     level, line, message = _IMPORT_REFUSALS[library]
     if library not in _import_refusals_logged:
         # Recorded before logging: a log handler may itself import something.

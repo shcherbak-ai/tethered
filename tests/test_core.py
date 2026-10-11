@@ -3996,6 +3996,35 @@ class TestUvloopRefusal:
                     _audit_hook(*event)
         assert len(_uvloop_refusals(caplog)) == 1
 
+    def test_a_library_that_is_not_installed_is_none_of_tethereds_business(
+        self, monkeypatch, caplog
+    ):
+        """A server probing for uvloop gets Python's own answer, and nothing is logged."""
+        monkeypatch.setattr(_core, "_import_refusals_logged", set())
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        tethered.activate(allow=["*.example.com"])
+        with caplog.at_level(logging.INFO, logger="tethered"):
+            for name in ("uvloop", "pycares"):
+                _audit_hook("import", (name, None, None, None, None))
+        assert _uvloop_refusals(caplog) == []
+        assert _core._import_refusals_logged == set()
+
+    def test_a_library_that_cannot_be_looked_up_is_taken_to_be_there(self, monkeypatch):
+        def broken(name):
+            raise ValueError(f"{name}.__spec__ is None")
+
+        monkeypatch.setattr(importlib.util, "find_spec", broken)
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(ImportError, match="tethered: uvloop was not loaded"):
+            _audit_hook("import", ("uvloop", None, None, None, None))
+
+    def test_the_extension_inside_it_is_refused_without_asking(self, monkeypatch):
+        """Its event is only raised while the package is being loaded."""
+        monkeypatch.setattr(importlib.util, "find_spec", _raise_runtime)
+        tethered.activate(allow=["*.example.com"])
+        with pytest.raises(ImportError, match="tethered: uvloop was not loaded"):
+            _audit_hook("import", ("uvloop.loop", None, None, None, None))
+
     def test_a_load_through_importlib_is_refused_at_the_loop_module(self, uvloop_on_path):
         """``import_module`` raises no event for the package, only for what it imports."""
         tethered.activate(allow=["*.example.com"])
@@ -4055,6 +4084,7 @@ class TestUvloopRefusal:
         assert "--loop asyncio" in message
         assert 'loop="asyncio" in uvicorn.run()' in message
         assert "before uvloop is imported" in message
+        assert "activate in a launcher script before the server is imported" in message
         assert _core._config is None
         assert _core._CHILD_POLICY_ENV not in os.environ
         assert _uvloop_warnings(caplog) == []  # refused, not warned about
