@@ -1,0 +1,10 @@
+# niquests and what it depends on.  urllib3-future installs two packages,
+# urllib3_future and one named urllib3: that is why this suite has an image of
+# its own.
+niquests==3.21.2
+urllib3-future==2.25.902
+charset-normalizer==3.5.2
+h11==0.16.0
+jh2==5.0.15
+qh3==2.0.4
+wassima==2.1.4
