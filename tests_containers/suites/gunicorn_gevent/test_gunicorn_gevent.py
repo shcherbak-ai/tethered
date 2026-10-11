@@ -19,6 +19,19 @@ The application is ``gevent_app:application``: the shared WSGI probe plus
 (``-k eventlet``: "Entry point ('gunicorn.workers', 'eventlet') not found"),
 and gevent's dnspython resolver fails every lookup with dnspython 2.9, with
 or without tethered; neither is covered.
+
+**A known hazard, which no test here can pin.**  tethered logs a refusal in
+the thread in which the audit hook runs, and for a lookup that is one of
+gevent's pool threads.  After monkey-patching, the lock of a logging handler
+is gevent's, and when several pool threads log at the same moment one of them
+is now and then never woken: its lookup never returns, the request hangs, and
+a worker that is told to restart or to stop waits for that request until
+gunicorn's graceful timeout (30 s by default).  Measured on Python 3.13 with
+gevent 26.9: in about one of ten new processes that refuse eight lookups at
+once, and in none of 300 in which nothing was logged; an audit hook that logs
+and raises does the same without tethered, one that only raises does not.
+Every server here is therefore started with ``--graceful-timeout 5``, so that
+such a worker ends five seconds after it is told to and not thirty.
 """
 
 from __future__ import annotations
@@ -80,7 +93,9 @@ HUB_TRACEBACK = "failed with EgressBlocked"
 
 
 def gunicorn(model: str, *options: str, workers: int = 2) -> list[str]:
-    return [*GUNICORN, "--workers", str(workers), *WORKER_MODELS[model], *options]
+    # --graceful-timeout: see "A known hazard" at the top of this module.
+    command = [*GUNICORN, "--workers", str(workers), "--graceful-timeout", "5"]
+    return [*command, *WORKER_MODELS[model], *options]
 
 
 def wait_until(condition: Callable[[], Any], what: str, timeout: float = 15.0) -> Any:
