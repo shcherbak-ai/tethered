@@ -284,7 +284,7 @@ hypercorn's master never imports the application; every worker is a new Python p
 
 granian imports every event-loop package it finds as soon as granian itself is imported, in the main process and in every worker, whichever `--loop` is asked for. So:
 
-- **uvloop not installed** (`pip install granian`, or `granian[rloop]`): `granian --interface asgi main:app` with `activate()` at the top of `main.py` is enforced, for ASGI, RSGI and WSGI, with `--workers`, and in workers started later.
+- **uvloop not installed** (plain `granian`, or `granian[rloop]`): `granian --interface asgi main:app` with `activate()` at the top of `main.py` is enforced, for ASGI, RSGI and WSGI, with `--workers`, and in workers started later.
 - **uvloop installed** (`granian[uvloop]`): the server does not start under a policy, with `--loop asyncio` or `--loop rloop` either, because uvloop is loaded all the same. Uninstall uvloop, or use the launcher pattern, with which uvloop is not loaded and `auto` goes on to rloop or asyncio:
 
 ```python
@@ -312,9 +312,9 @@ On rloop one way out is not seen: `transport.sendto(data, addr)` on an unconnect
 
 ### sanic
 
-`import sanic` imports uvloop when uvloop is installed, and `pip install sanic` installs it. The `sanic` command has imported sanic before it imports the application, so under a policy it does not start: `activate()` raises `RuntimeError`. `SANIC_USE_UVLOOP=false` does not help, because uvloop is loaded all the same. Two arrangements work:
+`import sanic` imports uvloop when uvloop is installed, and sanic installs it as a dependency. The `sanic` command has imported sanic before it imports the application, so under a policy it does not start: `activate()` raises `RuntimeError`. `SANIC_USE_UVLOOP=false` does not help, because uvloop is loaded all the same. Two arrangements work:
 
-- Uninstall uvloop (`pip uninstall uvloop`). The `sanic` command then works as it is.
+- Keep uvloop out of the environment. The `sanic` command then works as it is. In a uv project, set `exclude-dependencies = ["uvloop"]` under `[tool.uv]` in `pyproject.toml`: `uv remove` does not remove the dependency of a dependency, and `uv sync` puts back what was uninstalled by hand (measured once, with uv 0.13.0). With pip, `pip uninstall uvloop`.
 - Start sanic from a script that calls `activate()` before it imports sanic:
 
 ```python

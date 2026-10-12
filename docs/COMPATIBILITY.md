@@ -182,7 +182,7 @@ Measured with granian 2.8.4, rloop 0.5.0, uvloop 0.23.0. granian's main process 
 
 ### sanic
 
-Measured with sanic 25.12.1 and uvloop 0.23.0, which `pip install sanic` installs. `import sanic` itself imports uvloop.
+Measured with sanic 25.12.1 and uvloop 0.23.0, which sanic installs as a dependency. `import sanic` itself imports uvloop.
 
 | Arrangement | Result | Pinned by |
 |---|---|---|

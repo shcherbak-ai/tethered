@@ -149,7 +149,7 @@ Never use hostnames that could trigger unexpected connections to services with s
 
 ## C extension
 
-The `_guardian.c` C extension provides tamper-resistant locked mode. It is built automatically by `setuptools` during `uv sync` or `pip install -e .`. A C compiler is required — the build will fail without one.
+The `_guardian.c` C extension provides tamper-resistant locked mode. It is built automatically by `setuptools` during `uv sync`. A C compiler is required — the build will fail without one.
 
 ### cppcheck
 
