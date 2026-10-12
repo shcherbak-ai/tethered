@@ -540,7 +540,7 @@ The first time a connection is refused to an address that tethered has no name f
 
 What tethered puts on disk is what its wheel holds: the `tethered/` package with the compiled extension, `tethered.pth` beside it, and the `.dist-info` directory. At run time it writes no file. While a policy is active it keeps `_TETHERED_CHILD_POLICY` in the environment of the process, where every child program finds the allow list, and `deactivate()` removes it. `tethered.pth` is read by every interpreter that starts in the environment, and it imports tethered only when that variable is set.
 
-The rows below are measured once, with pip 26.2.1 on Python 3.13, on Linux (the image of a suite) and on Windows 11. No suite asserts them.
+The rows below are measured once, with pip 26.2.1 and uv 0.13.0 on Python 3.13, on Linux (the image of a suite; `python:3.13-slim` for uv) and on Windows 11. No suite asserts them.
 
 | Arrangement | What happens |
 |---|---|
@@ -550,12 +550,14 @@ The rows below are measured once, with pip 26.2.1 on Python 3.13, on Linux (the 
 | `pip uninstall tethered` or `pip install --force-reinstall` (an upgrade takes the same route) from a Python child of a process that holds a **locked** policy | Refused. pip gets `SubprocessBlocked` when it moves `tethered.pth` and exits with status 2. By then it has renamed `tethered-<version>.dist-info` to `~ethered-<version>.dist-info`, and it does not rename it back: tethered still works and enforces, and pip no longer lists it (`WARNING: Ignoring invalid distribution ~ethered`). To repair, rename the directory back from outside the locked processes; pip then lists and removes the package as before. |
 | `shutil.rmtree()` of the environment a locked process runs from, on Linux | Refused at `tethered.pth`, with whatever it had removed before that gone. |
 | `uv pip uninstall tethered` launched from a locked process, on Windows | uv is not Python, so the guard does not see what it does; the launch is logged as external (and refused under `external_subprocess_policy="block"`). It removed `tethered.pth` and most of the package, then failed at the loaded extension module. |
+| tethered installed by uv (`uv add`, `uv pip install`), on Linux and on Windows | `tethered.pth` in site-packages is a hard link to a file of the same name in uv's cache; with `--link-mode=copy` it is a file of its own, as with pip. Under a locked policy a write to the cache's file is refused like a write to the hook itself. |
+| Another distribution that ships a top-level `tethered.pth`, installed after tethered with pip or with uv | It replaces tethered's file, and neither installer says so. tethered does not take that file for its bootstrap: `activate()` logs a warning, and a Python child is an external launch (refused under `external_subprocess_policy="block"`). Uninstalling that distribution with pip removes `tethered.pth` altogether; reinstall tethered. |
 
-Install, upgrade and remove tethered from outside the processes that hold a locked policy: a deployment step or a shell, not a child of the application. The locked-mode guard on `tethered.pth` is described in [SUBPROCESS.md](SUBPROCESS.md#locked-mode-hardening-of-the-auto-propagation-channel); it refuses the file by its name and directory, however the installer names that directory. Windows does not delete a loaded extension module for any installer, so the `~ethered` directory is to be expected whenever tethered is upgraded while a process has it imported.
+Install, upgrade and remove tethered from outside the processes that hold a locked policy: a deployment step or a shell, not a child of the application. The locked-mode guard on `tethered.pth` is described in [SUBPROCESS.md](SUBPROCESS.md#locked-mode-hardening-of-the-auto-propagation-channel); it refuses the file by its name and directory, however the installer names that directory, and the same file where uv keeps it in its cache. Windows does not delete a loaded extension module for any installer, so the `~ethered` directory is to be expected whenever tethered is upgraded while a process has it imported.
 
 ## What was not tested
 
-- **Installers.** Anything but pip 26.2.1 on Python 3.13; uv only in the one arrangement above. conda, poetry and pipx were not run.
+- **Installers.** Anything but pip 26.2.1 and uv 0.13.0 on Python 3.13, and of uv only the arrangements above. conda, poetry and pipx were not run.
 - **Platforms.** Windows and macOS servers, musl (Alpine), ARM, and free-threaded builds of Python. Everything here ran on Linux x86-64 with glibc. The unit tests in `tests/` run on Windows and Linux; they do not start servers.
 - **The network itself.** The destinations are on the loopback interface of a container without a network. TLS, proxies, connection reuse, HTTP/2 and HTTP/3, and real DNS were not exercised. WebSockets were tested as a client (`websockets`), not as a server protocol.
 - **Client libraries.** oracledb in thick mode, pyodbc with Microsoft's driver, the `c` implementation of psycopg 3, pyarrow, polars and duckdb, DNS over HTTPS, TLS or QUIC in niquests, and what any client library does on uvloop.

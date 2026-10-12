@@ -64,7 +64,7 @@ The same import refusal applies to pycares, the c-ares binding under aiodns: whi
 ### What it logs
 
 - One info line on success (`tethered: activated with N rules (log_only=...)`).
-- A warning when no `tethered.pth` is in a directory this interpreter's `site.py` processes (Python children will not inherit).
+- A warning when no `tethered.pth` is in a directory this interpreter's `site.py` processes (Python children will not inherit), or when the file that is there is not the one tethered installs (`tethered: ... is not the file tethered installs under that name ...`): another distribution that ships a `tethered.pth` replaces tethered's when it is installed. From Python 3.15 also when a `tethered.start` file lies beside the hook, which switches it off (`tethered: ... is switched off by the tethered.start file beside it ...`).
 - One warning per process when multiprocessing's fork server was started before the policy: its workers are copies of the fork server and are not restricted, under a locked policy either (see [SECURITY.md](../SECURITY.md#what-tethered-does-not-protect-against)).
 - Later, one warning per process the first time the policy refuses (or, under `log_only`, reports) a connection to an IP address that no hostname is known for while the policy has hostname rules (`tethered: no hostname is known for the refused address ...`). Usually that is an address nothing allows, but it is also what a library that resolves names outside Python's `socket` module produces for a host the allow list names.
 
@@ -180,7 +180,8 @@ Raised when tethered refuses a process launch or, in locked mode, a guarded oper
 
 - for an external launch under `external_subprocess_policy="block"`;
 - in locked mode, for a launch whose environment fails the payload-integrity check (a different policy, an invalid value, two spellings of the variable) or cannot be given the payload; for a launch that inherits the environment, that includes a policy variable that was changed from another interpreter or below Python. An explicit environment that merely lacks the variable is not refused where tethered can add it: a `subprocess` launch gets it, and so does an `os.exec*` of the same interpreter. `os.posix_spawn`, `os.spawn*` and an `os.exec*` of another program with such an environment are refused;
-- in locked mode, for a refused operation on `tethered.pth` (delete, rename, write-mode open, chmod, truncate, a copy onto it) and for creating a `tethered.start` file beside it;
+- in locked mode, for a refused operation on `tethered.pth` (delete, rename, write-mode open, chmod, truncate, a copy onto it, a hard link or symlink to it) and for creating a `tethered.start` file beside it;
+- in locked mode, for the launch of a Python child after `tethered.pth` was emptied, removed or replaced, or was switched off by a `tethered.start` file beside it (Python 3.15+): the child would start without the locked policy, so the launch is refused whatever `external_subprocess_policy` says;
 - in locked mode, by the C guardian for a launch, a guarded filesystem operation, or an `os.putenv` / `os.unsetenv` of the policy variable while the integrity check fails;
 - in locked mode, by the C guardian in an interpreter that neither holds the lock nor has joined it, for every launch and every change to the bootstrap files or the policy variable, and in an interpreter that has joined it for a change to the policy variable (see [Locked mode](#locked-mode)).
 
