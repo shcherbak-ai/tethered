@@ -106,6 +106,7 @@ tests/
     test_subprocess.py    # Subprocess audit, scope propagation, locked-mode integrity, perf
     test_autoactivate.py  # Child-side bootstrap parsing + scope inheritance
     test_guardian.py      # C extension tamper detection
+    test_docs_recipes.py  # The recipes docs/COOKBOOK.md prints against the copies the container suites run
 tests_examples/
     conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
@@ -115,6 +116,8 @@ tests_containers/
     images/               # The Dockerfile: tethered built as a wheel and installed like a user's
     harness/              # Shared in-container code: pytest plugin, the destinations that count arrivals, probe applications
     suites/<name>/        # One directory per server, task queue or library family
+benchmarks/
+    overhead.py           # Standalone microbenchmark of the per-event overhead (not part of the test suite)
 examples/
     01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
 docs/
@@ -176,6 +179,6 @@ On first run, a `tethered-cppcheck:<version>` Docker image is built, with cppche
 - **Exception tests** (`test_exceptions.py`) and **lifecycle tests** (`test_lifecycle.py`): pickling and copying of `EgressBlocked` / `SubprocessBlocked` (including real spawn-mode pools), and `activate()` / `deactivate()` transitions under interleaving and failure.
 - **Example tests** (`tests_examples/test_examples.py`): Run each `examples/*.py` script as a subprocess. Requires network (examples make real HTTP calls to `api.github.com`). Not included in coverage — they run in separate processes.
 - **Container suites** (`tests_containers/suites/<name>/`): A suite starts a real server, task queue or client library in a container that has no network, with tethered installed from a wheel. Destinations on the container's loopback interface count what arrives, and a test asserts both what the application reported and what arrived: "blocked" means that the counter did not move. A known limit is pinned as what happens today, in a test whose docstring starts with `Limit:`. Every requirement is pinned; a suite is added by adding its directory. `docs/COMPATIBILITY.md` is written from these suites: when a result changes, change the page with it.
-- **Documentation that is tested.** The code and configuration blocks of `docs/COOKBOOK.md` are meant to work as printed. Run a block in a container before you change it, or take it from a suite where it already runs. The FastAPI recipe and the Django middleware have a copy in their suite (`tests_containers/suites/fastapi/cookbook_recipe.py`, `tests_containers/suites/django/djapp/`): change the copy with the block and run the suite.
+- **Documentation that is tested.** The code and configuration blocks of `docs/COOKBOOK.md` are meant to work as printed. Run a block in a container before you change it, or take it from a suite where it already runs. The FastAPI recipe and the Django middleware have a copy in their suite (`tests_containers/suites/fastapi/cookbook_recipe.py`, `tests_containers/suites/django/djapp/`): change the copy with the block and run the suite. `tests/test_docs_recipes.py` fails when a copy and its block differ.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before the connection is opened.

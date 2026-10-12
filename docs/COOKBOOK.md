@@ -63,7 +63,7 @@ class EgressBlockedMiddleware:
         return HttpResponse("Service unavailable", status=503)
 ```
 
-Add it to `MIDDLEWARE` in the settings. The hook is what matters: Django turns an exception that a view lets out into a 500 response before `get_response()` returns to the middleware that called it, so a `try` / `except tethered.EgressBlocked` around `get_response()` never sees the refusal. `process_exception()` is what Django calls with the exception instead. Earlier versions of this page printed the `try` / `except` form; with it the connection is refused all the same, but the request ends as a 500 and nothing is logged by the middleware.
+Add it to `MIDDLEWARE` in the settings. The hook is what matters: Django turns an exception that a view lets out into a 500 response before `get_response()` returns to the middleware that called it, so a `try` / `except tethered.EgressBlocked` around `get_response()` never sees the refusal. `process_exception()` is what Django calls with the exception instead.
 
 Flask — register an error handler with `@app.errorhandler(tethered.EgressBlocked)`; it is reached for a refused lookup and for a refused connection.
 
@@ -245,7 +245,7 @@ uvicorn 0.47.0 is the first release that imports the application before it choos
 
 **`-k gevent`** and `-k gevent_pywsgi`: connections are enforced, in every worker and for greenlets that overlap. Three things are particular to gevent.
 
-- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken. The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). In stress runs on Python 3.13 with gevent 26.9 this happened in about one in ten new processes that refused several lookups at once; a plain audit hook that logs and raises did the same with no tethered in the process, and one that only raises did not. One mitigation was measured: with `logging.getLogger("tethered").setLevel(logging.ERROR)`, tethered writes no warning for a refusal, and none of 180 processes had a stuck greenlet. Take it for what it is: a measurement, at the price of tethered's own log line for each refusal (the exception is still raised, so log refusals where you catch them). A shorter `--graceful-timeout` limits how long a stuck request can hold a worker.
+- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken. The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). A plain audit hook that logs and raises did the same with no tethered in the process. One mitigation was measured: with `logging.getLogger("tethered").setLevel(logging.ERROR)`, tethered writes no warning for a refusal, and no process had a stuck greenlet. Take it for what it is: a measurement, at the price of tethered's own log line for each refusal (the exception is still raised, so log refusals where you catch them). A shorter `--graceful-timeout` limits how long a stuck request can hold a worker. [COMPATIBILITY.md](COMPATIBILITY.md#gunicorn) has the numbers.
 - gevent's hub prints a traceback for every refused lookup, in addition to tethered's warning. Telling the hub that `EgressBlocked` is not its error silences that:
 
   ```python
@@ -260,25 +260,15 @@ uvicorn 0.47.0 is the first release that imports the application before it choos
   ```
 
   Call it from the worker, for example at the start of a request.
-- A process launch is seen differently, as `os.exec*` events inside the forked child, one for each `PATH` directory that is tried. `external_subprocess_policy="block"` still refuses an external launch, and a Python child still inherits the policy. What changes is where tethered's log lines go: they are written to the stderr of that forked child, so they end up in the output the application captures from its subprocess and not in the server log. Under `"block"` with captured stderr the refusal is logged nowhere; the `SubprocessBlocked` exception is all there is.
+- A process launch is seen differently, as `os.exec*` events inside the forked child, one for each `PATH` directory that is tried. `external_subprocess_policy="block"` still refuses an external launch, and a Python child still inherits the policy. What changes is where tethered's log lines go: to the stderr of that forked child, which is the pipe the application captures, and not to the server log. Under `"block"` with captured stderr the refusal is logged nowhere; the `SubprocessBlocked` exception is all there is. [SUBPROCESS.md](SUBPROCESS.md#launches-under-gunicorns-gevent-worker) has the details.
 
 With `GEVENT_RESOLVER=ares` lookups are made by c-ares, which tethered does not see: hosts the allow list names are refused, and names are sent to the DNS server unchecked. Use gevent's default resolver.
 
 **`-k tornado`**: enforced. An exception the application lets out gets no response at all; tornado logs it and leaves the connection open, with or without tethered. Catch `EgressBlocked` in the application.
 
-**Launching processes from a request handler**, under a locked policy:
+**Launching processes from a request handler.** Launch Python children with `sys.executable`. Such a child inherits the policy, a locked one included, also when it is given an `env=` that lacks `_TETHERED_CHILD_POLICY`. `["python3", ...]` is warned about as external although that child does inherit; `[sys.executable, "-S", ...]` and any other program are warned about and run without a policy. All three are refused under `external_subprocess_policy="block"`. [COMPATIBILITY.md](COMPATIBILITY.md#what-holds-under-every-server) has the table.
 
-| Launch | Result |
-|---|---|
-| `[sys.executable, ...]` | The child inherits the locked policy and enforces it. |
-| `[sys.executable, ...]` with an `env=` that lacks `_TETHERED_CHILD_POLICY` | The child is given the variable and inherits the locked policy. |
-| `["python3", ...]` | Warned about as external, although this child does inherit. Refused under `"block"`. |
-| `[sys.executable, "-S", ...]` | Warned about; the child has no policy. Refused under `"block"`. |
-| `["bash", ...]` | Warned about; the child can reach anything. Refused under `"block"`. |
-
-So launch Python children with `sys.executable`.
-
-**Binary upgrade (`SIGUSR2`).** It works as it is, with a locked policy too, with and without `--preload`. gunicorn re-executes itself with the environment it saved when it started, which under `--preload` lacks the policy variable; tethered carries that exec out with the variable added and logs `tethered: os.exec*(...) was given an environment without _TETHERED_CHILD_POLICY; carried out with the locked policy added`. The new master starts under the policy, its own `activate()` is the idempotent no-op, and a client that kept requesting during the upgrade saw no failed request. The `pre_exec` hook that earlier versions of this page printed is no longer needed; it does no harm where it is still in place.
+**Binary upgrade (`SIGUSR2`).** It works as it is, with a locked policy too, with and without `--preload`. gunicorn re-executes itself with the environment it saved when it started, which under `--preload` lacks the policy variable; tethered carries that exec out with the variable added and logs `tethered: os.exec*(...) was given an environment without _TETHERED_CHILD_POLICY; carried out with the locked policy added`. The new master starts under the policy, its own `activate()` is the idempotent no-op, and a client that kept requesting during the upgrade saw no failed request.
 
 **Interpreter pools under `--preload`.** Do not start an `InterpreterPoolExecutor` worker at import time, which under `--preload` is in the master process: every worker process forked afterwards died with `SIGSEGV`, with or without tethered. Create the pool in the worker process, when it is first needed.
 
@@ -472,7 +462,7 @@ Two other arrangements avoid the race: one `WSGIDaemonProcess` per application, 
 
 **Reloading a WSGI script.** In embedded mode a script that is reloaded with a changed locked policy gets `TetheredLocked`, and requests are answered with a 500 until Apache is restarted; reloaded with the same policy, its `activate()` is a no-op. In daemon mode touching the script restarts the process, and the new policy is in place.
 
-**Subprocesses from a handler** under a lock are handled as under gunicorn (the table above), in the lock holder and in an interpreter that joined. An interpreter outside the lock launches nothing.
+**Subprocesses from a handler** under a lock are handled as under [gunicorn](#gunicorn), in the lock holder and in an interpreter that joined. An interpreter outside the lock launches nothing.
 
 ### Flask and Django
 
@@ -628,12 +618,6 @@ The hint surfaces both as `EgressBlocked.scope_hint` (a `str | None` attribute r
 - **The host's `activate()` policy blocks** — the host has tethered configured but forgot to allowlist your endpoint. Your guidance still reaches them.
 - **An outer scope set by the host or a higher-level library blocks** — same rule. App developers combining `activate()` with `scope()` can put their own `hint=` on outer scopes (e.g. `scope(allow=["*.stripe.com"], hint="Payment flow — only Stripe is reachable here")`) and have it surface through any block downstream that doesn't set its own.
 
-So `hint=` is useful in three audiences' code:
-
-1. **Library authors** publishing a package — attach the egress contract and docs URL once at the scope.
-2. **App developers** using `scope()` to tighten request handlers, jobs, or calls into third-party packages — attach context about the call site.
-3. **Mixed setups** with `activate()` + nested scopes — outer scopes can guide the developer about which surface they're in even when an inner scope or the global ceiling is what rejected the call.
-
 `hint=` does not replace per-package CLI translation. If your package presents bespoke error UX (e.g. raising `ClickException` from a CLI), keep doing that — the wrapper can read `exc.scope_hint` and forward it without duplicating the contract in code:
 
 ```python
@@ -649,7 +633,7 @@ The hint travels with the scope through subprocess auto-propagation, so a child 
 
 #### A note on Unicode in hints (and labels)
 
-Tethered stores `hint=` and `label=` as Python `str` and round-trips them through subprocess auto-propagation as JSON (`ensure_ascii=True`, so non-ASCII characters cross the env-var boundary as `\uXXXX` and are decoded back losslessly in the child). Whether a non-ASCII character *renders* correctly in the host's traceback or log output depends on the host's stdio / log-handler encoding — not on tethered. Modern Python (UTF-8 default on Windows from 3.15, and on Linux/macOS since forever) handles arbitrary Unicode fine; legacy non-UTF-8 environments may mis-render exotic characters. ASCII is always safe; common Latin-1 / cp1252 typography (en/em dashes, curly quotes, ellipsis) is safe almost everywhere; CJK, Cyrillic, Arabic, and emoji are the higher-risk cases on legacy hosts. If you ship to environments where you can't assume UTF-8 stdio, prefer ASCII for hints and labels — the same advice that already applies to every exception message and log line in any Python library.
+`hint=` and `label=` cross the subprocess boundary unchanged: they travel as JSON, with non-ASCII characters as `\uXXXX` escapes that the child decodes. Whether such a character *renders* correctly in the host's traceback or log output depends on the host's stdio / log-handler encoding — not on tethered. If you ship to environments where you can't assume UTF-8 stdio, prefer ASCII for hints and labels.
 
 ### Adding `tethered` to your deps imposes `tethered.pth` on every downstream
 
@@ -675,7 +659,7 @@ def _on_block(host: str, port: int | None) -> None:
 def fetch_data(): ...
 ```
 
-Tethered will still log under the `"tethered"` logger as well — your callback is additive, not a replacement (today). If you want to fully isolate the event from the `"tethered"` namespace, configure a logging filter on `"tethered"` or wrap the call as shown below.
+Tethered will still log under the `"tethered"` logger as well — your callback is additive, not a replacement. If you want to fully isolate the event from the `"tethered"` namespace, configure a logging filter on `"tethered"` or wrap the call as shown below.
 
 ### Wrap `EgressBlocked` in a library-specific exception
 
@@ -696,7 +680,7 @@ def fetch_data():
         ) from e
 ```
 
-The `EgressBlocked.scope_label` attribute carries the human-readable label of the scope that blocked the call (e.g. `"scope(api.mylib.com:443)"`), or `None` if the block came from the host's global policy. Use it to attribute blocks to the right scope when multiple are nested.
+`e.scope_label` is the label of the scope that blocked the call, or `None` if the block came from the host's global policy. Give your scope a `label=` ([above](#use-scope-never-activate)) and the message attributes the block to your library.
 
 ### Make `tethered` a regular runtime dependency
 
