@@ -50,13 +50,18 @@ tests_containers/
 benchmarks/
     overhead.py        # Standalone microbenchmark — per-event overhead activated vs deactivated vs locked
 examples/
+    README.md          # The list of the examples and how to run them
     *.py               # Runnable usage examples (httpx + api.github.com)
 docs/
-    API.md             # Full API reference (activate, scope, deactivate, exceptions, locked mode)
+    API.md             # Full API reference (activate, scope, deactivate, exceptions, allow list syntax, locked mode)
     SUBPROCESS.md      # Subprocess auto-propagation, scope propagation, external_subprocess_policy
-    ARCHITECTURE.md    # Audit-hook mechanics, scope ContextVar, C guardian
+    ARCHITECTURE.md    # Audit-hook mechanics, scope ContextVar, C guardian, measured overhead
     COOKBOOK.md        # Django/FastAPI middleware, Celery, retry decorators; what each server, task queue and pool needs
     COMPATIBILITY.md   # Measured results by server, task queue and client library, with versions and the suite behind each row
+assets/
+    tethered-mark-{dark,light}.svg    # The name in pixel letters with its kite (the mark of the company website), for a dark and a light page
+    tethered-figure-{dark,light}.svg  # The README's figure: one call, two connections allowed, one blocked
+    tethered_header.png               # The header of earlier READMEs; the PyPI pages of published releases name it by URL
 README.md              # Pitch + quick start + pointers (deliberately slim)
 SECURITY.md            # Threat model, what tethered does/doesn't protect against, vulnerability reporting
 ```
@@ -165,11 +170,12 @@ If adding a new rule type (e.g., regex patterns, deny lists):
 
 ### Documentation
 
-- **`README.md`** is the pitch — what tethered is, why you'd use it, basic quick start, and pointers to deeper docs. Keep it short (~200 lines). Detailed API reference, threat-model enumeration, and framework recipes do NOT live here.
+- **`README.md`** is the pitch — what tethered is, why you'd use it, basic quick start, and pointers to deeper docs. Keep it short (~200 lines). Detailed API reference, threat-model enumeration, and framework recipes do NOT live here; neither do the table of examples (`examples/README.md`), the full allow list syntax (`docs/API.md`; the README has the short table, under the heading `## Allow list syntax`, which other pages link to) and the overhead measurements (`docs/ARCHITECTURE.md`; the README quotes one figure from them).
+- **README images** are the four SVG files in `assets/`: the mark and the figure, each for a dark and a light page, chosen by a `<picture>` element with `prefers-color-scheme` (PyPI shows the `<img>` inside it, the light one). They are named by absolute `raw.githubusercontent.com/.../main/...` URL, so a new or renamed image shows only once it is on `main`, and a file a released README names must stay: PyPI keeps showing that README, which is why `assets/tethered_header.png` is still there. An SVG shown through `<img>` runs its CSS animation and nothing else, so each file is drawn complete and at rest, with the animation only on top (the kite of the mark dips now and then; the figure plays its run once), and both are switched off under `prefers-reduced-motion`. The colours are those of the company website. markdownlint allows the HTML elements the README's header uses (`.markdownlint-cli2.yaml`).
 - **`SECURITY.md`** holds the threat model, the full "what tethered does NOT protect against" enumeration, the statement of what locked mode does and does not do, design tradeoffs, and vulnerability reporting. Adversarial detail belongs here, not in the README. The README and `docs/API.md` must not promise more than this file does.
-- **`docs/API.md`** holds full API signatures and behavior — every parameter, every exception, locked mode, log-only mode, intersection semantics.
+- **`docs/API.md`** holds full API signatures and behavior — every parameter, every exception, the allow list syntax, locked mode, log-only mode, intersection semantics.
 - **`docs/SUBPROCESS.md`** holds the subprocess control deep-dive — auto-propagation, `external_subprocess_policy`, scope-to-subprocess propagation, locked-mode hardening.
-- **`docs/ARCHITECTURE.md`** holds implementation mechanics — audit hook events, scope ContextVar, C guardian.
+- **`docs/ARCHITECTURE.md`** holds implementation mechanics — audit hook events, scope ContextVar, C guardian — and the measured overhead per event (`## Performance`, from `benchmarks/overhead.py`).
 - **`docs/COOKBOOK.md`** holds framework integration patterns (Django, FastAPI, Celery, retry decorators) and what a deployment needs under each server, task queue and pool: the launcher pattern, uvicorn and FastAPI, gunicorn, hypercorn, granian, sanic, aiohttp, daphne, tornado, uWSGI, waitress, mod_wsgi, Flask and Django, Celery and the other task queues, process pools and the fork server, interpreter pools. Its code and configuration blocks are meant to work as printed: run a block before changing it, or take it from a container suite where it already runs. Two blocks have a copy in a suite that tests them, and the copy changes with the block: the FastAPI recipe (`tests_containers/suites/fastapi/cookbook_recipe.py`) and the Django middleware (`tests_containers/suites/django/djapp/`). The limits behind the server guidance are stated in `SECURITY.md` and `docs/SUBPROCESS.md`.
 - **`docs/COMPATIBILITY.md`** is the page a user consults before relying on tethered: per server, task queue and client library, what is enforced, what needs which configuration, what tethered refuses at start-up and what it does not see, each row with the version it was measured with and the container suite that asserts it. It is written from the suites, not from expectation: a row without a suite behind it is marked "measured once", and the client-library tables are the table the `clients` suite prints at the end of a run (`--verbose`), with `tests_containers/suites/clients/catalog.py` as its source. It also says what installing, upgrading and removing tethered does under a policy (measured once: pip refused halfway under a lock, the extension module left behind on Windows), and what was not tested. The cookbook says what to do; this page says what was measured.
 - **Event loops.** A statement that tethered works with asyncio or with an async framework or client (FastAPI, httpx, aiohttp, `asyncio.create_subprocess_exec`) names the event loop it holds for: asyncio's own selector loop. tethered does not run next to uvloop, which uvicorn uses by default when it is installed: it refuses the import under an enforcing policy and refuses to activate over a loaded one, and a statement about a server says which of the two that server meets. A log-only policy and a scope without a policy do run next to uvloop and see nothing of its loop. On Windows the default `ProactorEventLoop` gets no connect-time enforcement. `SECURITY.md` has these items.

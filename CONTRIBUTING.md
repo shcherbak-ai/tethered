@@ -119,10 +119,12 @@ tests_containers/
 benchmarks/
     overhead.py           # Standalone microbenchmark of the per-event overhead (not part of the test suite)
 examples/
+    README.md             # The list of the examples and how to run them
     01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
 docs/
     API.md, ARCHITECTURE.md, COOKBOOK.md, SUBPROCESS.md  # Detailed reference
     COMPATIBILITY.md      # What was measured under which server, task queue and client library
+assets/                   # The images of the README (see "Documentation" in AGENTS.md)
 ```
 
 ## Network safety in tests

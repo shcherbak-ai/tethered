@@ -11,7 +11,7 @@ tethered uses [`sys.addaudithook`](https://docs.python.org/3/library/sys.html#sy
 - **`socket.__new__`** — no enforcement. It is used for two one-time warnings about event loops that tethered cannot see into: on Windows when a socket is created while an asyncio `ProactorEventLoop` is running, and elsewhere when one is created while uvloop is loaded, which can only be under a log-only policy or a scope without a policy (see [Event loops](#event-loops)).
 - **`import`** — while a policy that is not log-only is active, an import of uvloop or pycares is refused with `ImportError` (see [Event loops](#event-loops)). Nothing else is done for import events.
 
-This works with libraries built on CPython sockets (requests, httpx, urllib3, aiohttp) and frameworks like Django, Flask, and FastAPI — they all call `socket.getaddrinfo` and `socket.connect` under the hood. A library that resolves and connects inside a C library of its own raises neither event and is not seen; [COMPATIBILITY.md](COMPATIBILITY.md#client-libraries) lists which of some seventy client-library arrangements do which. What a check costs per event is measured in the [README](../README.md#performance).
+This works with libraries built on CPython sockets (requests, httpx, urllib3, aiohttp) and frameworks like Django, Flask, and FastAPI — they all call `socket.getaddrinfo` and `socket.connect` under the hood. A library that resolves and connects inside a C library of its own raises neither event and is not seen; [COMPATIBILITY.md](COMPATIBILITY.md#client-libraries) lists which of some seventy client-library arrangements do which. What a check costs per event is measured [below](#performance).
 
 When `getaddrinfo` resolves a hostname, tethered records the IP-to-hostname mapping in a bounded LRU cache: up to 4096 addresses, keyed by the canonical text of the address (IPv6 compressed and without scope ID, IPv4-mapped IPv6 as the IPv4 address), each with up to 8 hostnames, most recent first. When a subsequent `connect()` targets that IP, tethered looks up the hostnames and checks them, and the raw IP, against the allow list; the connection is allowed if any of them is. If denied, `EgressBlocked` is raised before the connection is attempted.
 
@@ -158,3 +158,16 @@ All of the above is per interpreter: each interpreter has its own `tethered._cor
 A forked child gets these locks back unlocked. `os.fork()` copies the forking thread only, so a lock that another thread held at that moment would stay locked in the child for ever. An `os.register_at_fork` handler resets tethered's locks in the child, in place (`_at_fork_reinit`, as `logging` and `threading` do with theirs), so the lock objects stay the ones a locked policy has pinned; a re-entrant lock that the forking thread itself holds is left to it. The C guardian gives up its activation claim in a forked child for the same reason.
 
 None of this has been validated on free-threaded Python (PEP 703). The C extension does not declare free-threaded support, so importing it on a free-threaded build re-enables the GIL, and no free-threaded wheels are published.
+
+## Performance
+
+The audit hook runs on every relevant socket event, but the cost per event is small: the TCP handshake, TLS and application logic dominate the time a real connection takes. The overheads below apply whether tethered was engaged through `activate()` or `scope()`. Measured on CPython 3.13 against localhost with the benchmark's default settings (3,000 TCP-connect iterations, median of 3; 5,000 iterations for the other events):
+
+| Operation | Overhead added |
+|---|---|
+| `socket.connect` | ~25 µs |
+| `socket.getaddrinfo` | ~120 µs (~2×): tethered resolves the name itself to record which hostname each address belongs to |
+| Any audit event that is not a network event | ~150 ns |
+| `with tethered.scope(...)` enter + exit | ~1 µs (the cost of the context manager, with or without `activate()`) |
+
+Numbers vary with hardware, operating system and Python version. Reproduce them with [`uv run python benchmarks/overhead.py`](../benchmarks/overhead.py).

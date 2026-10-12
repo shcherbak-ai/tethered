@@ -8,6 +8,7 @@
 - [`tethered.EgressBlocked`](#tetheredegressblocked)
 - [`tethered.SubprocessBlocked`](#tetheredsubprocessblocked)
 - [`tethered.TetheredLocked`](#tetheredtetheredlocked)
+- [Allow list syntax](#allow-list-syntax)
 - [Locked mode](#locked-mode)
 - [Log-only mode](#log-only-mode)
 - [Intersection semantics — `activate()` + `scope()`](#intersection-semantics--activate--scope)
@@ -31,7 +32,7 @@ tethered.activate(
 
 | Parameter | Description |
 |---|---|
-| `allow` | Required. Allowed destinations — see [Allow list syntax](../README.md#allow-list-syntax). Pass `[]` to block all non-localhost connections. A malformed rule raises `ValueError` (see [Rule validation](#rule-validation)). |
+| `allow` | Required. Allowed destinations — see [Allow list syntax](#allow-list-syntax). Pass `[]` to block all non-localhost connections. A malformed rule raises `ValueError` (see [Rule validation](#rule-validation)). |
 | `log_only` | Log what would be blocked instead of raising `EgressBlocked`. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors, instead of failing open. Default `False`. |
 | `allow_localhost` | Allow loopback addresses (`127.0.0.0/8`, `::1`). Default `True`. |
@@ -103,7 +104,7 @@ tethered.scope(
 
 | Parameter | Description |
 |---|---|
-| `allow` | Required. Allowed destinations — see [Allow list syntax](../README.md#allow-list-syntax). A malformed rule raises `ValueError`, as for `activate()`. |
+| `allow` | Required. Allowed destinations — see [Allow list syntax](#allow-list-syntax). A malformed rule raises `ValueError`, as for `activate()`. |
 | `allow_localhost` | Allow loopback addresses. Default `True`. |
 | `log_only` | Log what would be blocked instead of raising. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors. Default `False`. |
@@ -208,6 +209,29 @@ Only the interpreter that took the lock can present its token, so in every other
 | The lock holder with the correct token, when the locked policy has failed its integrity check | `tethered: the locked policy has failed its integrity check, so it can be neither replaced nor deactivated — re-activating would take a fresh snapshot of whatever has been put in place. Restart the process.` |
 
 A joined interpreter is told to pass the token although it has none: the token never leaves the interpreter that took the lock. The third message is the one an application sees when its interpreter was created before another application of the same process took the lock, for example a second mod_wsgi application group under concurrent first requests (see [COOKBOOK.md](COOKBOOK.md#mod_wsgi)).
+
+## Allow list syntax
+
+`activate()` and `scope()` take the same rules.
+
+| Pattern | Example | Matches |
+|---|---|---|
+| Exact hostname | `"api.stripe.com"` | `api.stripe.com` only |
+| Wildcard subdomain | `"*.stripe.com"` | `api.stripe.com`, `dashboard.stripe.com` (not `stripe.com`) |
+| Hostname + port | `"api.stripe.com:443"` | `api.stripe.com` on port 443 only |
+| IPv4 address | `"198.51.100.1"` | That IP only |
+| IPv4 CIDR range | `"10.0.0.0/8"` | Any IP in `10.x.x.x` |
+| CIDR + port | `"10.0.0.0/8:5432"` | Any IP in `10.x.x.x` on port 5432 |
+| IPv6 address | `"2001:db8::1"` or `"[2001:db8::1]"` | That IPv6 address |
+| IPv6 + port | `"[2001:db8::1]:443"` | That IPv6 address on port 443 only |
+| IPv6 CIDR | `"[2001:db8::]/32"` | Any IP in that IPv6 prefix |
+| IPv6 CIDR + port | `"[2001:db8::]/32:443"` | Any IP in that IPv6 prefix on port 443 only |
+
+**Wildcards** use Python's `fnmatch` syntax. `*` matches any characters **including dots**, so `*.stripe.com` matches both `api.stripe.com` and `a.b.stripe.com`. This differs from TLS certificate wildcards. The characters `?` (single character) and `[seq]` (character set) are also supported. Wildcards match text, not address ranges: `10.*` also allows `10.attacker.example`. Use CIDR for ranges.
+
+**Localhost** (`127.0.0.0/8`, `::1`) is allowed by default; pass `allow_localhost=False` to change that. The addresses `0.0.0.0` and `::` (INADDR_ANY) are treated as localhost.
+
+**Malformed rules raise `ValueError`** at `activate()` / `scope()`; [Rule validation](#rule-validation) lists what is rejected. Hostnames containing whitespace, control characters, or invisible Unicode are rejected and never matched by wildcard rules.
 
 ## Locked mode
 
