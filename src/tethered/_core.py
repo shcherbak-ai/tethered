@@ -2354,6 +2354,9 @@ def _launch_exclusion(event: str, args: tuple[Any, ...]) -> str | None:
        (:func:`_bootstrap_pth_path`).  An editable install, or a ``pip
        install --target`` directory on ``PYTHONPATH``, has none: no Python
        child auto-activates there, so none is treated as auto-inheriting.
+       The file is read again at each such launch
+       (:func:`_is_bootstrap_file`): one that has been emptied, removed or
+       replaced since it was found starts no policy either.
     3. Its interpreter options can be parsed and don't disable that
        bootstrap: no ``-S`` (which skips ``site.py``), and no ``-s`` / ``-I``
        when the bootstrap is in the per-user site-packages.  Otherwise
@@ -2431,7 +2434,33 @@ def _launch_exclusion(event: str, args: tuple[Any, ...]) -> str | None:
     if not pth_path:
         return "no tethered.pth is in a directory this interpreter's site.py processes"
 
-    return _site_bypass_reason(argv, pth_path) or None
+    reason = _site_bypass_reason(argv, pth_path)
+    if reason:
+        return reason
+    # The hook was tethered's when it was found.  Whether it still is decides
+    # whether this child comes up with a policy: a file that was emptied,
+    # removed or replaced since (by an installer, by an external program, by
+    # code the locked-mode guard does not see) starts none, and neither does
+    # one that has been given a ``tethered.start`` for a neighbour.  Asked
+    # last, because it reads the file.
+    if not _is_bootstrap_file(pth_path):
+        return _HOOK_CHANGED_REASON
+    if _start_file_beside(pth_path):
+        return _HOOK_SILENCED_REASON
+    return None
+
+
+# Why a launch of this interpreter is not covered although a hook was found:
+# the hook has been lost since.  Under a lock such a launch is refused
+# whatever ``external_subprocess_policy`` says (see ``_handle_subprocess``).
+_HOOK_CHANGED_REASON = (
+    "tethered.pth no longer holds tethered's bootstrap line: the child holds no policy"
+)
+_HOOK_SILENCED_REASON = (
+    "a tethered.start file beside tethered.pth switches its import line off (PEP 829): "
+    "the child holds no policy"
+)
+_HOOK_LOST_REASONS = (_HOOK_CHANGED_REASON, _HOOK_SILENCED_REASON)
 
 
 # Maximum frames to walk back from the audit hook to find ``_execute_child``.
@@ -3011,6 +3040,16 @@ def _handle_subprocess(
     # is what the rest of this function establishes.
     exclusion = _launch_exclusion(launch_event, launch_args)
     is_python = exclusion is None
+    # The hook was there when the policy was locked and starts no policy any
+    # more.  The lock promises that no Python child of this interpreter comes
+    # up without the policy, and nothing done here can put the hook back, so
+    # the launch is refused whatever external_subprocess_policy says — as a
+    # process environment that lost the policy variable is.  Without a lock
+    # it is an external launch like the others.
+    if cfg.locked and exclusion in _HOOK_LOST_REASONS:
+        desc = f"{_describe_launch(event, args, launch_args)} — {exclusion}"
+        logger.warning("tethered: blocked subprocess launch under a locked policy: %s", desc)
+        raise SubprocessBlocked(event, f"{desc}, and the policy is locked")
     _has_env, env_value = _extract_subprocess_env(launch_event, launch_args)
 
     # ── The environment the child will actually receive ────────────────
@@ -4056,7 +4095,40 @@ def activate(
     # site.py processes (see _compute_pth_path).  Without it, Python children
     # do not auto-activate, sys.executable launches are classified as
     # external, and locked-mode FS-tamper protection has no real target.
-    if not pth_path or not os.path.isfile(pth_path):
+    # A file of that name which is not tethered's leaves things the same
+    # way, and gets a message of its own: nothing is missing there.
+    stand_in = "" if pth_path else _stand_in_pth_path()
+    silenced = "" if pth_path or stand_in else _silenced_pth_path()
+    if stand_in:
+        logger.warning(
+            "tethered: %s is not the file tethered installs under that name (it "
+            "does not hold tethered's bootstrap line): another package may have "
+            "replaced it, or it was changed. Python child processes will NOT "
+            "auto-inherit the policy and sys.executable launches are treated as "
+            "external (external_subprocess_policy applies).%s Reinstall tethered.",
+            stand_in,
+            (
+                " Locked-mode FS-tamper protection on tethered.pth is also unavailable."
+                if locked
+                else ""
+            ),
+        )
+    elif silenced:
+        logger.warning(
+            "tethered: %s is switched off by the tethered.start file beside it: from "
+            "Python 3.15, site.py does not run the import line of a .pth file that has "
+            "a .start file of its name for a neighbour (PEP 829). Python child processes "
+            "will NOT auto-inherit the policy and sys.executable launches are treated as "
+            "external (external_subprocess_policy applies).%s tethered ships no such "
+            "file: remove it.",
+            silenced,
+            (
+                " Locked-mode FS-tamper protection on tethered.pth is also unavailable."
+                if locked
+                else ""
+            ),
+        )
+    elif not pth_path or not os.path.isfile(pth_path):
         logger.warning(
             "tethered: tethered.pth not found at %s — no directory this "
             "interpreter's site.py processes holds it, so Python child processes "
@@ -4424,8 +4496,51 @@ def _canonical_payload(cfg: _Config) -> str:
     return cfg._serialized_payload or _build_env_payload(_build_child_policy_payload(cfg), ())
 
 
-def _compute_pth_path() -> str:
-    """Return the normalized path of the ``tethered.pth`` hook this interpreter processes.
+# The one line of ``tethered.pth``, which ``site.py`` runs when an interpreter
+# starts.  ``src/tethered.pth`` holds exactly this; a test compares the two.
+_PTH_BOOTSTRAP = (
+    f'import os; "{_CHILD_POLICY_ENV}" in os.environ and __import__("tethered._autoactivate")'
+)
+
+# No ``tethered.pth`` is anywhere near this long; more than this is not read.
+_PTH_READ_LIMIT = 4096
+
+
+def _is_bootstrap_file(path: str) -> bool:
+    """Return True if ``path`` holds the bootstrap line tethered installs, and nothing else.
+
+    A file is found by its name and its place, which says nothing about what
+    is in it.  Another distribution that ships a top-level ``tethered.pth``
+    replaces ours when it is installed, without a word from pip or uv, and an
+    emptied file starts no policy in anyone: with either in place, Python
+    children would come up without a policy while this process took them for
+    covered.  So the file counts as the hook only while it is the one
+    tethered installs.
+
+    Read the way ``site.py`` reads a ``.pth`` file (UTF-8, a byte-order mark
+    allowed).  The line ending and trailing white space do not count;
+    anything in front of the line does: the file tethered installs has
+    nothing there, and up to Python 3.14 ``site.py`` executes a line only
+    when it begins with ``import``.
+    """
+    try:
+        with open(path, "rb") as file:
+            data = file.read(_PTH_READ_LIMIT + 1)
+    except (OSError, SubprocessBlocked):
+        # Not there, not readable — or the read itself was refused: a locked
+        # policy that has failed its integrity check is refused every
+        # operation on this file, reading included.  That refusal is not
+        # passed on from here.  The answer is that the file could not be
+        # shown to be the hook, and what the caller is about (an activate()
+        # over such a policy) is refused by the guardian in its own words.
+        return False
+    if len(data) > _PTH_READ_LIMIT:
+        return False
+    return data.decode("utf-8-sig", "replace").rstrip() == _PTH_BOOTSTRAP
+
+
+def _pth_candidates() -> list[str]:
+    """Return the paths at which this interpreter's ``site.py`` runs a ``tethered.pth``.
 
     ``site.py`` executes ``.pth`` files only in site directories: the
     site-packages of the interpreter's prefixes and, when enabled, the
@@ -4434,17 +4549,14 @@ def _compute_pth_path() -> str:
     --target`` directory that is merely on ``PYTHONPATH`` — so it is not a
     bootstrap, however close to the imported package it sits.
 
-    The hook next to the imported package is preferred when that directory
-    is a site directory (``setup.py``'s ``build_py_with_pth`` installs it
-    there, which also covers ``--user`` installs); otherwise the site
-    directories are searched in the order ``site`` processes them.
-
-    Returns ``""`` when no site directory holds the hook, or when this
-    interpreter runs without ``site`` (``-S``).  Python children then do not
-    auto-activate, and the locked-mode FS hook has nothing to guard.
+    The one next to the imported package comes first when that directory is
+    a site directory (``setup.py``'s ``build_py_with_pth`` installs it
+    there, which also covers ``--user`` installs); the others follow in the
+    order ``site`` processes them.  Normalized, and empty when this
+    interpreter runs without ``site`` (``-S``).
     """
     if sys.flags.no_site:
-        return ""
+        return []
     import site
 
     import tethered
@@ -4465,8 +4577,71 @@ def _compute_pth_path() -> str:
         )
         if adjacent in candidates:
             candidates.insert(0, adjacent)
-    for path in candidates:
-        if os.path.isfile(path):
+    return candidates
+
+
+def _compute_pth_path() -> str:
+    """Return the normalized path of the ``tethered.pth`` hook this interpreter processes.
+
+    That is the first of :func:`_pth_candidates` that is tethered's own
+    bootstrap file (:func:`_is_bootstrap_file`).
+
+    Returns ``""`` when no site directory holds the hook, or when this
+    interpreter runs without ``site`` (``-S``).  Python children then do not
+    auto-activate, and the locked-mode FS hook has nothing to guard.
+    """
+    for path in _pth_candidates():
+        # (isfile first: opening a file raises an audit event, a stat none.)
+        if os.path.isfile(path) and _is_bootstrap_file(path) and not _start_file_beside(path):
+            return path
+    return ""
+
+
+# From Python 3.15 (PEP 829) ``site.py`` does not run the import line of
+# ``<name>.pth`` while a ``<name>.start`` file lies beside it.  (Tests flip it.)
+_START_FILE_SILENCES_PTH = sys.version_info >= (3, 15)
+
+
+def _start_file_beside(pth_path: str) -> str:
+    """Return the ``tethered.start`` that switches the hook at ``pth_path`` off, or ``""``.
+
+    tethered ships no such file.  One that is there, whatever it holds,
+    makes ``site.py`` skip the hook's import line on Python 3.15 and later:
+    children start without a policy, and one that should have refused to
+    start does not.  Locked mode refuses the ways of creating the file that
+    raise an audit event; this is for the rest (``os.mknod``, a file that
+    was there before the policy, a policy that is not locked).
+
+    Anything of that name counts, a file ``site.py`` would pass over
+    included (a hidden one, one it cannot read): the answer errs towards
+    "no bootstrap".
+    """
+    if not _START_FILE_SILENCES_PTH:
+        return ""
+    start = os.path.join(os.path.dirname(pth_path), "tethered.start")
+    return start if os.path.lexists(start) else ""
+
+
+def _silenced_pth_path() -> str:
+    """Return a hook of tethered's that a ``tethered.start`` beside it switches off, or ``""``.
+
+    Asked, like :func:`_stand_in_pth_path`, when no hook was found, for the
+    warning.
+    """
+    for path in _pth_candidates():
+        if os.path.isfile(path) and _is_bootstrap_file(path) and _start_file_beside(path):
+            return path
+    return ""
+
+
+def _stand_in_pth_path() -> str:
+    """Return a ``tethered.pth`` that ``site.py`` runs and that is not tethered's, or ``""``.
+
+    Asked when :func:`_compute_pth_path` found no hook, so that the warning
+    can say what is in its place.
+    """
+    for path in _pth_candidates():
+        if os.path.isfile(path) and not _is_bootstrap_file(path):
             return path
     return ""
 

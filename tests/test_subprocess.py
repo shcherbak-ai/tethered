@@ -43,6 +43,10 @@ from tethered._core import (
 )
 from tethered._policy import AllowPolicy, _NetworkRule
 
+# What tethered.pth holds: a file of that name with other content is not
+# taken for the hook (_core._is_bootstrap_file).
+_HOOK_TEXT = _core._PTH_BOOTSTRAP + "\n"
+
 
 def _check_egress_worker(host: str) -> str:
     """Module-level worker for multiprocessing.Pool / ProcessPoolExecutor tests.
@@ -1048,7 +1052,7 @@ class TestIsAutoInheritingPythonLaunch:
         assert _is_auto_inheriting_python_launch("subprocess.Popen", other) is False
         assert _core._pth_path_cache is None
 
-    def test_active_config_decides_over_the_cache(self, monkeypatch):
+    def test_active_config_decides_over_the_cache(self, monkeypatch, tmp_path):
         """With a policy active, the path activate() found is the one that counts."""
         monkeypatch.setattr(_core, "_pth_path_cache", "/stale/site-packages/tethered.pth")
         monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
@@ -1056,8 +1060,10 @@ class TestIsAutoInheritingPythonLaunch:
         assert _core._config._pth_path == ""
         assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is False
 
+        hook = tmp_path / "tethered.pth"
+        hook.write_text(_HOOK_TEXT)
         monkeypatch.setattr(_core, "_pth_path_cache", "")
-        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "/site-packages/tethered.pth")
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: str(hook))
         tethered.activate(allow=[])
         assert _is_auto_inheriting_python_launch("subprocess.Popen", self._PLAIN_LAUNCH) is True
 
@@ -1082,6 +1088,9 @@ class TestIsAutoInheritingPythonLaunch:
         monkeypatch.setattr(site, "USER_SITE", str(tmp_path / "user-site"))
         user_hook = _core._normalize_path(str(tmp_path / "user-site" / "tethered.pth"))
         other_hook = _core._normalize_path(str(tmp_path / "site-packages" / "tethered.pth"))
+        for hook in (user_hook, other_hook):
+            os.makedirs(os.path.dirname(hook))
+            Path(hook).write_text(_HOOK_TEXT)
         args = (sys.executable, [sys.executable, *options], None, None)
 
         monkeypatch.setattr(_core, "_pth_path_cache", user_hook)
@@ -1626,7 +1635,7 @@ class TestPthGuardByAnotherName:
         """A site directory with a hook file: ``(directory, alias of it, locked config)``."""
         directory = tmp_path / "site-packages"
         directory.mkdir()
-        (directory / "tethered.pth").write_text("import tethered._autoactivate\n")
+        (directory / "tethered.pth").write_text(_HOOK_TEXT)
         alias = alias_of(directory, tmp_path / "alias")
         cfg = _Config(
             policy=AllowPolicy([], allow_localhost=True),
@@ -1900,6 +1909,139 @@ class TestPthGuardByAnotherName:
             _handle_pth_fs_op(cfg, "os.remove", ("tethered.pth", no_descriptor))
 
 
+_ANOTHER_PACKAGES_PTH = 'import os; os.environ.setdefault("OTHER_PTH_RAN", "1")\n'
+
+
+class TestBootstrapFile:
+    """A ``tethered.pth`` is the hook only while it is the file tethered installs.
+
+    The hook used to be known by its name and its place alone.  Another
+    distribution that ships a top-level ``tethered.pth`` replaces tethered's
+    when it is installed (pip and uv both overwrite it without a word), and
+    tethered took that file for its bootstrap: no warning, and a Python child
+    of a locked, fail-closed process under ``external_subprocess_policy="block"``
+    was launched with no policy.  An emptied file had the same effect.
+    """
+
+    def test_the_constant_is_what_the_package_ships(self):
+        shipped = Path(__file__).resolve().parent.parent / "src" / "tethered.pth"
+        assert shipped.read_bytes().decode("utf-8") == _HOOK_TEXT
+
+    def test_the_installed_hook_is_recognised(self):
+        assert _core._is_bootstrap_file(_compute_pth_path()) is True
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            _core._PTH_BOOTSTRAP,
+            _core._PTH_BOOTSTRAP + "\n",
+            _core._PTH_BOOTSTRAP + "\r\n",
+            _core._PTH_BOOTSTRAP + " \n\n",
+            "﻿" + _core._PTH_BOOTSTRAP + "\n",
+        ],
+        ids=["no-newline", "lf", "crlf", "trailing-white-space", "byte-order-mark"],
+    )
+    def test_the_line_ending_does_not_count(self, tmp_path, content):
+        hook = tmp_path / "tethered.pth"
+        hook.write_bytes(content.encode("utf-8"))
+        assert _core._is_bootstrap_file(str(hook)) is True
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"",
+            b"\n",
+            _ANOTHER_PACKAGES_PTH.encode(),
+            b"import tethered._autoactivate\n",
+            b" " + _core._PTH_BOOTSTRAP.encode() + b"\n",
+            b"\n" + _core._PTH_BOOTSTRAP.encode() + b"\n",
+            b"# a comment\n" + _core._PTH_BOOTSTRAP.encode() + b"\n",
+            _core._PTH_BOOTSTRAP.encode() + b"\nimport something_else\n",
+            _core._PTH_BOOTSTRAP.encode() + b"\n" * 5000 + b"import something_else\n",
+            _core._PTH_BOOTSTRAP.encode() + b"\n" * 5000,
+            _core._PTH_BOOTSTRAP.encode()[:-1],
+            _core._PTH_BOOTSTRAP.encode().upper(),
+            b"\xff\xfe" + _core._PTH_BOOTSTRAP.encode(),
+        ],
+        ids=[
+            "empty",
+            "blank",
+            "another-package",
+            "another-import",
+            "indented",  # site.py executes a line only when it begins with "import"
+            "after-a-blank-line",
+            "after-a-comment",
+            "with-a-second-line",
+            "with-a-second-line-far-down",
+            "longer-than-is-read",
+            "cut-short",
+            "other-case",
+            "not-utf-8",
+        ],
+    )
+    def test_anything_else_is_not_the_hook(self, tmp_path, content):
+        hook = tmp_path / "tethered.pth"
+        hook.write_bytes(content)
+        assert _core._is_bootstrap_file(str(hook)) is False
+
+    def test_a_file_that_cannot_be_read_is_not_the_hook(self, tmp_path):
+        assert _core._is_bootstrap_file(str(tmp_path / "missing" / "tethered.pth")) is False
+        assert _core._is_bootstrap_file(str(tmp_path)) is False  # a directory
+
+
+class TestStartFileBesideTheHook:
+    """From Python 3.15 a ``tethered.start`` beside the hook switches the hook off.
+
+    ``site.py`` does not run the import line of a ``.pth`` file that has a
+    ``.start`` file of its name for a neighbour (PEP 829).  Locked mode
+    refuses creating one, by the calls that raise an audit event.  A file
+    that was already there, one made with ``os.mknod``, and any such file
+    under a policy that is not locked went unnoticed: children started
+    without a policy and were taken for covered.
+    """
+
+    @pytest.fixture
+    def hook(self, tmp_path):
+        hook = tmp_path / "site-packages" / "tethered.pth"
+        hook.parent.mkdir()
+        hook.write_text(_HOOK_TEXT)
+        return hook
+
+    @pytest.fixture
+    def from_3_15(self, monkeypatch):
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", True)
+
+    def test_the_python_version_decides(self):
+        assert _core._START_FILE_SILENCES_PTH is (sys.version_info >= (3, 15))
+
+    def test_no_start_file(self, hook, from_3_15):
+        assert _core._start_file_beside(str(hook)) == ""
+
+    @pytest.mark.parametrize("content", ["", "# nothing\n", "package.module:callable\n"])
+    def test_a_start_file_counts_whatever_it_holds(self, hook, from_3_15, content):
+        start = hook.with_name("tethered.start")
+        start.write_text(content)
+        assert _core._start_file_beside(str(hook)) == str(start)
+
+    def test_a_link_of_that_name_counts_wherever_it_points(self, hook, from_3_15):
+        start = hook.with_name("tethered.start")
+        try:
+            os.symlink(hook.with_name("nothing-there"), start)
+        except OSError:
+            pytest.skip("making a symlink needs a privilege here")
+        assert _core._start_file_beside(str(hook)) == str(start)
+
+    def test_other_names_do_not_count(self, hook, from_3_15):
+        for name in ("tethered.start.bak", "other.start", "tethered.pth.start"):
+            hook.with_name(name).write_text("")
+        assert _core._start_file_beside(str(hook)) == ""
+
+    def test_before_3_15_the_file_changes_nothing(self, hook, monkeypatch):
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", False)
+        hook.with_name("tethered.start").write_text("")
+        assert _core._start_file_beside(str(hook)) == ""
+
+
 class TestComputePthPath:
     """Direct tests for _compute_pth_path.
 
@@ -1915,12 +2057,14 @@ class TestComputePthPath:
         directory = Path(site.getsitepackages([str(prefix)])[-1])
         directory.mkdir(parents=True)
         if hook:
-            (directory / "tethered.pth").write_text("# hook\n")
+            (directory / "tethered.pth").write_text(_HOOK_TEXT)
         return directory
 
     @staticmethod
-    def _lookup(monkeypatch, sys_prefix, *, site_prefixes=None, user_site=None, package_in=None):
-        """Run _compute_pth_path() as an interpreter with the given site layout would."""
+    def _lookup(
+        monkeypatch, sys_prefix, *, site_prefixes=None, user_site=None, package_in=None, ask=None
+    ):
+        """Run _compute_pth_path() (or ``ask``) as an interpreter with that site layout would."""
         import site
 
         prefixes = [sys_prefix] if site_prefixes is None else site_prefixes
@@ -1932,7 +2076,7 @@ class TestComputePthPath:
             m.setattr(site, "USER_SITE", None if user_site is None else str(user_site))
             if package_in is not None:
                 m.setattr(tethered, "__file__", str(package_in / "tethered" / "__init__.py"))
-            return _compute_pth_path()
+            return (ask or _compute_pth_path)()
 
     def test_finds_the_hook_in_site_packages(self):
         """In this environment the hook that runs is the one in the venv's site-packages.
@@ -1967,7 +2111,7 @@ class TestComputePthPath:
         """``pip install --target`` + ``PYTHONPATH``: on sys.path, yet its .pth files never run."""
         target = tmp_path / "target"
         (target / "tethered").mkdir(parents=True)
-        (target / "tethered.pth").write_text("# hook\n")
+        (target / "tethered.pth").write_text(_HOOK_TEXT)
         monkeypatch.syspath_prepend(str(target))
         prefix = tmp_path / "prefix"
         site_packages = self._site_packages(prefix, hook=False)
@@ -1975,7 +2119,7 @@ class TestComputePthPath:
         assert self._lookup(monkeypatch, prefix, package_in=target) == ""
 
         # Once a site directory has the hook, that one is reported — never the target's.
-        (site_packages / "tethered.pth").write_text("# hook\n")
+        (site_packages / "tethered.pth").write_text(_HOOK_TEXT)
         found = self._lookup(monkeypatch, prefix, package_in=target)
         assert found == _core._normalize_path(str(site_packages / "tethered.pth"))
 
@@ -1999,7 +2143,7 @@ class TestComputePthPath:
         self._site_packages(prefix, hook=False)
         user_site = tmp_path / "user-site"
         user_site.mkdir()
-        (user_site / "tethered.pth").write_text("# hook\n")
+        (user_site / "tethered.pth").write_text(_HOOK_TEXT)
 
         found = self._lookup(monkeypatch, prefix, user_site=user_site, package_in=user_site)
         assert found == _core._normalize_path(str(user_site / "tethered.pth"))
@@ -2024,6 +2168,59 @@ class TestComputePthPath:
             m.setattr(sys, "flags", flags)
             result = _compute_pth_path()
         assert result == ""
+
+    def test_a_file_of_that_name_with_other_content_is_not_the_hook(self, tmp_path, monkeypatch):
+        """Another distribution's ``tethered.pth`` takes the place of ours when it is installed."""
+        prefix = tmp_path / "prefix"
+        site_packages = self._site_packages(prefix, hook=False)
+        stand_in = site_packages / "tethered.pth"
+        stand_in.write_text(_ANOTHER_PACKAGES_PTH)
+
+        def lookup(ask=None):
+            return self._lookup(monkeypatch, prefix, package_in=site_packages, ask=ask)
+
+        assert lookup() == ""
+        assert lookup(_core._stand_in_pth_path) == _core._normalize_path(str(stand_in))
+
+        # tethered's own file in its place: the hook again, and nothing stands in for it.
+        stand_in.write_text(_HOOK_TEXT)
+        assert lookup() == _core._normalize_path(str(stand_in))
+        assert lookup(_core._stand_in_pth_path) == ""
+
+    def test_a_stand_in_does_not_hide_the_hook_of_another_site_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first = self._site_packages(tmp_path / "first", hook=False)
+        second = self._site_packages(tmp_path / "second", hook=True)
+        (first / "tethered.pth").write_text("# not ours\n")
+        prefixes = [tmp_path / "first", tmp_path / "second"]
+        found = self._lookup(monkeypatch, prefixes[0], site_prefixes=prefixes, package_in=first)
+        assert found == _core._normalize_path(str(second / "tethered.pth"))
+
+    def test_nothing_stands_in_where_there_is_no_file(self, tmp_path, monkeypatch):
+        prefix = tmp_path / "prefix"
+        self._site_packages(prefix, hook=False)
+        assert self._lookup(monkeypatch, prefix, ask=_core._stand_in_pth_path) == ""
+
+    def test_a_start_file_beside_the_hook_switches_it_off(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", True)
+        prefix = tmp_path / "prefix"
+        site_packages = self._site_packages(prefix, hook=True)
+        hook = _core._normalize_path(str(site_packages / "tethered.pth"))
+
+        def lookup(ask=None):
+            return self._lookup(monkeypatch, prefix, package_in=site_packages, ask=ask)
+
+        assert lookup() == hook
+        assert lookup(_core._silenced_pth_path) == ""
+        (site_packages / "tethered.start").write_text("")
+        assert lookup() == ""
+        assert lookup(_core._silenced_pth_path) == hook
+        assert lookup(_core._stand_in_pth_path) == ""  # it is tethered's file all the same
+        # Before Python 3.15 site.py knows no .start files, and the hook runs.
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", False)
+        assert lookup() == hook
+        assert lookup(_core._silenced_pth_path) == ""
 
     def test_child_resolves_the_hook_during_its_own_startup(self):
         """An auto-activated child calls activate() from inside site.py and must still find it."""
@@ -2100,6 +2297,121 @@ class TestComputePthPath:
         assert "tethered.pth" in result.stderr
 
 
+@pytest.fixture(scope="module")
+def installed_environment(tmp_path_factory):
+    """``(python, hook)`` of a venv with a copy of the package and of ``tethered.pth``."""
+    import shutil
+
+    venv = tmp_path_factory.mktemp("installed") / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )  # nosec B603 B607
+    python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    asked = subprocess.run(
+        [str(python), "-c", "import site; print(site.getsitepackages()[-1])"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )  # nosec B603 B607
+    site_packages = Path(asked.stdout.strip())
+    package = Path(tethered.__file__).parent
+    shutil.copytree(
+        package, site_packages / "tethered", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    return python, site_packages / "tethered.pth"
+
+
+class TestAnInstalledHookThatIsNotTethereds:
+    """End to end, in an environment that has tethered and its hook in site-packages.
+
+    Each test runs a process of that environment which activates a policy
+    under ``external_subprocess_policy="block"`` and launches a Python child.
+    """
+
+    _PROBE = (
+        "import logging, subprocess, sys\n"
+        "logging.basicConfig()\n"
+        "import tethered, tethered._core as c\n"
+        "tethered.activate(allow=[], external_subprocess_policy='block')\n"
+        "print('hook found:', bool(c._config._pth_path))\n"
+        "CHILD = 'import tethered._core as c; print(\"child has a policy:\", bool(c._config))'\n"
+        "def launch():\n"
+        "    try:\n"
+        "        run = subprocess.run([sys.executable, '-c', CHILD], capture_output=True)\n"
+        "        print((run.stdout.strip() or run.stderr.strip()).decode())\n"
+        "    except tethered.SubprocessBlocked as exc:\n"
+        "        print('blocked:', exc.description.partition(' \\u2014 ')[2])\n"
+        "launch()\n"
+        "if sys.argv[2] == 'replace-it':\n"
+        "    with open(sys.argv[1], 'w') as hook:\n"
+        "        hook.write(sys.argv[3])\n"
+        "    launch()\n"
+    )
+
+    def _run(self, installed_environment, mode):
+        python, hook = installed_environment
+        env = {**os.environ}
+        env.pop(_CHILD_POLICY_ENV, None)
+        env.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [str(python), "-c", self._PROBE, str(hook), mode, _ANOTHER_PACKAGES_PTH],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )  # nosec B603 B607
+        assert result.returncode == 0, result.stderr
+        return result
+
+    def test_a_hook_that_is_replaced_under_a_running_process(self, installed_environment):
+        """An installer or another program changed the file: the next launch says so."""
+        installed_environment[1].write_text(_HOOK_TEXT)
+        result = self._run(installed_environment, "replace-it")
+        assert result.stdout.splitlines() == [
+            "hook found: True",
+            "child has a policy: True",
+            "blocked: tethered.pth no longer holds tethered's bootstrap line: "
+            "the child holds no policy",
+        ]
+
+    def test_a_hook_that_another_package_replaced(self, installed_environment):
+        """It is not taken for the bootstrap: a warning, and the child is an external launch."""
+        installed_environment[1].write_text(_ANOTHER_PACKAGES_PTH)
+        result = self._run(installed_environment, "as-it-is")
+        assert result.stdout.splitlines() == [
+            "hook found: False",
+            "blocked: no tethered.pth is in a directory this interpreter's site.py processes",
+        ]
+        assert "is not the file tethered installs under that name" in result.stderr
+
+    def test_a_start_file_beside_the_hook(self, installed_environment):
+        """tethered says what this interpreter's ``site.py`` does: nothing before 3.15."""
+        hook = installed_environment[1]
+        hook.write_text(_HOOK_TEXT)
+        start = hook.with_name("tethered.start")
+        start.write_text("")
+        try:
+            result = self._run(installed_environment, "as-it-is")
+        finally:
+            start.unlink()
+        if sys.version_info >= (3, 15):
+            assert result.stdout.splitlines() == [
+                "hook found: False",
+                "blocked: no tethered.pth is in a directory this interpreter's site.py processes",
+            ]
+            assert "is switched off by the tethered.start file beside it" in result.stderr
+        else:
+            assert result.stdout.splitlines() == [
+                "hook found: True",
+                "child has a policy: True",
+            ]
+            assert "tethered.start" not in result.stderr
+
+
 class TestPthAvailabilityWarning:
     """activate() warns when tethered.pth is missing — children won't auto-inherit."""
 
@@ -2144,6 +2456,77 @@ class TestPthAvailabilityWarning:
             tethered.activate(allow=["*.example.com"])
         msg = next(r.message for r in caplog.records if "tethered.pth not found" in r.message)
         assert "FS-tamper protection" not in msg
+
+    def test_a_stand_in_gets_a_warning_of_its_own(self, monkeypatch, caplog):
+        """Nothing is missing there: a file of that name is in place, and it is not tethered's."""
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        monkeypatch.setattr(_core, "_stand_in_pth_path", lambda: "/site-packages/tethered.pth")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        (msg,) = [r.message for r in caplog.records if "tethered.pth" in r.message]
+        assert msg.startswith(
+            "tethered: /site-packages/tethered.pth is not the file tethered installs"
+        )
+        assert "NOT auto-inherit the policy" in msg
+        assert "FS-tamper protection" not in msg
+        assert msg.endswith("Reinstall tethered.")
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_a_stand_in_under_a_lock_mentions_fs_protection(self, monkeypatch, caplog):
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        monkeypatch.setattr(_core, "_stand_in_pth_path", lambda: "/site-packages/tethered.pth")
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=[], locked=True, lock_token=object())
+        (msg,) = [r.message for r in caplog.records if "is not the file tethered" in r.message]
+        assert "FS-tamper protection on tethered.pth is also unavailable" in msg
+        assert not [r for r in caplog.records if "tethered.pth not found" in r.message]
+
+    def test_no_stand_in_is_looked_for_while_the_hook_is_there(self, monkeypatch):
+        def unexpected():
+            raise AssertionError("the hook was found; nothing stands in for it")
+
+        monkeypatch.setattr(_core, "_stand_in_pth_path", unexpected)
+        tethered.activate(allow=["*.example.com"])
+        assert _core._config._pth_path
+
+    @pytest.mark.parametrize(
+        "locked",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    _core._c_guardian is None, reason="C guardian extension not available"
+                ),
+            ),
+        ],
+        ids=["unlocked", "locked"],
+    )
+    def test_a_silenced_hook_gets_a_warning_of_its_own(self, monkeypatch, caplog, locked):
+        """The hook is tethered's and in its place; a ``tethered.start`` beside it stops it."""
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        monkeypatch.setattr(_core, "_silenced_pth_path", lambda: "/site-packages/tethered.pth")
+        lock = {"locked": True, "lock_token": object()} if locked else {}
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"], **lock)
+        (msg,) = [r.message for r in caplog.records if "tethered.pth" in r.message]
+        assert msg.startswith(
+            "tethered: /site-packages/tethered.pth is switched off by the tethered.start file"
+        )
+        assert "NOT auto-inherit the policy" in msg
+        assert ("FS-tamper protection" in msg) is locked
+        assert msg.endswith("tethered ships no such file: remove it.")
+
+    def test_a_stand_in_is_reported_and_nothing_else_is_asked(self, monkeypatch, caplog):
+        def unexpected():
+            raise AssertionError("a stand-in was found; that is the message")
+
+        monkeypatch.setattr(_core, "_compute_pth_path", lambda: "")
+        monkeypatch.setattr(_core, "_stand_in_pth_path", lambda: "/site-packages/tethered.pth")
+        monkeypatch.setattr(_core, "_silenced_pth_path", unexpected)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            tethered.activate(allow=["*.example.com"])
+        assert [r for r in caplog.records if "is not the file tethered installs" in r.message]
 
 
 class TestAuditHookFsAndAllowDispatch:
@@ -4908,6 +5291,137 @@ class TestWhyALaunchIsExternal:
         assert record.getMessage() == (
             "tethered: external subprocess launch detected: subprocess.Popen(/bin/sh)"
         )
+
+    # ── a hook that is no longer the bootstrap ──
+
+    _NO_LONGER = "tethered.pth no longer holds tethered's bootstrap line: the child holds no policy"
+
+    @pytest.fixture
+    def own_hook(self, tmp_path, monkeypatch):
+        """A hook file of the test's own, in the place a launch looks it up without a config."""
+        hook = tmp_path / "site-packages" / "tethered.pth"
+        hook.parent.mkdir()
+        hook.write_text(_HOOK_TEXT)
+        monkeypatch.setattr(_core, "_pth_path_cache", _core._normalize_path(str(hook)))
+        return hook
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda hook: hook.write_text(""),
+            lambda hook: hook.write_text(_ANOTHER_PACKAGES_PTH),
+            lambda hook: hook.unlink(),
+        ],
+        ids=["emptied", "replaced", "removed"],
+    )
+    def test_a_hook_that_was_changed_since_it_was_found(self, own_hook, change):
+        """An installer, another program, code the guard does not see: the child gets no policy.
+
+        The path was found once and believed from then on, so a child of a
+        process whose hook had been emptied was launched as one that inherits.
+        """
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+        change(own_hook)
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) == self._NO_LONGER
+        assert _is_auto_inheriting_python_launch("subprocess.Popen", self._popen()) is False
+        own_hook.write_text(_HOOK_TEXT)
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+
+    @pytest.mark.parametrize("policy", ["warn", "block"])
+    def test_a_changed_hook_ends_the_warning_and_the_refusal(self, own_hook, policy, caplog):
+        own_hook.write_text("")
+        cfg = _launch_cfg(external_subprocess_policy=policy)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if policy == "block":
+                with pytest.raises(tethered.SubprocessBlocked, match="no longer holds tethered"):
+                    _handle_subprocess(cfg, "subprocess.Popen", self._popen())
+            else:
+                _handle_subprocess(cfg, "subprocess.Popen", self._popen())
+        (record,) = caplog.records
+        assert record.getMessage().endswith(" — " + self._NO_LONGER)
+
+    def test_the_hook_is_read_only_for_a_launch_that_would_inherit(self, own_hook, monkeypatch):
+        """Reading a file is the dearest step; every other answer is given without it."""
+        reads = []
+        real = _core._is_bootstrap_file
+        monkeypatch.setattr(
+            _core, "_is_bootstrap_file", lambda path: reads.append(path) or real(path)
+        )
+        other_program = ("/bin/sh", ["/bin/sh", "-c", "true"], None, None)
+        assert _core._launch_exclusion("subprocess.Popen", other_program) == ""
+        assert _core._launch_exclusion("os.system", ("echo hi",)) == ""
+        assert _core._launch_exclusion("subprocess.Popen", self._popen("-S"))
+        assert _core._launch_exclusion("subprocess.Popen", self._popen(argv0="python"))
+        assert reads == []
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+        assert reads == [_core._normalize_path(str(own_hook))]
+
+    _SILENCED = (
+        "a tethered.start file beside tethered.pth switches its import line off (PEP 829): "
+        "the child holds no policy"
+    )
+
+    def test_a_start_file_that_appeared_beside_the_hook(self, own_hook, monkeypatch):
+        """``os.mknod`` raises no audit event, and without a lock nothing guards the name."""
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", True)
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+        start = own_hook.with_name("tethered.start")
+        start.write_text("")
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) == self._SILENCED
+        start.unlink()
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+        # Before Python 3.15 the file is nothing to site.py, and nothing here.
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", False)
+        start.write_text("")
+        assert _core._launch_exclusion("subprocess.Popen", self._popen()) is None
+
+    # ── under a lock, a launch after the hook was lost is refused ──
+
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    @pytest.mark.parametrize("lost", ["emptied", "removed", "silenced"])
+    def test_under_a_lock_the_launch_is_refused_whatever_the_setting(
+        self, own_hook, monkeypatch, caplog, policy, lost
+    ):
+        """The lock promises that no Python child of this interpreter starts without the policy.
+
+        Under ``"warn"`` the child of a locked process whose hook had been
+        emptied was started all the same, with a warning; under ``"allow"``
+        without one.
+        """
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", True)
+        # (Done before the locked config is in force: from then on this
+        # process is refused each of these, and they stand for the routes
+        # that the guard does not see.)
+        if lost == "emptied":
+            own_hook.write_text("")
+        elif lost == "removed":
+            own_hook.unlink()
+        else:
+            own_hook.with_name("tethered.start").write_text("")
+        cfg = _launch_cfg_in_force(monkeypatch, locked=True, external_subprocess_policy=policy)
+        assert cfg._pth_path == _core._normalize_path(str(own_hook))
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.SubprocessBlocked, match="and the policy is locked") as refused,
+        ):
+            _handle_subprocess(cfg, "subprocess.Popen", self._popen())
+        assert refused.value.event == "subprocess.Popen"
+        expected = self._SILENCED if lost == "silenced" else self._NO_LONGER
+        assert refused.value.description.endswith(f" — {expected}, and the policy is locked")
+        (record,) = caplog.records
+        assert record.getMessage().startswith(
+            "tethered: blocked subprocess launch under a locked policy: subprocess.Popen("
+        )
+        assert record.getMessage().endswith(expected)
+
+    def test_only_a_hook_that_was_found_can_be_lost(self, monkeypatch):
+        """No hook when the policy was activated: an external launch, as it was reported then."""
+        assert set(_core._HOOK_LOST_REASONS) == {self._NO_LONGER, self._SILENCED}
+        monkeypatch.setattr(_core, "_bootstrap_pth_path", lambda: "")
+        reason = _core._launch_exclusion("subprocess.Popen", self._popen())
+        assert reason and reason not in _core._HOOK_LOST_REASONS
+        bypass = _core._launch_exclusion("subprocess.Popen", self._popen("-S"))
+        assert bypass and bypass not in _core._HOOK_LOST_REASONS
 
 
 class TestSysExecutableThatIsNotPython:

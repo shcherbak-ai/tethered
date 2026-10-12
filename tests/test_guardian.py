@@ -1251,7 +1251,9 @@ class TestSnapshotStaging:
             guardian.deactivate(secret)
 
 
-PTH_LINE = "import tethered._autoactivate\n"
+# What tethered.pth holds: a file of that name with other content is not
+# taken for the hook (_core._is_bootstrap_file).
+PTH_LINE = _core._PTH_BOOTSTRAP + "\n"
 
 
 @pytest.fixture
@@ -1618,6 +1620,77 @@ class TestPthGuardByAnotherName:
         shutil.rmtree(elsewhere)
         assert not elsewhere.exists()
         assert scratch_pth.read_text() == PTH_LINE
+
+
+@pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+class TestHookContentUnderALock:
+    """What the hook file holds is read again while a policy is locked."""
+
+    def test_a_refused_read_does_not_confirm_the_hook(self, scratch_pth, monkeypatch, capfd):
+        """A locked policy that has failed its check is refused reading the file, too.
+
+        ``activate()`` reads the hook before the guardian is asked, and the
+        refusal of that read used to come out of it as ``SubprocessBlocked``
+        in place of the guardian's ``TetheredLocked``.
+        """
+        secret = object()
+        tethered.activate(allow=["a.test"], locked=True, lock_token=secret)
+        hook = _core._config._pth_path
+        assert _core._is_bootstrap_file(hook) is True
+        with monkeypatch.context() as patch:
+            patch.setattr(_core, "_handle_connect", lambda *args: None)
+            with pytest.raises(tethered.SubprocessBlocked, match="integrity"):
+                open(scratch_pth, "rb")  # noqa: SIM115
+            assert _core._is_bootstrap_file(hook) is False
+            with pytest.raises(tethered.TetheredLocked, match="integrity"):
+                tethered.activate(allow=["b.test"], locked=True, lock_token=secret)
+        assert _core._is_bootstrap_file(hook) is True
+        assert "TAMPER DETECTED" in capfd.readouterr().err
+
+    @pytest.mark.parametrize("policy", ["allow", "warn", "block"])
+    def test_a_hook_emptied_by_another_process_ends_python_launches(self, scratch_pth, policy):
+        """The guard sees this process only; what it cannot refuse, the launch does.
+
+        The child that empties the file is locked too, and guards the hook
+        of the environment it runs in: to it, this one is a file elsewhere.
+        A locked policy refuses the launch that follows whatever
+        ``external_subprocess_policy`` says: the hook was there when the
+        policy was locked, and the child would start without it.
+        """
+        _activate_locked(allow=[], external_subprocess_policy=policy)
+        empty_it = f"open({str(scratch_pth)!r}, 'w').close()"
+        subprocess.run([sys.executable, "-c", empty_it], check=True, timeout=60)  # nosec B603
+        assert scratch_pth.read_text() == ""
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"no longer holds tethered.*policy is locked"
+        ) as refused:
+            subprocess.run([sys.executable, "-c", "pass"], timeout=60)  # nosec B603
+        assert refused.value.event == "subprocess.Popen"
+
+    def test_a_start_file_made_by_another_process_ends_python_launches(
+        self, scratch_pth, monkeypatch
+    ):
+        """From Python 3.15 a ``tethered.start`` beside the hook switches the hook off.
+
+        This process is refused creating one.  One that comes from elsewhere
+        (another process here; ``os.mknod`` raises no audit event either) is
+        met at the next launch.
+        """
+        monkeypatch.setattr(_core, "_START_FILE_SILENCES_PTH", True)  # before the lock pins it
+        _activate_locked(allow=[])
+        start = scratch_pth.with_name("tethered.start")
+        with pytest.raises(tethered.SubprocessBlocked, match="refused creation"):
+            start.write_text("")
+        make_it = f"open({str(start)!r}, 'w').close()"
+        subprocess.run([sys.executable, "-c", make_it], check=True, timeout=60)  # nosec B603
+        assert start.exists()
+        with pytest.raises(
+            tethered.SubprocessBlocked, match=r"tethered\.start file beside.*policy is locked"
+        ):
+            subprocess.run([sys.executable, "-c", "pass"], timeout=60)  # nosec B603
+        # Taking the file away is not refused, and the hook runs again.
+        start.unlink()
+        subprocess.run([sys.executable, "-c", "pass"], check=True, timeout=60)  # nosec B603
 
 
 # ── Integrity verification on non-socket events (R30) ──────────────
