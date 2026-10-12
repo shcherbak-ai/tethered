@@ -1761,6 +1761,183 @@ class TestPthGuardByAnotherName:
             assert not _path_matches_pth(str(alias / "tethered.pth"), cfg._pth_path)
             assert _path_matches_pth(str(directory / "tethered.pth"), cfg._pth_path)
 
+    # ── the file itself, under its name in another directory ───────────
+
+    @pytest.fixture
+    def cache_copy(self, hook, tmp_path):
+        """The hook as uv installs it: a hard link to a ``tethered.pth`` in its cache."""
+        directory, _, _ = hook
+        cache = tmp_path / "cache" / "archive-v0" / "a1b2"
+        cache.mkdir(parents=True)
+        os.link(directory / "tethered.pth", cache / "tethered.pth")
+        return cache / "tethered.pth"
+
+    @pytest.mark.parametrize(
+        ("event", "arguments", "refusal"),
+        [
+            ("open", lambda c, t: (str(c), "w", 0), "refused write-open"),
+            ("open", lambda c, t: (os.fsencode(c), "r+", 0), "refused write-open"),
+            ("open", lambda c, t: (c, "", os.O_WRONLY | os.O_TRUNC), "refused write-open"),
+            ("os.chmod", lambda c, t: (str(c), 0, -1), "refused chmod"),
+            ("os.truncate", lambda c, t: (str(c), 0), "refused truncation"),
+            ("_winapi.CopyFile2", lambda c, t: (str(t), str(c), 0), "refused overwrite"),
+            ("os.rename", lambda c, t: (str(c), str(t), -1, -1), "refused rename"),
+            ("os.link", lambda c, t: (str(c), str(t), -1, -1), "refused a second name"),
+            (
+                "os.symlink",
+                lambda c, t: (os.fsencode(c), os.fsencode(t), -1),
+                "refused a second name",
+            ),
+        ],
+        ids=lambda value: value if isinstance(value, str) else None,
+    )
+    def test_the_same_file_elsewhere_is_the_hook(
+        self, hook, cache_copy, tmp_path, event, arguments, refusal
+    ):
+        """uv hard-links the hook out of its cache: a write to the cache's file empties it.
+
+        A rename of that other name is refused with the links: it would leave
+        the file under a name that no longer says what it is.
+        """
+        _, _, cfg = hook
+        with pytest.raises(tethered.SubprocessBlocked, match=refusal):
+            _handle_pth_fs_op(cfg, event, arguments(cache_copy, tmp_path / "other.txt"))
+
+    def test_the_other_name_can_be_read_removed_and_replaced(self, hook, cache_copy, tmp_path):
+        """None of these changes the hook, which keeps its content under its own name."""
+        _, _, cfg = hook
+        other = str(tmp_path / "other.txt")
+        _handle_pth_fs_op(cfg, "open", (str(cache_copy), "rb", 0))  # no raise
+        _handle_pth_fs_op(cfg, "_winapi.CopyFile2", (str(cache_copy), other, 0))  # a copy of it
+        _handle_pth_fs_op(cfg, "os.remove", (str(cache_copy), -1))
+        _handle_pth_fs_op(cfg, "os.rename", (other, str(cache_copy), -1, -1))
+
+    def test_only_some_events_ask_for_the_file(self, hook, cache_copy):
+        _, _, cfg = hook
+        assert not _path_matches_pth(str(cache_copy), cfg._pth_path)
+        assert _path_matches_pth(str(cache_copy), cfg._pth_path, same_file=True)
+
+    def test_another_file_of_that_name_is_not_the_hook(self, hook, tmp_path):
+        """The environment next door has a ``tethered.pth`` of its own, and pip writes there."""
+        _, _, cfg = hook
+        other = tmp_path / "another-environment" / "tethered.pth"
+        other.parent.mkdir()
+        spare = str(tmp_path / "spare")
+        for exists in (False, True):
+            if exists:
+                other.write_text(_HOOK_TEXT)
+            assert not _path_matches_pth(str(other), cfg._pth_path, same_file=True)
+            _handle_pth_fs_op(cfg, "open", (str(other), "w", 0))  # no raise
+            _handle_pth_fs_op(cfg, "os.chmod", (str(other), 0, -1))
+            _handle_pth_fs_op(cfg, "os.truncate", (str(other), 0))
+            _handle_pth_fs_op(cfg, "_winapi.CopyFile2", (spare, str(other), 0))
+            _handle_pth_fs_op(cfg, "os.rename", (str(other), spare, -1, -1))
+            _handle_pth_fs_op(cfg, "os.link", (str(other), spare, -1, -1))
+            _handle_pth_fs_op(cfg, "os.symlink", (str(other), spare, -1))
+        nowhere = tmp_path / "nowhere" / "tethered.pth"
+        assert not _path_matches_pth(str(nowhere), cfg._pth_path, same_file=True)
+
+    def test_the_file_is_looked_up_at_each_check(self, hook, cache_copy):
+        """An upgrade puts a new file in the hook's place: the old one is the hook no longer."""
+        directory, _, cfg = hook
+        os.remove(directory / "tethered.pth")
+        (directory / "tethered.pth").write_text(_HOOK_TEXT)
+        assert not _path_matches_pth(str(cache_copy), cfg._pth_path, same_file=True)
+        _handle_pth_fs_op(cfg, "open", (str(cache_copy), "w", 0))  # no raise
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            _handle_pth_fs_op(cfg, "open", (str(directory / "tethered.pth"), "w", 0))
+
+    def test_a_file_without_a_file_index_is_not_matched(self, hook, cache_copy, monkeypatch):
+        """Where every file reports index 0, one file cannot be told from another."""
+        directory, _, cfg = hook
+        real_stat = os.stat
+
+        def without_index(path, **kwargs):
+            fields = list(real_stat(path, **kwargs))
+            fields[1] = 0  # st_ino
+            return os.stat_result(fields)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "stat", without_index)
+            assert not _path_matches_pth(str(cache_copy), cfg._pth_path, same_file=True)
+            assert _path_matches_pth(str(directory / "tethered.pth"), cfg._pth_path, same_file=True)
+
+    def test_a_symlink_of_that_name_to_the_file_is_the_file(self, hook, tmp_path):
+        directory, _, cfg = hook
+        link = tmp_path / "linked" / "tethered.pth"
+        link.parent.mkdir()
+        try:
+            os.symlink(directory / "tethered.pth", link)
+        except OSError:
+            pytest.skip("making a symlink needs a privilege here")
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            _handle_pth_fs_op(cfg, "open", (str(link), "w", 0))
+
+    def test_a_stream_of_the_same_file_elsewhere(self, hook, cache_copy, windows_rules):
+        _, _, cfg = hook
+        with pytest.raises(tethered.SubprocessBlocked, match="refused write-open"):
+            _handle_pth_fs_op(cfg, "open", (str(cache_copy) + "::$DATA", "a", 0))
+
+    # ── one more name for the file ─────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        ("event", "arguments"),
+        [
+            ("os.link", lambda d, a, t: (str(d / "tethered.pth"), str(t), -1, -1)),
+            (
+                "os.link",
+                lambda d, a, t: (os.fsencode(a / "tethered.pth"), os.fsencode(t), -1, -1),
+            ),
+            ("os.link", lambda d, a, t: (a / "tethered.pth", t, -1, -1)),
+            ("os.symlink", lambda d, a, t: (str(d / "tethered.pth"), str(t), -1)),
+            ("os.symlink", lambda d, a, t: (os.fsencode(a / "tethered.pth"), os.fsencode(t), -1)),
+            # The text a symlink holds is read from the directory the link is made in.
+            ("os.symlink", lambda d, a, t: ("tethered.pth", str(d / "by-another-name"), -1)),
+            (
+                "os.symlink",
+                lambda d, a, t: (os.path.join("..", d.name, "tethered.pth"), str(d / "x"), -1),
+            ),
+        ],
+        ids=[
+            "link",
+            "link-bytes-through-an-alias",
+            "link-pathlike",
+            "symlink",
+            "symlink-bytes-through-an-alias",
+            "symlink-relative",
+            "symlink-relative-with-dots",
+        ],
+    )
+    def test_a_second_name_for_the_file_is_refused(self, hook, tmp_path, caplog, event, arguments):
+        """A write through a link changes the hook, and its path need not say so.
+
+        ``os.link(hook, "x")`` and ``open("x", "w")`` emptied the hook under a
+        lock: the first was only looked at as a way of creating
+        ``tethered.start``, and the second names nothing tethered knows.
+        """
+        directory, alias, cfg = hook
+        with (
+            caplog.at_level(logging.WARNING, logger="tethered"),
+            pytest.raises(tethered.SubprocessBlocked, match="refused a second name"),
+        ):
+            _handle_pth_fs_op(cfg, event, arguments(directory, alias, tmp_path / "second-name"))
+        assert any("blocked a second name for" in r.message for r in caplog.records)
+
+    def test_links_to_something_else_are_left_alone(self, hook, tmp_path):
+        directory, _, cfg = hook
+        other = tmp_path / "other.txt"
+        other.write_text("")
+        spare = str(tmp_path / "spare")
+        _handle_pth_fs_op(cfg, "os.link", (str(other), spare, -1, -1))  # no raise
+        _handle_pth_fs_op(cfg, "os.symlink", (str(other), spare, -1))
+        # A link to the directory is another name for the directory, which the guard knows.
+        _handle_pth_fs_op(cfg, "os.symlink", (str(directory), str(tmp_path / "tethered.pth.d"), -1))
+        # The same text, read from another directory, names another file.
+        _handle_pth_fs_op(cfg, "os.symlink", ("tethered.pth", spare, -1))
+        # An event that is short of arguments, and a source that is no path.
+        _handle_pth_fs_op(cfg, "os.link", (str(directory / "tethered.pth"),))
+        _handle_pth_fs_op(cfg, "os.symlink", (3, str(tmp_path / "tethered.pth.d"), -1))
+
     @pytest.mark.parametrize(
         ("argument", "expected"),
         [
@@ -1878,6 +2055,28 @@ class TestPthGuardByAnotherName:
             _handle_pth_fs_op(cfg, "os.chmod", ("tethered.pth", 0, fd))
             _handle_pth_fs_op(cfg, "os.symlink", ("/tmp/x", "tethered.start", fd))
         finally:
+            os.close(fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no directory descriptors")
+    def test_the_same_file_relative_to_a_descriptor_of_another_directory(self, hook, cache_copy):
+        directory, _, cfg = hook
+        cache_fd = os.open(cache_copy.parent, os.O_RDONLY)
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            assert not _path_matches_pth("tethered.pth", cfg._pth_path, cache_fd)
+            assert _path_matches_pth("tethered.pth", cfg._pth_path, cache_fd, same_file=True)
+            with pytest.raises(tethered.SubprocessBlocked, match="refused chmod"):
+                _handle_pth_fs_op(cfg, "os.chmod", ("tethered.pth", 0, cache_fd))
+            with pytest.raises(tethered.SubprocessBlocked, match="refused rename"):
+                _handle_pth_fs_op(cfg, "os.rename", ("tethered.pth", "x", cache_fd, cache_fd))
+            for source_fd in (fd, cache_fd):
+                with pytest.raises(tethered.SubprocessBlocked, match="refused a second name"):
+                    _handle_pth_fs_op(cfg, "os.link", ("tethered.pth", "x", source_fd, -1))
+                with pytest.raises(tethered.SubprocessBlocked, match="refused a second name"):
+                    _handle_pth_fs_op(cfg, "os.symlink", ("tethered.pth", "x", source_fd))
+            _handle_pth_fs_op(cfg, "os.remove", ("tethered.pth", cache_fd))  # no raise
+        finally:
+            os.close(cache_fd)
             os.close(fd)
 
     def test_an_absolute_path_ignores_the_descriptor(self, hook, tmp_path, posix_rules):

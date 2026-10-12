@@ -818,15 +818,19 @@ _EXTERNAL_SUBPROCESS_POLICIES = frozenset(("allow", "warn", "block"))
 # built on it) writes its destination on Windows from Python 3.12: the file
 # is replaced without an ``open`` event.
 #
-# ``os.link`` and ``os.symlink`` cannot be used against the ``.pth`` itself:
-# both syscalls fail with ``EEXIST`` when the destination already exists, and
-# the ``.pth`` is created during ``pip install`` and present at the moment
-# this hook starts watching.  They are here for a name that does not exist.
-# From Python 3.15 (PEP 829) ``site.py`` ignores the ``import`` line of
-# ``tethered.pth`` when a ``tethered.start`` file sits beside it, whatever
-# that file contains.  tethered ships no such file, so creating one disables
-# auto-activation as surely as deleting the ``.pth`` — see
-# :func:`_created_path` for the ways of creating it that are refused.
+# ``os.link`` and ``os.symlink`` cannot replace the ``.pth``: both syscalls
+# fail with ``EEXIST`` when the destination already exists, and the ``.pth``
+# is created when tethered is installed and present at the moment this hook
+# starts watching.  They are here for two other things.  One is a name that
+# does not exist yet: from Python 3.15 (PEP 829) ``site.py`` ignores the
+# ``import`` line of ``tethered.pth`` when a ``tethered.start`` file sits
+# beside it, whatever that file contains.  tethered ships no such file, so
+# creating one disables auto-activation as surely as deleting the ``.pth`` —
+# see :func:`_created_path` for the ways of creating it that are refused.
+# The other is the ``.pth`` as the source: a hard link or a symlink to it is
+# a second name for the file, and a write through a name that does not
+# mention ``tethered.pth`` is never looked at
+# (:func:`_gives_pth_another_name`).
 #
 # The C guardian verifies the integrity snapshot on these same events before
 # this hook runs (``classify_event`` in ``_guardian.c``), so a replaced
@@ -3269,7 +3273,9 @@ def _mentions_hook(path: Any) -> bool:
     return path is not None and not isinstance(path, int) and isinstance(path, os.PathLike)
 
 
-def _path_matches_pth(target: Any, cached: str, dir_fd: Any = -1) -> bool:
+def _path_matches_pth(
+    target: Any, cached: str, dir_fd: Any = -1, *, same_file: bool = False
+) -> bool:
     """Return True if ``target`` (str/bytes/PathLike) names ``cached``, a guarded path.
 
     ``cached`` is the ``tethered.pth`` path stored at ``activate()`` time, or
@@ -3287,8 +3293,19 @@ def _path_matches_pth(target: Any, cached: str, dir_fd: Any = -1) -> bool:
     guarded name, so a path that has nothing to do with the hook costs no
     system call.
 
-    Not matched: another name for the file itself (a hard link, a symlink to
-    the file), and a directory on a file system that reports no file index.
+    With ``same_file``, a file of that name in another directory is a match
+    as well when it is the very file ``cached`` names (one more ``os.stat``
+    of each).  uv installs by hard-linking out of its cache, so the
+    ``tethered.pth`` of an environment it made is also a ``tethered.pth`` in
+    the cache directory, and a write to that one changes the hook.  The
+    events that change a file in place ask for this, and so do the ones
+    that would give the file one more name (a link to it, a rename of it).
+    Removing the other name, or renaming something else onto it, leaves the
+    hook as it is and is not refused.
+
+    Not matched: a name for the file that is not ``tethered.pth`` (a hard
+    link or a symlink called something else, ``/proc/self/fd/N``), and
+    anything on a file system that reports no file index.
     """
     if not cached:
         return False
@@ -3323,9 +3340,44 @@ def _path_matches_pth(target: Any, cached: str, dir_fd: Any = -1) -> bool:
         else:
             found = os.stat(dir_fd)
         # (Some network file systems report 0 for every file.)
-        return found.st_ino != 0 and os.path.samestat(found, os.stat(os.path.dirname(cached)))
+        if found.st_ino != 0 and os.path.samestat(found, os.stat(os.path.dirname(cached))):
+            return True
+        if not same_file:
+            return False
+        # Another directory.  (``last`` is without the name of a Windows stream.)
+        entry = os.path.join(directory, last)
+        found = os.stat(entry, dir_fd=dir_fd) if relative_to_fd else os.stat(entry)
+        return found.st_ino != 0 and os.path.samestat(found, os.stat(cached))
     except (OSError, ValueError, NotImplementedError):
         return False
+
+
+def _gives_pth_another_name(event: str, args: tuple[Any, ...], pth: str) -> bool:
+    """Return True if an ``os.link`` / ``os.symlink`` event makes a second name for ``pth``.
+
+    A write through a hard link or a symlink changes the hook as a write to
+    ``pth`` itself does, and once such a name exists its path need not
+    mention ``tethered.pth`` any more: nothing would look at that write.  So
+    the name is refused when it is made, while the source still spells the
+    file's name out.
+
+    ``os.link`` carries ``(src, dst, src_dir_fd, dst_dir_fd)``.
+    ``os.symlink`` carries ``(src, dst, dir_fd)``, where ``src`` is the text
+    the link will hold: a relative one is read from the directory of
+    ``dst``, which is also where the descriptor applies.
+    """
+    if len(args) < 2:
+        return False
+    dir_fd = args[2] if len(args) >= 3 else -1
+    if event == "os.link":
+        return _path_matches_pth(args[0], pth, dir_fd, same_file=True)
+    try:
+        held = os.fsdecode(args[0])
+        if not os.path.isabs(held):
+            held = os.path.join(os.path.dirname(os.fsdecode(args[1])), held)
+    except (TypeError, ValueError):
+        return False
+    return _path_matches_pth(held, pth, dir_fd, same_file=True)
 
 
 def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
@@ -3344,7 +3396,14 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     - ``os.truncate`` given a path (emptying the file disables
       auto-activation just as deleting it does);
     - ``_winapi.CopyFile2`` onto the path (``shutil.copy2`` on Windows, which
-      replaces the file without an ``open`` event).
+      replaces the file without an ``open`` event);
+    - the last four on the same file under its name in another directory
+      (uv hard-links the hook out of its cache, so a write to the cache's
+      ``tethered.pth`` empties the hook);
+    - one more name for the file: ``os.link`` / ``os.symlink`` with the
+      file as their source (:func:`_gives_pth_another_name`), and a rename
+      of that other ``tethered.pth``, which would leave the file under a
+      name that no longer says what it is.
 
     Also refuses creating ``tethered.start`` beside it, which from Python
     3.15 makes ``site.py`` ignore the ``.pth``'s ``import`` line (PEP 829):
@@ -3364,8 +3423,9 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
     ``os.truncate`` given a file descriptor) — the event carries the
     descriptor, not a path, though obtaining a writable descriptor through
     ``open`` / ``os.open`` is refused above; ``os.open`` with ``dir_fd``,
-    whose ``open`` event does not carry the descriptor; another name for the
-    file itself (a hard link, a symlink to the file); ``os.mknod`` creating
+    whose ``open`` event does not carry the descriptor; a name for the file
+    that is not ``tethered.pth`` and was made before the policy was locked,
+    or that needs no link (``/proc/self/fd/N`` on Linux); ``os.mknod`` creating
     ``tethered.start`` (POSIX), which raises no audit event; ``ctypes``
     calling libc ``unlink`` / ``rename`` / ``open`` / ``chmod`` /
     ``truncate`` directly, which raises none either; and external tools
@@ -3402,35 +3462,44 @@ def _handle_pth_fs_op(cfg: _Config, event: str, args: tuple[Any, ...]) -> None:
             logger.warning("tethered: blocked deletion of %s", pth)
             raise SubprocessBlocked(event, f"refused deletion of {pth} in locked mode")
     elif event == "os.rename":
-        # args: (src, dst, src_dir_fd, dst_dir_fd); ``created`` is dst
+        # args: (src, dst, src_dir_fd, dst_dir_fd); ``created`` is dst.
+        # The source is asked for the file as well: renaming another
+        # ``tethered.pth`` that is this file gives the file a name nothing
+        # looks at any more.  A rename onto that other name only takes the
+        # name away from the file.
         src = args[0] if args else None
         src_fd = args[2] if len(args) >= 3 else -1
-        if _path_matches_pth(src, pth, src_fd) or _path_matches_pth(created, pth, created_fd):
+        if _path_matches_pth(src, pth, src_fd, same_file=True) or _path_matches_pth(
+            created, pth, created_fd
+        ):
             logger.warning("tethered: blocked rename touching %s", pth)
             raise SubprocessBlocked(event, f"refused rename touching {pth} in locked mode")
     elif event == "open":
-        if _path_matches_pth(created, pth):
+        if _path_matches_pth(created, pth, same_file=True):
             logger.warning("tethered: blocked write-open of %s", pth)
             raise SubprocessBlocked(event, f"refused write-open of {pth} in locked mode")
     elif event == "os.chmod":
         # args: (path, mode, dir_fd)
         target = args[0] if args else None
         dir_fd = args[2] if len(args) >= 3 else -1
-        if _path_matches_pth(target, pth, dir_fd):
+        if _path_matches_pth(target, pth, dir_fd, same_file=True):
             logger.warning("tethered: blocked chmod of %s", pth)
             raise SubprocessBlocked(event, f"refused chmod of {pth} in locked mode")
     elif event == "os.truncate":
         # args: (path_or_fd, length).  An int is a file descriptor, which
         # _path_matches_pth() does not match.
         target = args[0] if args else None
-        if _path_matches_pth(target, pth):
+        if _path_matches_pth(target, pth, same_file=True):
             logger.warning("tethered: blocked truncation of %s", pth)
             raise SubprocessBlocked(event, f"refused truncation of {pth} in locked mode")
     elif event == "_winapi.CopyFile2":
         # args: (existing_file_name, new_file_name, flags); ``created`` is the new file
-        if _path_matches_pth(created, pth):
+        if _path_matches_pth(created, pth, same_file=True):
             logger.warning("tethered: blocked overwrite of %s", pth)
             raise SubprocessBlocked(event, f"refused overwrite of {pth} in locked mode")
+    elif event in ("os.link", "os.symlink") and _gives_pth_another_name(event, args, pth):
+        logger.warning("tethered: blocked a second name for %s", pth)
+        raise SubprocessBlocked(event, f"refused a second name for {pth} in locked mode")
 
 
 def _install_hook() -> None:

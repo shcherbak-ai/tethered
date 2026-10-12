@@ -1621,6 +1621,90 @@ class TestPthGuardByAnotherName:
         assert not elsewhere.exists()
         assert scratch_pth.read_text() == PTH_LINE
 
+    # ── the file itself, under its name somewhere else ─────────────────
+
+    @pytest.fixture
+    def cache_copy(self, scratch_pth, tmp_path):
+        """What uv does: the hook is a hard link to a ``tethered.pth`` in its cache."""
+        cache = tmp_path / "uv-cache" / "archive-v0" / "a1b2"
+        cache.mkdir(parents=True)
+        os.link(scratch_pth, cache / "tethered.pth")
+        return cache / "tethered.pth"
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "open-w",
+            "open-a",
+            "os.open",
+            "write_text",
+            "chmod",
+            "truncate",
+            "copy",
+            "copy2",
+            "rename-away",
+            "move-away",
+        ],
+    )
+    def test_through_the_name_uv_keeps_in_its_cache(
+        self, operation, scratch_pth, cache_copy, tmp_path, capfd
+    ):
+        """A write to the cache's file emptied the hook under a lock, in an environment uv made.
+
+        The guard knew the file by its name and its directory, and the cache
+        is another directory.  Renaming the cache's file is refused with the
+        writes: it would leave the hook under a name that says nothing.
+        """
+        source = tmp_path / "empty.txt"
+        source.write_text("")
+        _activate_locked()
+        run = self._operations(cache_copy, cache_copy.with_name("tethered.start"), source)[
+            operation
+        ]
+        with pytest.raises(tethered.SubprocessBlocked, match="refused"):
+            run()
+        assert scratch_pth.read_text() == PTH_LINE
+        assert os.path.samefile(scratch_pth, cache_copy)
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_the_cache_can_be_read_and_cleared(self, scratch_pth, cache_copy):
+        """Clearing a cache takes names away; the hook stays what it is."""
+        _activate_locked()
+        assert cache_copy.read_text() == PTH_LINE
+        shutil.rmtree(cache_copy.parents[2])
+        assert not cache_copy.exists()
+        assert scratch_pth.read_text() == PTH_LINE
+
+    @pytest.mark.parametrize(
+        "make", ["link", "hardlink_to", "symlink", "symlink_to", "link-from-the-cache"]
+    )
+    def test_no_second_name_can_be_made(self, make, scratch_pth, cache_copy, tmp_path, capfd):
+        """``os.link(hook, "x")`` and ``open("x", "w")`` emptied the hook under a lock."""
+        second = tmp_path / "second-name"
+        makers = {
+            "link": lambda: os.link(scratch_pth, second),
+            "hardlink_to": lambda: second.hardlink_to(scratch_pth),
+            "symlink": lambda: os.symlink(scratch_pth, second),
+            "symlink_to": lambda: second.symlink_to(scratch_pth),
+            "link-from-the-cache": lambda: os.link(cache_copy, second),
+        }
+        _activate_locked()
+        with pytest.raises(tethered.SubprocessBlocked, match="refused a second name"):
+            makers[make]()
+        assert not os.path.lexists(second)
+        assert scratch_pth.read_text() == PTH_LINE
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+
+    def test_a_copy_and_links_to_other_files_are_not_refused(self, scratch_pth, tmp_path):
+        other = tmp_path / "other.txt"
+        other.write_text("x")
+        _activate_locked()
+        os.link(other, tmp_path / "another-name.txt")
+        shutil.copy(scratch_pth, tmp_path / "a-copy.pth")
+        # The copy is a file of its own: a write to it changes nothing.
+        (tmp_path / "a-copy.pth").write_text("")
+        assert scratch_pth.read_text() == PTH_LINE
+
 
 @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
 class TestHookContentUnderALock:

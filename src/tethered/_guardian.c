@@ -1319,7 +1319,11 @@ unicode_readable(PyObject *str)
  * and its directory: it matches the cached location as text, and a path
  * whose last component is the file name in that same directory, however the
  * directory is named or reached (a symlink, a junction, a directory
- * descriptor).  Normalising a path only drops components
+ * descriptor).  For tethered.pth it also matches a file of that name in
+ * another directory when it is the same file (uv hard-links the hook out of
+ * its cache), and it refuses a link whose source is the file: there too the
+ * last component of the path it matches is the file name.  Normalising a
+ * path only drops components
  * ("x/tethered.pth/.", "x/y/../tethered.pth") and, on Windows, trailing dots
  * and spaces and the name of a stream ("tethered.pth::$DATA"), and case
  * folding never produces these ASCII letters from other characters, so
