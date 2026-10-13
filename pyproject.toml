@@ -47,6 +47,7 @@ dev = [
     "commitizen>=4.13",
     "interrogate>=1.7",
     "httpx>=0.28.1",
+    "invoke>=2.2",
     "setuptools>=83.0.0",
     "ty>=0.0.86",
 ]
