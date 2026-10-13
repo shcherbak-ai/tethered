@@ -282,7 +282,7 @@ Every requirement is pinned, so that a pull request is tested against the same s
 
 To bump: run `uv run python tests_containers/run.py --suite <name> --unpinned --verbose`, read what was installed (the line that starts with `installed:` at the top of the container's output is the image's `pip freeze`), write the versions into the suite's `requirements.txt` and run the suite pinned. For pytest it is `harness/requirements.txt`, and then every suite. When a new version changes what tethered has to do, that is a finding: write it down where the behaviour is documented before changing the test. [`docs/COMPATIBILITY.md`](../docs/COMPATIBILITY.md) names the version each of its rows was measured with and the suite behind it, and [`docs/COOKBOOK.md`](../docs/COOKBOOK.md) says what each server needs: a bump that changes a result changes those two pages.
 
-A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. When 3.15 is released, change its tag from `3.15-rc` to `3.15` there.
+A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. Before it is released, its tag is that of the pre-release image (`3.16-rc`); change it to the version alone when the release is out.
 
 ## CI
 

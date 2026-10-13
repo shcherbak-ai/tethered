@@ -38,14 +38,13 @@ IMAGES_DIR = HERE / "images"
 
 #: The supported Python versions and the tag of the official image each one is
 #: tested on (``python:<tag>`` to build tethered, ``python:<tag>-slim`` to run).
-#: This is the only place that knows them.  3.15 is a release candidate until
-#: it is released: change its tag to "3.15" then.
+#: This is the only place that knows them.
 PYTHON_IMAGE_TAGS = {
     "3.11": "3.11",
     "3.12": "3.12",
     "3.13": "3.13",
     "3.14": "3.14",
-    "3.15": "3.15-rc",
+    "3.15": "3.15",
 }
 
 #: The last line of a container's output that starts with this carries the
