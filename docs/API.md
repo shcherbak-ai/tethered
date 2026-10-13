@@ -1,3 +1,8 @@
+---
+title: "API reference"
+description: "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode and log-only mode."
+---
+
 # API reference
 
 ## `tethered.activate()`

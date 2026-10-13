@@ -1,3 +1,8 @@
+---
+title: "Compatibility"
+description: "What tethered enforces, what needs configuration, what it refuses at start-up and what it does not see, measured under real servers, task queues and client libraries."
+---
+
 # Compatibility — servers, task queues, client libraries
 
 What tethered enforces under the servers, task queues and client libraries people deploy, what needs a particular configuration, what tethered refuses at start-up, and what it does not see at all. Everything on this page was measured: each row names the container suite in [`tests_containers/`](https://github.com/shcherbak-ai/tethered/blob/main/tests_containers/README.md) that asserts it, and the versions it was measured with. [The cookbook](COOKBOOK.md#servers-and-interpreter-pools) has the configuration for each server; [the security model](security.md#what-tethered-does-not-protect-against) has the limits as part of the threat model.

@@ -17,7 +17,8 @@ site_name = "tethered"
 site_url = "https://tethered.shcherbak.ai/"
 site_description = "Runtime network egress control for Python. One function call, zero dependencies, no infrastructure changes."
 site_author = "Sergii Shcherbak"
-copyright = "Copyright &copy; 2026 Sergii Shcherbak. MIT License."
+# The version is rewritten by `cz bump` (version_files in pyproject.toml).
+copyright = "tethered 0.5.3 &middot; Copyright &copy; 2026 Sergii Shcherbak. MIT License."
 docs_dir = "docs"
 site_dir = "site"
 extra_css = ["stylesheets/extra.css"]
@@ -92,3 +93,36 @@ pymdownx.quotes.callouts = true
 pymdownx.snippets.base_path = ["."]
 pymdownx.snippets.check_paths = true
 pymdownx.superfences = {}
+
+# llms.txt, the index of the documentation for language models and coding
+# agents (https://llmstxt.org/): the build writes it to the root of the site,
+# with a Markdown copy of every page it lists beside the HTML one. They are
+# static files like the rest; nothing is fetched from anywhere. A page that is
+# added to nav above goes into a section below as well, in the same order and
+# with the description of its front matter: tests/test_llms_index.py fails
+# until it does. The home page is left out, since the index says what it says.
+# There is no llms-full.txt: the index lets a reader take the page it needs.
+[project.plugins.llmstxt]
+markdown_description = "tethered checks every connection made through Python's socket layer against an allow list, from inside the process, before the connection is opened. `activate()` sets the ceiling for the whole process, and `scope()` narrows a single code path. It is a guardrail at Python's audit-event layer, not a sandbox: code that goes below that layer (`ctypes`, a C extension, a library that resolves and connects inside its own C code) is not stopped."
+
+[project.plugins.llmstxt.sections]
+"Get started" = [
+  { "quickstart.md" = "Install tethered, set an allow list for the process, narrow a code path, and lock the policy in production." },
+]
+"Guides" = [
+  { "COOKBOOK.md" = "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, and patterns for package authors." },
+  { "SUBPROCESS.md" = "How a tethered policy and a scope reach Python child processes, and what external_subprocess_policy does with every other launch." },
+  { "migrating-to-v1.md" = "Upgrading tethered from 0.5.x to 1.0.0: the breaking changes by what a deployment uses, the message each one shows, and the change that puts it right." },
+]
+"Reference" = [
+  { "API.md" = "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode and log-only mode." },
+  { "COMPATIBILITY.md" = "What tethered enforces, what needs configuration, what it refuses at start-up and what it does not see, measured under real servers, task queues and client libraries." },
+  { "ARCHITECTURE.md" = "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, and the measured overhead." },
+]
+"Security" = [
+  { "security.md" = "The tethered security model: the threat model, what tethered protects against and what it does not, and what locked mode does and does not do." },
+]
+# A section of this name may be left out by a reader that is short of room.
+"Optional" = [
+  { "changelog.md" = "What changed in each tethered release." },
+]

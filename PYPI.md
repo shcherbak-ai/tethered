@@ -23,6 +23,8 @@ urllib.request.urlopen("https://evil.test/exfil")            # raises tethered.E
 - With `locked=True`, replacing or switching off the policy takes a token, and tampering with tethered's own code or with the active policy is detected and fails closed.
 - It is a guardrail at Python's audit-event layer, not a sandbox. Code that goes below that layer is not stopped: `ctypes`, `cffi`, a C extension, or a library that resolves and connects inside its own C code. Under asyncio it enforces on asyncio's own selector event loop: it refuses to run next to uvloop, and on Windows the default `ProactorEventLoop` gets DNS-time hostname checks only.
 
+Upgrading from 0.5.x? 1.0 refuses to run where 0.5.x went on without enforcing, so a deployment can stop at start-up after the upgrade. Read the [migration guide](https://tethered.shcherbak.ai/migrating-to-v1/) first.
+
 See the [documentation](https://tethered.shcherbak.ai/) for the quick start, what each server and task queue needs, and the API, the [security model](https://tethered.shcherbak.ai/security/) for what tethered does and does not protect against, and the [repository](https://github.com/shcherbak-ai/tethered#readme) for the source.
 
 Licensed under [MIT](https://github.com/shcherbak-ai/tethered/blob/main/LICENSE).

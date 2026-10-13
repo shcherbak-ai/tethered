@@ -50,6 +50,7 @@ dev = [
     "invoke>=2.2",
     "setuptools>=83.0.0",
     "ty>=0.0.86",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -104,6 +105,7 @@ version_files = [
     "src/tethered/__init__.py:__version__",
     "pyproject.toml:version",
     "CITATION.cff:version",
+    "zensical.toml:^copyright",
 ]
 tag_format = "v$version"
 annotated_tag = true

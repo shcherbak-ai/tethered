@@ -1,3 +1,8 @@
+---
+title: "Security model"
+description: "The tethered security model: the threat model, what tethered protects against and what it does not, and what locked mode does and does not do."
+---
+
 # Security model
 
 What tethered defends against, what it does not, and what locked mode adds to that.

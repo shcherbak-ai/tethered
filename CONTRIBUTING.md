@@ -89,12 +89,16 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 - Write GitHub-flavoured Markdown, with relative links between pages (`COOKBOOK.md#gunicorn`) and absolute GitHub URLs for files outside `docs/`.
 - Indent what belongs to a list item (a nested item, a further paragraph, a code block) by four spaces, and put a blank line before the item that follows such a paragraph or code block. GitHub reads two spaces the same way; the site does not.
-- A new page goes into the `nav` list of `zensical.toml`.
+- A page begins with front matter: a `title` and a `description` of one sentence, which is the page's meta description on the site and its line in `llms.txt`.
+- A new page goes into the `nav` list of `zensical.toml`, and into a section of the `llms.txt` index in the same file (`[project.plugins.llmstxt.sections]`), at the same place and with the `description` of its front matter; a test fails until the two agree. The build writes that index to the root of the site, <https://tethered.shcherbak.ai/llms.txt>, for language models and coding agents.
 - `docs/index.md` and `docs/quickstart.md` repeat the README's pitch and quick start. Change them together.
+- The footer of the site names the version, in the `copyright` line of `zensical.toml`. `cz bump` rewrites it with the other version fields; do not edit it by hand.
 
 ### README and package description
 
 `README.md` is what GitHub shows. Use relative paths in it for files of the repository and for images (`docs/API.md`, `docs/assets/tethered-mark.svg`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
+
+The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
 
 The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
 
@@ -129,6 +133,8 @@ tests/
     test_autoactivate.py  # Child-side bootstrap parsing + scope inheritance
     test_guardian.py      # C extension tamper detection
     test_docs_recipes.py  # The recipes docs/COOKBOOK.md prints against the copies the container suites run
+    test_docs_site.py     # The version in the site's footer against the package version
+    test_llms_index.py    # The llms.txt index against nav and the description each page gives itself
 tests_examples/
     conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
@@ -151,7 +157,8 @@ docs/                     # The pages of the documentation site
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
     assets/, stylesheets/ # The images of the site and the README, and the site's look
-zensical.toml             # The documentation site: navigation, theme, Markdown extensions
+assets/                   # The README's own images: the pixel names of the sibling projects
+zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
 tasks.py                  # Invoke tasks: docs, docs-live
 README.md                 # What GitHub shows: pitch, quick start, pointers
 PYPI.md                   # The package description PyPI shows

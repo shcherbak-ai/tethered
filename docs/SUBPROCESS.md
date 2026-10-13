@@ -1,3 +1,8 @@
+---
+title: "Subprocess control"
+description: "How a tethered policy and a scope reach Python child processes, and what external_subprocess_policy does with every other launch."
+---
+
 # Subprocess control
 
 ## Auto-propagation to Python child processes

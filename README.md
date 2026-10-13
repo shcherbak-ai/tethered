@@ -58,6 +58,8 @@ uv add tethered
 
 Or `pip install tethered`. Python 3.11+ on Linux, macOS and Windows, with no runtime dependencies. Wheels are prebuilt; a source install needs a C compiler.
 
+Upgrading from 0.5.x? 1.0 refuses to run where 0.5.x went on without enforcing, so a deployment can stop at start-up after the upgrade. Read the [migration guide](docs/migrating-to-v1.md) first.
+
 ## Quick start
 
 ### Protect the process
@@ -134,12 +136,15 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 
 ## Documentation
 
+These pages are also a site, [tethered.shcherbak.ai](https://tethered.shcherbak.ai/), with an index for language models and coding agents at [llms.txt](https://tethered.shcherbak.ai/llms.txt).
+
 - [API reference](docs/API.md): `activate`, `scope`, `deactivate`, the exceptions, locked and log-only mode
 - [Cookbook](docs/COOKBOOK.md): what each server, task queue and pool needs; handling a blocked connection in Django, FastAPI and Celery; patterns for package authors
 - [Compatibility](docs/COMPATIBILITY.md): what is enforced, what needs configuration and what is not seen, measured under real servers, task queues and client libraries
 - [Subprocess control](docs/SUBPROCESS.md): how a policy and a scope reach child processes, and `external_subprocess_policy`
 - [Architecture](docs/ARCHITECTURE.md): the audit hook, scopes, the C guardian, measured overhead
 - [Security model](docs/security.md): the threat model, what tethered does and does not protect against, what locked mode adds
+- [Migrating to 1.0](docs/migrating-to-v1.md): upgrading from 0.5.x, with the breaking changes by what a deployment uses and what to do about each
 - [Examples](examples/): twelve runnable scripts, one for each feature
 - [Contributing](CONTRIBUTING.md): development setup and guidelines
 
@@ -156,3 +161,22 @@ Using tethered in your project? Add the badge to your README:
 ## License
 
 [MIT](LICENSE)
+
+## More from shcherbak_ai
+
+<!-- markdownlint-disable MD033 -->
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <a href="https://github.com/shcherbak-ai/contextgem"><img src="assets/contextgem-wordmark.svg" alt="ContextGem" width="336"></a><br>
+      Structured extraction from documents with LLMs.
+    </td>
+    <td width="50%" align="center" valign="top">
+      <a href="https://github.com/shcherbak-ai/licenseal"><img src="assets/licenseal-wordmark.svg" alt="licenseal" width="336"></a><br>
+      License compatibility checks for dependency trees, fast enough for CI.
+    </td>
+  </tr>
+</table>
+<!-- markdownlint-enable MD033 -->
+
+Questions or collaboration ideas? Reach out on [LinkedIn](https://www.linkedin.com/in/sergii-shcherbak-10068866/) or [X](https://x.com/seshch). Built with ❤️ in Oslo, Norway.

@@ -1,3 +1,8 @@
+---
+title: "Architecture"
+description: "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, and the measured overhead."
+---
+
 # Architecture — how tethered works
 
 tethered uses [`sys.addaudithook`](https://docs.python.org/3/library/sys.html#sys.addaudithook) (PEP 578) to intercept socket operations at the interpreter level:

@@ -13,6 +13,8 @@ uv add tethered
 
 Or `pip install tethered`. Python 3.11+ on Linux, macOS and Windows, with no runtime dependencies. Wheels are prebuilt; a source install needs a C compiler.
 
+Upgrading from 0.5.x? 1.0 refuses to run where 0.5.x went on without enforcing, so a deployment can stop at start-up after the upgrade. Read the [migration guide](migrating-to-v1.md) first.
+
 ## Protect the process
 
 ```python

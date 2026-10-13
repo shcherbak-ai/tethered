@@ -1,3 +1,8 @@
+---
+title: "Cookbook"
+description: "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, and patterns for package authors."
+---
+
 # Cookbook — frameworks, servers, blocked connections
 
 ## Handling blocked connections
