@@ -1,31 +1,5 @@
 # Cookbook — frameworks, servers, blocked connections
 
-[← Back to README](../README.md)
-
-- [Handling blocked connections](#handling-blocked-connections)
-  - [Django / FastAPI middleware](#django--fastapi-middleware)
-  - [Celery tasks](#celery-tasks)
-  - [Retry decorators](#retry-decorators)
-- [Servers and interpreter pools](#servers-and-interpreter-pools)
-  - [The launcher pattern](#the-launcher-pattern)
-  - [uvicorn and FastAPI](#uvicorn-and-fastapi)
-  - [gunicorn](#gunicorn)
-  - [hypercorn and Quart](#hypercorn-and-quart)
-  - [granian](#granian)
-  - [sanic](#sanic)
-  - [aiohttp](#aiohttp)
-  - [daphne and Twisted](#daphne-and-twisted)
-  - [tornado](#tornado)
-  - [uWSGI](#uwsgi)
-  - [waitress](#waitress)
-  - [mod_wsgi](#mod_wsgi)
-  - [Flask and Django](#flask-and-django)
-  - [Changing a locked policy](#changing-a-locked-policy)
-  - [Celery and other task queues](#celery-and-other-task-queues)
-  - [Process pools and the fork server](#process-pools-and-the-fork-server)
-  - [Interpreter pools](#interpreter-pools)
-- [For package authors](#for-package-authors)
-
 ## Handling blocked connections
 
 `EgressBlocked` is a `RuntimeError`, not an `OSError`. This is intentional — a policy violation is not a network error and should not be silently caught by HTTP libraries or retry logic. You'll want to handle it explicitly at your application boundaries.
@@ -164,7 +138,7 @@ With a retry library, pass the exception types to retry explicitly (for example 
 
 ## Servers and interpreter pools
 
-What a deployment has to get right so that the policy is enforced in every process and interpreter that serves requests. This section is written from container suites that run the real servers on Linux (x86-64, glibc) with Python 3.11 to 3.15. [COMPATIBILITY.md](COMPATIBILITY.md) has the full tables, the version each row was measured with and the suite behind it, and what was not tested. A statement that no suite asserts says "measured once"; the notes on `InterpreterPoolExecutor` that go beyond joining a lock, and the one on interpreter pools under gunicorn's `--preload`, come from earlier container runs on Python 3.14 and are not part of a suite either. The limits behind this guidance are stated in [SECURITY.md](../SECURITY.md#what-tethered-does-not-protect-against).
+What a deployment has to get right so that the policy is enforced in every process and interpreter that serves requests. This section is written from container suites that run the real servers on Linux (x86-64, glibc) with Python 3.11 to 3.15. [The compatibility page](COMPATIBILITY.md) has the full tables, the version each row was measured with and the suite behind it, and what was not tested. A statement that no suite asserts says "measured once"; the notes on `InterpreterPoolExecutor` that go beyond joining a lock, and the one on interpreter pools under gunicorn's `--preload`, come from earlier container runs on Python 3.14 and are not part of a suite either. The limits behind this guidance are stated in [the security model](security.md#what-tethered-does-not-protect-against).
 
 Three rules cover most of it:
 
@@ -245,28 +219,29 @@ uvicorn 0.47.0 is the first release that imports the application before it choos
 
 **`-k gevent`** and `-k gevent_pywsgi`: connections are enforced, in every worker and for greenlets that overlap. Three things are particular to gevent.
 
-- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken. The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). A plain audit hook that logs and raises did the same with no tethered in the process. One mitigation was measured: with `logging.getLogger("tethered").setLevel(logging.ERROR)`, tethered writes no warning for a refusal, and no process had a stuck greenlet. Take it for what it is: a measurement, at the price of tethered's own log line for each refusal (the exception is still raised, so log refusals where you catch them). A shorter `--graceful-timeout` limits how long a stuck request can hold a worker. [COMPATIBILITY.md](COMPATIBILITY.md#gunicorn) has the numbers.
+- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken. The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). A plain audit hook that logs and raises did the same with no tethered in the process. One mitigation was measured: with `logging.getLogger("tethered").setLevel(logging.ERROR)`, tethered writes no warning for a refusal, and no process had a stuck greenlet. Take it for what it is: a measurement, at the price of tethered's own log line for each refusal (the exception is still raised, so log refusals where you catch them). A shorter `--graceful-timeout` limits how long a stuck request can hold a worker. [The compatibility page](COMPATIBILITY.md#gunicorn) has the numbers.
 - gevent's hub prints a traceback for every refused lookup, in addition to tethered's warning. Telling the hub that `EgressBlocked` is not its error silences that:
 
-  ```python
-  def _quiet_refusals() -> None:
-      import gevent
+    ```python
+    def _quiet_refusals() -> None:
+        import gevent
 
-      import tethered
+        import tethered
 
-      hub = gevent.get_hub()
-      if tethered.EgressBlocked not in hub.NOT_ERROR:
-          hub.NOT_ERROR += (tethered.EgressBlocked,)
-  ```
+        hub = gevent.get_hub()
+        if tethered.EgressBlocked not in hub.NOT_ERROR:
+            hub.NOT_ERROR += (tethered.EgressBlocked,)
+    ```
 
-  Call it from the worker, for example at the start of a request.
-- A process launch is seen differently, as `os.exec*` events inside the forked child, one for each `PATH` directory that is tried. `external_subprocess_policy="block"` still refuses an external launch, and a Python child still inherits the policy. What changes is where tethered's log lines go: to the stderr of that forked child, which is the pipe the application captures, and not to the server log. Under `"block"` with captured stderr the refusal is logged nowhere; the `SubprocessBlocked` exception is all there is. [SUBPROCESS.md](SUBPROCESS.md#launches-under-gunicorns-gevent-worker) has the details.
+    Call it from the worker, for example at the start of a request.
+
+- A process launch is seen differently, as `os.exec*` events inside the forked child, one for each `PATH` directory that is tried. `external_subprocess_policy="block"` still refuses an external launch, and a Python child still inherits the policy. What changes is where tethered's log lines go: to the stderr of that forked child, which is the pipe the application captures, and not to the server log. Under `"block"` with captured stderr the refusal is logged nowhere; the `SubprocessBlocked` exception is all there is. [The subprocess page](SUBPROCESS.md#launches-under-gunicorns-gevent-worker) has the details.
 
 With `GEVENT_RESOLVER=ares` lookups are made by c-ares, which tethered does not see: hosts the allow list names are refused, and names are sent to the DNS server unchecked. Use gevent's default resolver.
 
 **`-k tornado`**: enforced. An exception the application lets out gets no response at all; tornado logs it and leaves the connection open, with or without tethered. Catch `EgressBlocked` in the application.
 
-**Launching processes from a request handler.** Launch Python children with `sys.executable`. Such a child inherits the policy, a locked one included, also when it is given an `env=` that lacks `_TETHERED_CHILD_POLICY`. `["python3", ...]` is warned about as external although that child does inherit; `[sys.executable, "-S", ...]` and any other program are warned about and run without a policy. All three are refused under `external_subprocess_policy="block"`. [COMPATIBILITY.md](COMPATIBILITY.md#what-holds-under-every-server) has the table.
+**Launching processes from a request handler.** Launch Python children with `sys.executable`. Such a child inherits the policy, a locked one included, also when it is given an `env=` that lacks `_TETHERED_CHILD_POLICY`. `["python3", ...]` is warned about as external although that child does inherit; `[sys.executable, "-S", ...]` and any other program are warned about and run without a policy. All three are refused under `external_subprocess_policy="block"`. [The compatibility page](COMPATIBILITY.md#what-holds-under-every-server) has the table.
 
 **Binary upgrade (`SIGUSR2`).** It works as it is, with a locked policy too, with and without `--preload`. gunicorn re-executes itself with the environment it saved when it started, which under `--preload` lacks the policy variable; tethered carries that exec out with the variable added and logs `tethered: os.exec*(...) was given an environment without _TETHERED_CHILD_POLICY; carried out with the locked policy added`. The new master starts under the policy, its own `activate()` is the idempotent no-op, and a client that kept requesting during the upgrade saw no failed request.
 
@@ -482,7 +457,7 @@ Whatever re-executes the server keeps a locked policy. The new process image inh
 
 The same policy asked for again is a no-op, so a reload that changes nothing about the policy is unaffected. uWSGI with `--lazy-apps`, gunicorn without `--preload` and unlocked policies are not affected either. To change a locked policy, stop the server and start it.
 
-Upgrade tethered itself the same way: from the deployment, with the server stopped. A `pip install --upgrade tethered` that a locked application starts for itself is refused when it reaches `tethered.pth`, and pip leaves the installation half changed; [COMPATIBILITY.md](COMPATIBILITY.md#installing-upgrading-and-removing-tethered) has what that looks like and how to repair it.
+Upgrade tethered itself the same way: from the deployment, with the server stopped. A `pip install --upgrade tethered` that a locked application starts for itself is refused when it reaches `tethered.pth`, and pip leaves the installation half changed; [the compatibility page](COMPATIBILITY.md#installing-upgrading-and-removing-tethered) has what that looks like and how to repair it.
 
 ### Celery and other task queues
 
@@ -629,7 +604,7 @@ except tethered.EgressBlocked as exc:
     raise click.ClickException(exc.scope_hint or str(exc)) from exc
 ```
 
-The hint travels with the scope through subprocess auto-propagation, so a child process launched through `subprocess` inside your scope and blocked on the same call sees the same guidance. (Spawn-mode `multiprocessing` workers do not receive scopes; see [SUBPROCESS.md](SUBPROCESS.md#scopes-propagate-to-subprocesses-too).)
+The hint travels with the scope through subprocess auto-propagation, so a child process launched through `subprocess` inside your scope and blocked on the same call sees the same guidance. (Spawn-mode `multiprocessing` workers do not receive scopes; see [the subprocess page](SUBPROCESS.md#scopes-propagate-to-subprocesses-too).)
 
 #### A note on Unicode in hints (and labels)
 

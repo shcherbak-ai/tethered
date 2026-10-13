@@ -1,0 +1,277 @@
+/*
+ * tethered documentation: the theme's dark scheme, set to the look of the
+ * project's figure. A near-black ground, hairlines, grey type, the orange of
+ * the mark for what is tethered's own (links, the current page), amber for
+ * what it stops or warns about. No web font and no image from another host.
+ */
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 240;
+
+  /* Ground and type */
+  --md-default-bg-color: #09090b;
+  --md-default-bg-color--light: #09090bcc;
+  --md-default-bg-color--lighter: #09090b80;
+  --md-default-bg-color--lightest: #09090b1a;
+  --md-default-fg-color: #e4e4e7;
+  --md-default-fg-color--light: #a1a1aa;
+  --md-default-fg-color--lighter: #71717a;
+  --md-default-fg-color--lightest: #27272a;
+  --color-background: 9 9 11;
+  --color-background-subtle: 17 17 19;
+  --color-backdrop: 0 0 0;
+
+  /* Orange: links, the current page, focus */
+  --md-primary-fg-color: #fb923c;
+  --md-primary-fg-color--light: #fdba74;
+  --md-primary-fg-color--dark: #ea580c;
+  --md-primary-bg-color: #fafafa;
+  --md-primary-bg-color--light: #a1a1aa;
+  --md-accent-fg-color: #fdba74;
+  --md-accent-fg-color--transparent: #fdba741a;
+  --md-accent-bg-color: #09090b;
+  --md-typeset-a-color: #fb923c;
+
+  /* Code: grey, with orange for keywords, green for strings, amber for numbers */
+  --md-code-fg-color: #d4d4d8;
+  --md-code-bg-color: #111113;
+  --md-code-bg-color--light: #111113e6;
+  --md-code-bg-color--lighter: #1111138a;
+  --md-code-hl-color: #fb923c;
+  --md-code-hl-color--light: #fb923c1f;
+  --md-code-hl-keyword-color: #fdba74;
+  --md-code-hl-function-color: #e4e4e7;
+  --md-code-hl-constant-color: #fdba74;
+  --md-code-hl-special-color: #fdba74;
+  --md-code-hl-string-color: #a7f3d0;
+  --md-code-hl-number-color: #fcd34d;
+  --md-code-hl-name-color: #d4d4d8;
+  --md-code-hl-comment-color: #71717a;
+  --md-code-hl-operator-color: #a1a1aa;
+  --md-code-hl-punctuation-color: #a1a1aa;
+  --md-code-hl-generic-color: #a1a1aa;
+  --md-code-hl-variable-color: #d4d4d8;
+
+  /* Tables, call-outs, footer */
+  --md-typeset-table-color: #27272a;
+  --md-typeset-table-color--light: #ffffff08;
+  --md-typeset-mark-color: #fb923c40;
+  --md-admonition-fg-color: #e4e4e7;
+  --md-admonition-bg-color: #0c0c0e;
+  --md-footer-bg-color: #09090b;
+  --md-footer-bg-color--dark: #09090b;
+  --md-footer-fg-color: #a1a1aa;
+  --md-footer-fg-color--light: #71717a;
+  --md-footer-fg-color--lighter: #52525b;
+}
+
+/* The reader's own fonts, by the same stacks as the figure. The theme's
+   tracking is cut for its web font. */
+:root {
+  --md-text-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    "Noto Sans", Arial, sans-serif;
+  --md-code-font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+body,
+.md-typeset,
+.md-header__title,
+.md-nav {
+  letter-spacing: 0;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  letter-spacing: -0.01em;
+}
+
+/* The name in the header is the pixel mark, at one screen pixel to a pixel of
+   the art; the site's name in type beside it would say it twice. */
+.md-header__button.md-logo {
+  padding: 0.4rem;
+}
+
+.md-header__button.md-logo img {
+  width: 114px;
+  height: 32px;
+  image-rendering: pixelated;
+}
+
+.md-header__title .md-header__topic:first-child .md-ellipsis {
+  visibility: hidden;
+}
+
+/* Hairlines in place of the theme's shadows and fills. */
+.md-header {
+  border-bottom: 1px solid #27272a;
+  box-shadow: none;
+}
+
+.md-tabs {
+  border-bottom: 1px solid #27272a;
+}
+
+.md-typeset pre > code,
+.md-typeset .highlight pre {
+  border: 1px solid #27272a;
+  border-radius: 0;
+}
+
+.md-typeset code {
+  border-radius: 2px;
+}
+
+.md-typeset table:not([class]) {
+  border: 1px solid #27272a;
+  border-radius: 0;
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) th {
+  color: #fafafa;
+  font-weight: 600;
+}
+
+/* A quotation is a statement set apart, not a call-out: a hairline at its
+   edge and the page's own type. */
+.md-typeset blockquote {
+  border-left: 2px solid #3f3f46;
+  color: #d4d4d8;
+}
+
+/* Every call-out stands on the same ground; its kind is the colour of its
+   edge and of its mark: grey for a note, amber for a warning. */
+.md-typeset .admonition,
+.md-typeset details {
+  background-color: #0c0c0e;
+  border: 1px solid #27272a;
+  border-left-width: 2px;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.md-typeset .admonition[class],
+.md-typeset details[class] {
+  background-color: #0c0c0e;
+  font-size: 0.72rem;
+}
+
+.md-typeset .admonition.note,
+.md-typeset .admonition.tip,
+.md-typeset .admonition.info {
+  border-left-color: #a1a1aa;
+}
+
+.md-typeset .admonition.warning,
+.md-typeset .admonition.caution,
+.md-typeset .admonition.important {
+  border-left-color: #fbbf24;
+}
+
+.md-typeset .admonition > .admonition-title,
+.md-typeset details > summary {
+  background-color: transparent;
+}
+
+.md-typeset .admonition.note > .admonition-title::before,
+.md-typeset .admonition.tip > .admonition-title::before,
+.md-typeset .admonition.info > .admonition-title::before {
+  background-color: #a1a1aa;
+}
+
+.md-typeset .admonition.warning > .admonition-title::before,
+.md-typeset .admonition.caution > .admonition-title::before,
+.md-typeset .admonition.important > .admonition-title::before {
+  background-color: #fbbf24;
+}
+
+/* The figure is drawn on its own ground: no frame is added around it. It
+   takes the width of the text column, as a code block does. */
+.md-typeset figure {
+  width: 100%;
+  margin: 1.4em 0;
+}
+
+.md-typeset figure img,
+.md-typeset img.figure {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.md-typeset figcaption {
+  max-width: none;
+  margin-top: 0.6em;
+  color: #a1a1aa;
+  font-size: 0.7rem;
+  font-style: normal;
+  text-align: left;
+}
+
+/* The home page: the name, one line, one command, then where to go. The name
+   is pixel art, four screen pixels to a pixel. */
+.md-typeset img.home-name {
+  width: 456px;
+  max-width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+
+.md-typeset .home-lead {
+  color: #fafafa;
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid > .card {
+  border: 1px solid #27272a;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid > .card:hover {
+  border-color: #52525b;
+  box-shadow: none;
+}
+
+/* The home page has no side columns: its text keeps a readable measure, and
+   on a narrow screen the margin the theme gives every page. */
+.md-content__inner:has(.home-name) {
+  width: min(37.5rem, 100% - 1.6rem);
+  margin-inline: auto;
+}
+
+.md-typeset h1:has(.home-name) {
+  margin: 1.2rem 0 1.6rem;
+  line-height: 0;
+}
+
+/* A page's contents are listed under it in the left column, which leaves the
+   text column wide enough for a reference table. Running text keeps a readable
+   measure inside it. */
+.md-typeset > p,
+.md-typeset > ul,
+.md-typeset > ol,
+.md-typeset > blockquote,
+.md-typeset > .admonition,
+.md-typeset > details,
+.md-typeset > h1,
+.md-typeset > h2,
+.md-typeset > h3 {
+  max-width: 38rem;
+}
+
+.md-content__inner:has(.home-name) > * {
+  max-width: none;
+}
+
+/* A rule, a host or a parameter in a table's first column stays on one line. */
+.md-typeset table:not([class]) td:first-child code {
+  white-space: nowrap;
+}

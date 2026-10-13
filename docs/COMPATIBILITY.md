@@ -1,32 +1,6 @@
 # Compatibility — servers, task queues, client libraries
 
-[← Back to README](../README.md)
-
-What tethered enforces under the servers, task queues and client libraries people deploy, what needs a particular configuration, what tethered refuses at start-up, and what it does not see at all. Everything on this page was measured: each row names the container suite in [`tests_containers/`](../tests_containers/README.md) that asserts it, and the versions it was measured with. [COOKBOOK.md](COOKBOOK.md#servers-and-interpreter-pools) has the configuration for each server; [SECURITY.md](../SECURITY.md#what-tethered-does-not-protect-against) has the limits as part of the threat model.
-
-- [How to read this page](#how-to-read-this-page)
-- [What "not seen" means](#what-not-seen-means)
-- [Event loops and green threads](#event-loops-and-green-threads)
-- [Web servers](#web-servers)
-  - [uvicorn](#uvicorn)
-  - [FastAPI](#fastapi)
-  - [gunicorn](#gunicorn)
-  - [hypercorn and Quart](#hypercorn-and-quart)
-  - [granian](#granian)
-  - [sanic](#sanic)
-  - [aiohttp](#aiohttp)
-  - [daphne and Twisted](#daphne-and-twisted)
-  - [tornado](#tornado)
-  - [uWSGI](#uwsgi)
-  - [waitress](#waitress)
-  - [mod_wsgi](#mod_wsgi)
-  - [Flask and Django](#flask-and-django)
-  - [What holds under every server](#what-holds-under-every-server)
-- [Task queues and process pools](#task-queues-and-process-pools)
-- [Scopes](#scopes)
-- [Client libraries](#client-libraries)
-- [Installing, upgrading and removing tethered](#installing-upgrading-and-removing-tethered)
-- [What was not tested](#what-was-not-tested)
+What tethered enforces under the servers, task queues and client libraries people deploy, what needs a particular configuration, what tethered refuses at start-up, and what it does not see at all. Everything on this page was measured: each row names the container suite in [`tests_containers/`](https://github.com/shcherbak-ai/tethered/blob/main/tests_containers/README.md) that asserts it, and the versions it was measured with. [The cookbook](COOKBOOK.md#servers-and-interpreter-pools) has the configuration for each server; [the security model](security.md#what-tethered-does-not-protect-against) has the limits as part of the threat model.
 
 ## How to read this page
 
@@ -76,7 +50,7 @@ No setting of tethered changes this, and no later version of tethered can, for a
 | gevent with `GEVENT_RESOLVER=ares` | Allowed host refused | c-ares resolves in C. | `gunicorn_gevent`, `clients` |
 | eventlet, its default resolver (greendns) | Allowed host refused | greendns is a DNS client of its own (dnspython) and raises no `socket.getaddrinfo` event. | `clients`, `celery` (eventlet 0.41.2) |
 | eventlet with `EVENTLET_NO_GREENDNS=yes` | Enforced | | `clients`, `celery` |
-| asyncio's `ProactorEventLoop` (the Windows default) | Not tested here | That loop raises no connect events, so there is no connect-time enforcement on it: see [SECURITY.md](../SECURITY.md#what-tethered-does-not-protect-against). | |
+| asyncio's `ProactorEventLoop` (the Windows default) | Not tested here | That loop raises no connect events, so there is no connect-time enforcement on it: see [the security model](security.md#what-tethered-does-not-protect-against). | |
 
 **Where a process still ends on uvloop.** The refusal works where a policy that enforces is active in the interpreter that imports uvloop. It does not cover:
 
@@ -127,7 +101,7 @@ Measured with fastapi 0.143.0 installed as `fastapi[standard]` (fastapi-cli 0.0.
 | `fastapi run --entrypoint main:app --workers 2` | Never serves. Use a path, or `uvicorn main:app --workers 2 --loop asyncio`. | `fastapi`, `uvicorn_legacy` |
 | `activate()` in a FastAPI lifespan handler | Refused at start-up: "Application startup failed. Exiting.", exit status 3. Enforced with `uvicorn --loop asyncio`. | `fastapi` |
 | Starlette's `TestClient` | Enforced. It runs the application on the standard loop; asking anyio for uvloop (`backend_options={"use_uvloop": True}`) fails with tethered's `ImportError`. | `fastapi` |
-| The exception handler of [COOKBOOK.md](COOKBOOK.md#django--fastapi-middleware) | Every refusal ends as the HTTP 503 of the recipe and nothing arrives: a refused lookup, a port rule and a raw address, for `httpx.AsyncClient`, `httpx.Client`, asyncio streams and the `websockets` client. | `fastapi` |
+| The exception handler of [the cookbook](COOKBOOK.md#django--fastapi-middleware) | Every refusal ends as the HTTP 503 of the recipe and nothing arrives: a refused lookup, a port rule and a raw address, for `httpx.AsyncClient`, `httpx.Client`, asyncio streams and the `websockets` client. | `fastapi` |
 
 Of the compiled modules a `fastapi[standard]` installation brings, uvloop is the only one that imports the C library's `connect` and `getaddrinfo` itself (a test of the `fastapi` suite).
 
@@ -258,7 +232,7 @@ Measured with waitress 3.0.2: one process and a pool of threads.
 
 ### mod_wsgi
 
-Measured with mod_wsgi 6.1.0 and Apache 2.4 as Debian packages it (2.4.68 when measured). mod_wsgi runs each application group in an interpreter of its own, and a locked policy is one per process, so what counts is the order in which the interpreters of a process come into being. [COOKBOOK.md](COOKBOOK.md#mod_wsgi) has the configurations.
+Measured with mod_wsgi 6.1.0 and Apache 2.4 as Debian packages it (2.4.68 when measured). mod_wsgi runs each application group in an interpreter of its own, and a locked policy is one per process, so what counts is the order in which the interpreters of a process come into being. [The cookbook](COOKBOOK.md#mod_wsgi) has the configurations.
 
 | Arrangement | Result | Pinned by |
 |---|---|---|
@@ -285,7 +259,7 @@ Measured with Flask 3.1.3 (Werkzeug 3.1.9) and Django 6.1.2 (5.2.18 on Python 3.
 | Flask, `activate()` in the application factory: gunicorn with and without `--preload`, a `flask` command, `flask run` with and without its reloader | Enforced. The process the reloader starts inherits the policy. | `flask` |
 | Flask, an error handler registered for `tethered.EgressBlocked` | Reached for a refused lookup and a refused connection. | `flask` |
 | Django, `activate()` in `settings.py`: gunicorn with and without `--preload`, a management command, `runserver` with and without its autoreloader | Enforced. | `django` |
-| Django, a middleware that catches `EgressBlocked` around `get_response()` | Does not work: Django has turned the view's exception into a 500 before `get_response()` returns. A middleware with `process_exception()` gives the 503: see [COOKBOOK.md](COOKBOOK.md#django--fastapi-middleware). | `django` |
+| Django, a middleware that catches `EgressBlocked` around `get_response()` | Does not work: Django has turned the view's exception into a 500 before `get_response()` returns. A middleware with `process_exception()` gives the 503: see [the cookbook](COOKBOOK.md#django--fastapi-middleware). | `django` |
 | `requests` | Passes `EgressBlocked` through unwrapped; an adapter with `max_retries=3` makes one attempt. | `flask` |
 
 ### What holds under every server
@@ -518,7 +492,7 @@ The column "A refused name reaches the caller as" says what the code that called
 
 ### Notes on the table
 
-**Refusals at the connection can arrive inside an `ExceptionGroup`.** The last column is about a refused name, which is refused at the lookup. `httpx.AsyncClient`, `anyio.connect_tcp` and `trio.open_tcp_stream` deliver a refusal at the connection (a port rule, or a raw address) inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch. Use `except*` ([COOKBOOK.md](COOKBOOK.md#django--fastapi-middleware)).
+**Refusals at the connection can arrive inside an `ExceptionGroup`.** The last column is about a refused name, which is refused at the lookup. `httpx.AsyncClient`, `anyio.connect_tcp` and `trio.open_tcp_stream` deliver a refusal at the connection (a port rule, or a raw address) inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch. Use `except*` ([the cookbook](COOKBOOK.md#django--fastapi-middleware)).
 
 **What makes a library that resolves names itself work.** Each of these was measured:
 
@@ -553,7 +527,7 @@ The rows below are measured once, with pip 26.2.1 and uv 0.13.0 on Python 3.13, 
 | tethered installed by uv (`uv add`, `uv pip install`), on Linux and on Windows | `tethered.pth` in site-packages is a hard link to a file of the same name in uv's cache; with `--link-mode=copy` it is a file of its own, as with pip. Under a locked policy a write to the cache's file is refused like a write to the hook itself. |
 | Another distribution that ships a top-level `tethered.pth`, installed after tethered with pip or with uv | It replaces tethered's file, and neither installer says so. tethered does not take that file for its bootstrap: `activate()` logs a warning, and a Python child is an external launch (refused under `external_subprocess_policy="block"`). Uninstalling that distribution with pip removes `tethered.pth` altogether; reinstall tethered. |
 
-Install, upgrade and remove tethered from outside the processes that hold a locked policy: a deployment step or a shell, not a child of the application. The locked-mode guard on `tethered.pth` is described in [SUBPROCESS.md](SUBPROCESS.md#locked-mode-hardening-of-the-auto-propagation-channel); it refuses the file by its name and directory, however the installer names that directory, and the same file where uv keeps it in its cache. Windows does not delete a loaded extension module for any installer, so the `~ethered` directory is to be expected whenever tethered is upgraded while a process has it imported.
+Install, upgrade and remove tethered from outside the processes that hold a locked policy: a deployment step or a shell, not a child of the application. The locked-mode guard on `tethered.pth` is described in [the subprocess page](SUBPROCESS.md#locked-mode-hardening-of-the-auto-propagation-channel); it refuses the file by its name and directory, however the installer names that directory, and the same file where uv keeps it in its cache. Windows does not delete a loaded extension module for any installer, so the `~ethered` directory is to be expected whenever tethered is upgraded while a process has it imported.
 
 ## What was not tested
 

@@ -1,0 +1,25 @@
+# The documentation site's generator and what it needs, at exact versions.
+#
+#   uv run inv docs-live   # preview at http://localhost:9000
+#   uv run inv docs        # what CI runs
+#
+# Zensical is a tool that builds the site (docs/, zensical.toml). It is not a
+# dependency of the package and is not in uv.lock: the tasks (tasks.py) and the
+# workflow (.github/workflows/docs.yml) run it with
+# `uvx --constraints .github/docs-constraints.txt zensical`. It is pre-1.0:
+# change the versions on purpose, with
+#
+#   echo "zensical==<version>" | uv pip compile - --universal --python-version 3.11 --no-header --no-annotate
+#
+# and look at the built site afterwards.
+click==8.5.0
+deepmerge==3.0.1
+jinja2==3.1.6
+markdown==3.11
+markupsafe==3.0.4
+pathspec==1.1.1
+pygments==2.21.0
+pymdown-extensions==12.2
+pyyaml==6.0.3
+tomli==2.5.0
+zensical==0.0.70

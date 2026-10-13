@@ -1,0 +1,93 @@
+# The documentation site: https://shcherbak-ai.github.io/tethered/
+#
+#   uv run inv docs-live   # preview at http://localhost:9000
+#   uv run inv docs        # what CI runs; the site is written to site/
+#
+# Both tasks (tasks.py) run Zensical at the versions pinned in
+# .github/docs-constraints.txt.
+#
+# The site sets no cookie and asks no third party for anything: fonts are the
+# reader's own, there is no analytics, and nothing below turns on a feature
+# that loads a script or a stylesheet from another host. Keep it so: do not set
+# repo_url (the theme would ask api.github.com for star counts), and do not
+# enable a Mermaid or MathJax fence (each is fetched from a CDN).
+
+[project]
+site_name = "tethered"
+site_url = "https://shcherbak-ai.github.io/tethered/"
+site_description = "Runtime network egress control for Python. One function call, zero dependencies, no infrastructure changes."
+site_author = "Sergii Shcherbak"
+copyright = "Copyright &copy; 2026 Sergii Shcherbak. MIT License."
+docs_dir = "docs"
+site_dir = "site"
+extra_css = ["stylesheets/extra.css"]
+
+# A page that is not listed here is built all the same, but nothing leads to it.
+nav = [
+  { "Home" = "index.md" },
+  { "Quick start" = "quickstart.md" },
+  { "Guides" = [
+    { "Cookbook" = "COOKBOOK.md" },
+    { "Subprocess control" = "SUBPROCESS.md" },
+  ] },
+  { "Reference" = [
+    { "API reference" = "API.md" },
+    { "Compatibility" = "COMPATIBILITY.md" },
+    { "Architecture" = "ARCHITECTURE.md" },
+  ] },
+  { "Security" = "security.md" },
+  { "Changelog" = "changelog.md" },
+]
+
+[project.theme]
+language = "en"
+font = false
+logo = "assets/tethered-mark-dark.svg"
+favicon = "assets/favicon.svg"
+features = [
+  "content.code.copy",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.top",
+  "search.highlight",
+  "toc.follow",
+  "toc.integrate",
+]
+
+[project.theme.palette]
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+
+[project.extra]
+generator = false
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/shcherbak-ai/tethered"
+name = "tethered on GitHub"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/tethered/"
+name = "tethered on PyPI"
+
+[project.markdown_extensions]
+admonition = {}
+attr_list = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+# A heading's anchor is the one GitHub gives it, so a link between two pages
+# works in the repository and on the site ("a — b" is "a--b" in both).
+toc.slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }
+pymdownx.details = {}
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.quotes.callouts = true
+pymdownx.snippets.base_path = ["."]
+pymdownx.snippets.check_paths = true
+pymdownx.superfences = {}

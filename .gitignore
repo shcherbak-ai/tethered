@@ -15,6 +15,9 @@ build/
 htmlcov/
 coverage.xml
 
+# Documentation site (zensical build)
+site/
+
 # Linting
 .ruff_cache/
 

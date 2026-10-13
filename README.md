@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/assets/tethered-mark-dark.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/docs/assets/tethered-mark-dark.svg">
     <img src="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/assets/tethered-mark-light.svg" alt="tethered" width="456">
   </picture>
 </p>
@@ -23,13 +23,13 @@
   <a href="https://github.com/shcherbak-ai/tethered/blob/main/docs/API.md"><strong>API</strong></a> ·
   <a href="https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md"><strong>Cookbook</strong></a> ·
   <a href="https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md"><strong>Compatibility</strong></a> ·
-  <a href="https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md"><strong>Security</strong></a> ·
+  <a href="https://github.com/shcherbak-ai/tethered/blob/main/docs/security.md"><strong>Security</strong></a> ·
   <a href="https://github.com/shcherbak-ai/tethered/blob/main/CHANGELOG.md"><strong>Changelog</strong></a>
 </p>
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/assets/tethered-figure-dark.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/docs/assets/tethered-figure-dark.svg">
     <img src="https://raw.githubusercontent.com/shcherbak-ai/tethered/main/assets/tethered-figure-light.svg" alt="One call sets the allow list: the application reaches api.stripe.com and db.internal, and its connection to evil.test is blocked." width="600">
   </picture>
 </p>
@@ -116,7 +116,7 @@ tethered.activate(
 
 Under a lock, tampering with tethered's own code or with the active policy is detected and fails closed, and a Python child that cannot establish the locked policy refuses to start. Activate before importing third-party code: whatever runs earlier is not covered.
 
-`"block"` also stops the helper programs some libraries launch when they are imported, so import those first ([details](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
+`"block"` also stops the helper programs some libraries launch when they are imported, so import those first ([details](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](https://github.com/shcherbak-ai/tethered/blob/main/docs/security.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
 ## Allow list syntax
 
@@ -133,7 +133,7 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 
 ## Limits
 
-- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need hard isolation, combine tethered with OS-level controls: containers, seccomp, network namespaces. [SECURITY.md](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md) has the full threat model.
+- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need hard isolation, combine tethered with OS-level controls: containers, seccomp, network namespaces. The [security model](https://github.com/shcherbak-ai/tethered/blob/main/docs/security.md) has the full threat model.
 - **Libraries that connect in C are not seen.** tethered sees what goes through Python's `socket` module: requests, httpx, urllib3, aiohttp and the pure-Python database and broker clients. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not checked. The [compatibility page](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md) says what was measured, server by server and library by library.
 - **Under asyncio, the standard event loop only.** A uvloop event loop raises no audit events, so tethered refuses to enforce a policy next to it, and uvicorn picks uvloop whenever it is installed. Name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](https://github.com/shcherbak-ai/tethered/blob/main/docs/COOKBOOK.md#servers-and-interpreter-pools)).
 - **On Windows, run asyncio on `asyncio.SelectorEventLoop`.** The default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there.
@@ -145,7 +145,7 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 - [Compatibility](https://github.com/shcherbak-ai/tethered/blob/main/docs/COMPATIBILITY.md): what is enforced, what needs configuration and what is not seen, measured under real servers, task queues and client libraries
 - [Subprocess control](https://github.com/shcherbak-ai/tethered/blob/main/docs/SUBPROCESS.md): how a policy and a scope reach child processes, and `external_subprocess_policy`
 - [Architecture](https://github.com/shcherbak-ai/tethered/blob/main/docs/ARCHITECTURE.md): the audit hook, scopes, the C guardian, measured overhead
-- [Security](https://github.com/shcherbak-ai/tethered/blob/main/SECURITY.md): the threat model, what tethered does and does not protect against, reporting a vulnerability
+- [Security model](https://github.com/shcherbak-ai/tethered/blob/main/docs/security.md): the threat model, what tethered does and does not protect against, what locked mode adds
 - [Examples](https://github.com/shcherbak-ai/tethered/tree/main/examples): twelve runnable scripts, one for each feature
 - [Contributing](https://github.com/shcherbak-ai/tethered/blob/main/CONTRIBUTING.md): development setup and guidelines
 
