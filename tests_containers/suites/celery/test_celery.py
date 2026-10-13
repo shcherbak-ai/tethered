@@ -258,8 +258,16 @@ class TestPools:
     def test_every_pool_process_refuses_a_destination_outside_the_allow_list(
         self, stack: Stack, pool: str, host: str, port: int
     ) -> None:
-        path = probe_path("connect", host, port)
-        for report in stack.each_process(path, POOLS[pool][1]).values():
+        if pool == "gevent":
+            # One task, not several at once.  Under gevent's default resolver a refused
+            # lookup that overlaps another one now and then never returns (the hazard
+            # described in suites/gunicorn_gevent/test_gunicorn_gevent.py).  Its task
+            # never ends, and the warm shutdown of the worker then waits for that task.
+            reports = [stack.probe("connect", host, port)]
+        else:
+            path = probe_path("connect", host, port)
+            reports = list(stack.each_process(path, POOLS[pool][1]).values())
+        for report in reports:
             assert_refused(report)
         assert arrivals() == {}
 
