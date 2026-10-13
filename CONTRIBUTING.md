@@ -76,6 +76,22 @@ uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 ```
 
+## Documentation
+
+The user documentation is a site built from the Markdown pages under `docs/` with [Zensical](https://zensical.org/) (`zensical.toml`).
+
+```bash
+uv run inv docs-live   # preview at http://localhost:9000/tethered/, rebuilt when a page changes (--port N for another port)
+uv run inv docs        # what CI runs: fails on a broken link or anchor
+```
+
+Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --list` lists them. They run Zensical with `uvx`, as a tool at the versions pinned in `.github/docs-constraints.txt`. It is not a dependency of the package.
+
+- Write GitHub-flavoured Markdown, with relative links between pages (`COOKBOOK.md#gunicorn`) and absolute GitHub URLs for files outside `docs/`.
+- Indent what belongs to a list item (a nested item, a further paragraph, a code block) by four spaces, and put a blank line before the item that follows such a paragraph or code block. GitHub reads two spaces the same way; the site does not.
+- A new page goes into the `nav` list of `zensical.toml`.
+- `docs/index.md` and `docs/quickstart.md` repeat the README's pitch and quick start. Change them together.
+
 ## Commit messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by [commitizen](https://commitizen-tools.github.io/commitizen/). The commit-msg hook validates every commit message automatically. Run `uv run cz commit` for an interactive session that guides you through the format.
@@ -121,10 +137,16 @@ benchmarks/
 examples/
     README.md             # The list of the examples and how to run them
     01_basic_activate.py ... 12_scope_subprocess.py  # Runnable usage examples
-docs/
+docs/                     # The pages of the documentation site
+    index.md, quickstart.md  # The site's home page and quick start
     API.md, ARCHITECTURE.md, COOKBOOK.md, SUBPROCESS.md  # Detailed reference
     COMPATIBILITY.md      # What was measured under which server, task queue and client library
-assets/                   # The images of the README (see "Documentation" in AGENTS.md)
+    security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
+    changelog.md          # CHANGELOG.md, included as a page of the site
+    assets/, stylesheets/ # The site's images (shared with the README) and its look
+assets/                   # The README's own images (see "Documentation" in AGENTS.md)
+zensical.toml             # The documentation site: navigation, theme, Markdown extensions
+tasks.py                  # Invoke tasks: docs, docs-live
 ```
 
 ## Network safety in tests
