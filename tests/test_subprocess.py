@@ -3535,7 +3535,15 @@ class TestHigherLevelLaunchAPIs:
             f"workers saw scopes: {state['scope_labels']}"
         )
 
+    # A pytest-xdist worker has a second thread, which reads what the process
+    # that started it sends.  Under ``-n`` the two fork-mode tests therefore
+    # fork a multi-threaded process, and Python warns about that from 3.12.
+    _FORKS_AN_XDIST_WORKER = pytest.mark.filterwarnings(
+        "ignore:.*multi-threaded, use of fork:DeprecationWarning"
+    )
+
     @pytest.mark.skipif(sys.platform != "linux", reason="fork mode only reliable on Linux")
+    @_FORKS_AN_XDIST_WORKER
     def test_multiprocessing_fork_inherits_via_state_copy(self):
         """multiprocessing.Pool (fork mode) inherits policy via OS-level state copy.
 
@@ -3551,6 +3559,7 @@ class TestHigherLevelLaunchAPIs:
         assert result == "TETHERED_BLOCKED", result
 
     @pytest.mark.skipif(sys.platform != "linux", reason="fork mode only reliable on Linux")
+    @_FORKS_AN_XDIST_WORKER
     def test_multiprocessing_fork_inherits_scope_via_contextvar_copy(self):
         """Fork mode also copies ``_scopes`` ContextVar — child sees the parent's scope."""
         tethered.activate(allow=["*.allowed.com"])

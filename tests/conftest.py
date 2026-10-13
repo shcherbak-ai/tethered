@@ -5,7 +5,7 @@ when tethered is not active (between tests / during cleanup). When tethered
 IS active, its own hook handles enforcement and this guard is a no-op.
 
 Also installs ``tethered.pth`` into site-packages for the duration of the
-test session.  Editable installs (``pip install -e .``, ``uv pip install
+test run.  Editable installs (``pip install -e .``, ``uv pip install
 -e .``) don't run our ``setup.py`` ``build_py`` cmdclass, so the .pth that
 ships with the wheel doesn't land in site-packages automatically.  Tests
 that exercise subprocess auto-propagation need it there to work end-to-end.
@@ -200,30 +200,43 @@ def _quiet_once_per_process_messages() -> None:
     _core._fork_server_warning_pending = False
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _ensure_pth_installed():
-    """Install ``tethered.pth`` into site-packages for the test session.
+# The ``tethered.pth`` this run copied into site-packages, for
+# ``pytest_unconfigure`` to take away again.
+_INSTALLED_PTH = pytest.StashKey[Path]()
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Install ``tethered.pth`` into site-packages for the test run.
 
     The shipped wheel installs the .pth via setup.py's build_py cmdclass,
     but editable installs (``pip install -e .``) bypass that path.  Tests
     that subprocess.run a fresh Python interpreter need the .pth in
     site-packages to exercise auto-propagation; install it here and remove
-    on session teardown.  No-op if the .pth already exists (real wheel
-    install scenario).
+    it in ``pytest_unconfigure``.  No-op if the .pth already exists (real
+    wheel install scenario).
+
+    These are hooks and not a session fixture because of pytest-xdist
+    (``-n``): every worker has a session of its own, and site-packages is
+    one directory for all of them.  The worker that finished first would
+    remove the file under the workers still running.  So the process that
+    starts the workers installs it before the first of them starts and
+    removes it after the last has ended; a worker does neither.
     """
-    purelib = Path(sysconfig.get_path("purelib"))
-    pth_dst = purelib / "tethered.pth"
+    if hasattr(config, "workerinput"):
+        return  # a pytest-xdist worker
+    pth_dst = Path(sysconfig.get_path("purelib")) / "tethered.pth"
     pth_src = Path(__file__).resolve().parent.parent / "src" / "tethered.pth"
-    installed_by_us = False
     if not pth_dst.exists() and pth_src.exists():
         shutil.copy(pth_src, pth_dst)
-        installed_by_us = True
-    yield
-    if installed_by_us:
-        try:
+        config.stash[_INSTALLED_PTH] = pth_dst
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Remove the ``tethered.pth`` that ``pytest_configure`` installed."""
+    pth_dst = config.stash.get(_INSTALLED_PTH, None)
+    if pth_dst is not None:
+        with contextlib.suppress(OSError):  # best-effort cleanup
             pth_dst.unlink()
-        except OSError:  # pragma: no cover — best-effort cleanup
-            pass
 
 
 @pytest.fixture

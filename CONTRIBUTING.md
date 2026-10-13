@@ -14,7 +14,7 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 `uv sync` builds the environment on the Python that `.python-version` names (3.14), and downloads it if the machine has none. That is the interpreter for development; tethered supports 3.11 to 3.15, and CI tests every one of them. To run the tests on another version without rebuilding that environment:
 
 ```bash
-uv run --isolated --python 3.12 pytest tests/ -v
+uv run --isolated --python 3.12 pytest tests/ -n 8
 ```
 
 ## Branching
@@ -27,16 +27,22 @@ feature-branch → dev (PR) → main (release merge)
 
 ## Running tests
 
-Core tests (unit + integration, some tests skip if DNS is unavailable):
+Core tests (unit + integration, some tests skip if DNS is unavailable). `-n 8` runs them in parallel with [pytest-xdist](https://pytest-xdist.readthedocs.io/), in eight worker processes; more workers do not make the run shorter. CI passes `-n auto`, one worker per CPU of its runner.
 
 ```bash
-uv run pytest tests/ -v
+uv run pytest tests/ -n 8
+```
+
+Without `-n` the tests run in one process, which is what a debugger and `-s` need:
+
+```bash
+uv run pytest tests/test_policy.py -v
 ```
 
 With coverage (100% is required — the command will fail if coverage drops below that):
 
 ```bash
-uv run pytest tests/ --cov -v
+uv run pytest tests/ -n 8 --cov
 ```
 
 Example tests (run each example script as a subprocess, requires network):
@@ -237,3 +243,4 @@ On first run, a `tethered-cppcheck:<version>` Docker image is built, with cppche
 - **Documentation that is tested.** The code and configuration blocks of `docs/COOKBOOK.md` are meant to work as printed. Run a block in a container before you change it, or take it from a suite where it already runs. The FastAPI recipe and the Django middleware have a copy in their suite (`tests_containers/suites/fastapi/cookbook_recipe.py`, `tests_containers/suites/django/djapp/`): change the copy with the block and run the suite. `tests/test_docs_recipes.py` fails when a copy and its block differ.
 - Core tests that need DNS resolution are marked `@requires_network` and skip automatically if DNS is unavailable. The majority of core tests run fully offline.
 - Blocked connection tests verify `EgressBlocked` is raised before the connection is opened.
+- **Tests run in parallel.** CI runs `tests/` with `-n auto`, so a test has to pass in whichever worker process it lands, beside tests that run at the same time. The workers share no tethered state, but they share the file system: write below `tmp_path` only, bind port 0, and do not rely on another test having run first in the same process. What has to be in site-packages for the whole run (`tethered.pth`) is installed once by the `pytest_configure` hook in `tests/conftest.py`, not by a session fixture, which every worker would run for itself.
