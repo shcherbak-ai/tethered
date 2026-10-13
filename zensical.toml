@@ -29,6 +29,7 @@ nav = [
   { "Guides" = [
     { "Cookbook" = "COOKBOOK.md" },
     { "Subprocess control" = "SUBPROCESS.md" },
+    { "Migrating to 1.0" = "migrating-to-v1.md" },
   ] },
   { "Reference" = [
     { "API reference" = "API.md" },

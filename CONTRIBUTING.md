@@ -147,6 +147,7 @@ docs/                     # The pages of the documentation site
     index.md, quickstart.md  # The site's home page and quick start
     API.md, ARCHITECTURE.md, COOKBOOK.md, SUBPROCESS.md  # Detailed reference
     COMPATIBILITY.md      # What was measured under which server, task queue and client library
+    migrating-to-v1.md    # The 1.0.0 migration guide: the changelog's breaking changes by what a deployment uses
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
     assets/, stylesheets/ # The images of the site and the README, and the site's look
