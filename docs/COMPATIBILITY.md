@@ -305,7 +305,7 @@ In every system below, each process that runs task code held the policy, plain a
 
 | System | Arrangement | Result | Pinned by |
 |---|---|---|---|
-| Celery | `activate()` when the application module is imported: prefork, threads, solo and gevent pools; `--max-tasks-per-child`, a replacement for a killed pool process, `--autoscale`, a `SIGHUP` restart; `--beat` and a beat process of its own | Enforced. | `celery` (celery 5.6.3, kombu 5.6.2, billiard 4.3.1) |
+| Celery | `activate()` when the application module is imported: prefork, threads, solo and gevent pools; `--max-tasks-per-child`, a replacement for a killed pool process, `--autoscale`, a `SIGHUP` restart; `--beat` and a beat process of its own | Enforced. The gevent pool has the hazard described below the table. | `celery` (celery 5.6.3, kombu 5.6.2, billiard 4.3.1) |
 | Celery | `activate()` in a `worker_init` handler | Enforced in every pool. | `celery` |
 | Celery | `activate()` only in a `worker_process_init` handler | Enforced in the prefork pool's children (recycled ones too) and in the solo pool. **No policy at all** with `--pool threads` and `--pool gevent`: Celery never sends that signal there. | `celery` |
 | Celery | eventlet pool | Allowed host refused; enforced with `EVENTLET_NO_GREENDNS=yes`, or with a rule for the address. | `celery` (eventlet 0.41.2) |
@@ -324,6 +324,8 @@ In every system below, each process that runs task code held the policy, plain a
 **The fork server.** A worker of the `forkserver` start method is a copy of the fork server process, not of the process that asks for it. A fork server that was started before `activate()` holds no policy, and neither does any worker it produces from then on, also after `activate(locked=True)`. Asking it for a worker goes over a socket and raises no launch event, so tethered can neither refuse nor complete it. forkserver is the default start method on Linux from Python 3.14. `activate()` logs one warning when it finds a fork server already running. Call `activate()` before the first pool or process is started; a fork server that starts under the policy passes it on.
 
 **A broker that is addressed by name has to be in the allow list.** Otherwise the Celery worker ends at start-up with `EgressBlocked` for the broker's address (suite `celery`). kombu retries connection errors; `EgressBlocked` is not one, so the mistake is not retried for ever.
+
+**Celery's gevent pool and a lookup that never returns.** The hazard of gevent's thread-pool resolver, described under [gunicorn](#gunicorn), is there with `--pool gevent` too: when refused lookups overlap, the task of one of them now and then never finishes. The worker goes on running other tasks. A warm shutdown (`SIGTERM`) waits for running tasks without a time limit, so with such a task it does not end. Measured once, on Python 3.12 and 3.13 with Celery 5.6.3 and gevent 26.9.0, not asserted by a suite: under eight refused lookups at a time a task was stuck after 152 and after 328 lookups, the worker was still running two minutes after `SIGTERM`, and it ended at once when it was then sent `SIGQUIT`, Celery's cold shutdown.
 
 **What an operator sees for a refused task.** Nothing arrived in any of these, and in no system did the workers die.
 
