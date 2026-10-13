@@ -94,7 +94,7 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 ### README and package description
 
-`README.md` is what GitHub shows. Use relative paths in it for files of the repository and for images (`docs/API.md`, `docs/assets/tethered-mark-dark.svg`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
+`README.md` is what GitHub shows. Use relative paths in it for files of the repository and for images (`docs/API.md`, `docs/assets/tethered-mark.svg`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
 
 The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
 
@@ -149,8 +149,7 @@ docs/                     # The pages of the documentation site
     COMPATIBILITY.md      # What was measured under which server, task queue and client library
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
-    assets/, stylesheets/ # The site's images (shared with the README) and its look
-assets/                   # The README's own images (see "Documentation" in AGENTS.md)
+    assets/, stylesheets/ # The images of the site and the README, and the site's look
 zensical.toml             # The documentation site: navigation, theme, Markdown extensions
 tasks.py                  # Invoke tasks: docs, docs-live
 README.md                 # What GitHub shows: pitch, quick start, pointers

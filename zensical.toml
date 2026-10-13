@@ -42,7 +42,7 @@ nav = [
 [project.theme]
 language = "en"
 font = false
-logo = "assets/tethered-mark-dark.svg"
+logo = "assets/tethered-mark.svg"
 favicon = "assets/favicon.svg"
 features = [
   "content.code.copy",

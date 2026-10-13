@@ -10,8 +10,6 @@ config:
   no-inline-html:
     allowed_elements:
       - p
-      - picture
-      - source
       - img
       - a
       - strong

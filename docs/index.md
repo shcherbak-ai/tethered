@@ -6,7 +6,7 @@ hide:
   - toc
 ---
 
-# ![tethered](assets/tethered-mark-dark.svg){ .home-name width="456" }
+# ![tethered](assets/tethered-mark.svg){ .home-name width="456" }
 
 <p class="home-lead">Runtime network egress control for Python.</p>
 
@@ -17,7 +17,7 @@ uv add tethered
 ```
 
 <figure markdown>
-![One call sets the allow list: the application reaches api.stripe.com and db.internal, and its connection to evil.test is blocked.](assets/tethered-figure-dark.svg)
+![One call sets the allow list: the application reaches api.stripe.com and db.internal, and its connection to evil.test is blocked.](assets/tethered-figure.svg)
 </figure>
 
 ```python

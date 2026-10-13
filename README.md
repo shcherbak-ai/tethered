@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tethered-mark-dark.svg">
-    <img src="assets/tethered-mark-light.svg" alt="tethered" width="456">
-  </picture>
+  <img src="docs/assets/tethered-mark.svg" alt="tethered" width="456">
 </p>
 
 <h1 align="center">Runtime network egress control for Python</h1>
@@ -28,10 +25,7 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tethered-figure-dark.svg">
-    <img src="assets/tethered-figure-light.svg" alt="One call sets the allow list: the application reaches api.stripe.com and db.internal, and its connection to evil.test is blocked." width="600">
-  </picture>
+  <img src="docs/assets/tethered-figure.svg" alt="One call sets the allow list: the application reaches api.stripe.com and db.internal, and its connection to evil.test is blocked." width="600">
 </p>
 
 tethered checks every connection made through Python's socket layer against your allow list, from inside the process, before the connection is opened. `activate()` sets the ceiling for the whole process; `scope()` narrows a single code path.
