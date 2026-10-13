@@ -1,9 +1,10 @@
 name: Container tests
 
 # Real application servers in Docker, with no network: tests_containers/.
-# See tests_containers/AGENTS.md.  Pull requests run the pinned requirements;
-# the weekly run installs the latest release of everything, to notice when a
-# server or a framework changes under tethered.
+# See tests_containers/AGENTS.md.  Pull requests run the pinned requirements
+# on every supported Python version; the weekly run installs the latest
+# release of everything, to notice when a server or a framework changes under
+# tethered, and does so on one Python version, the one .python-version names.
 
 on:
   pull_request:
@@ -50,13 +51,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       # run.py needs Python 3.11+ and nothing else: the runner's own python3 will do.
+      # The weekly run is on one Python version: what it looks for, a server or a
+      # library that has changed, does not depend on the version.
       - name: List suite and Python combinations
         id: list
         env:
           PYTHON_INPUT: ${{ inputs.python }}
           SUITE_INPUT: ${{ inputs.suite }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
         run: |
           args=(--list --json)
+          if [ "$SCHEDULED" = "true" ]; then args+=(--python "$(cat .python-version)"); fi
           if [ -n "$PYTHON_INPUT" ]; then args+=(--python "$PYTHON_INPUT"); fi
           if [ -n "$SUITE_INPUT" ]; then args+=(--suite "$SUITE_INPUT"); fi
           python3 tests_containers/run.py "${args[@]}" | tee matrix.json

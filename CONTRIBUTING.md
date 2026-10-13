@@ -67,7 +67,7 @@ uv run python tests_containers/run.py --suite gunicorn -k reload --verbose
 uv run python tests_containers/run.py --list
 ```
 
-**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/AGENTS.md](tests_containers/AGENTS.md) explains how they work and how to add a suite.
+**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly, on one Python version, against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/AGENTS.md](tests_containers/AGENTS.md) explains how they work and how to add a suite.
 
 ## Linting and formatting
 

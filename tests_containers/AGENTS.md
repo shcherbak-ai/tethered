@@ -286,7 +286,7 @@ A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. Before it i
 
 ## CI
 
-`.github/workflows/container-tests.yml` runs one job per suite and Python version, from the matrix that `run.py --list --json` prints. It runs on pull requests that touch `src/`, `setup.py`, `pyproject.toml`, `tests_containers/` or the workflow itself; on demand (`workflow_dispatch`, with an optional Python version, suite and "unpinned"); and every Monday with `--unpinned`.
+`.github/workflows/container-tests.yml` runs one job per suite and Python version, from the matrix that `run.py --list --json` prints. It runs on pull requests that touch `src/`, `setup.py`, `pyproject.toml`, `tests_containers/` or the workflow itself; on demand (`workflow_dispatch`, with an optional Python version, suite and "unpinned"); and every Monday with `--unpinned`, on one Python version only, the one `.python-version` names: what that run looks for, a server or a library that has changed, does not depend on the Python version.
 
 ## What a run costs
 
