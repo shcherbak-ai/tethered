@@ -92,6 +92,12 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 - A new page goes into the `nav` list of `zensical.toml`.
 - `docs/index.md` and `docs/quickstart.md` repeat the README's pitch and quick start. Change them together.
 
+### README and package description
+
+`README.md` is what GitHub shows. Use relative paths in it for files of the repository and for images (`docs/API.md`, `docs/assets/tethered-mark-dark.svg`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
+
+The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
+
 ## Commit messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by [commitizen](https://commitizen-tools.github.io/commitizen/). The commit-msg hook validates every commit message automatically. Run `uv run cz commit` for an interactive session that guides you through the format.
@@ -147,6 +153,8 @@ docs/                     # The pages of the documentation site
 assets/                   # The README's own images (see "Documentation" in AGENTS.md)
 zensical.toml             # The documentation site: navigation, theme, Markdown extensions
 tasks.py                  # Invoke tasks: docs, docs-live
+README.md                 # What GitHub shows: pitch, quick start, pointers
+PYPI.md                   # The package description PyPI shows
 ```
 
 ## Network safety in tests

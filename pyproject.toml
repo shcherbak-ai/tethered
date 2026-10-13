@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tethered"
 version = "0.5.3"
 description = "Runtime network egress control for Python"
-readme = "README.md"
+readme = "PYPI.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [
