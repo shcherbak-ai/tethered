@@ -34,10 +34,11 @@ jobs:
         if: matrix.language == 'c-cpp'
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
 
+      # uv python install without a version: the one .python-version names.
       - name: Build C extension (for CodeQL tracing)
         if: matrix.language == 'c-cpp'
         run: |
-          uv python install 3.13
+          uv python install
           uv venv
           uv pip install setuptools
           uv run python setup.py build_ext --inplace

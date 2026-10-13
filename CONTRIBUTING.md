@@ -11,6 +11,12 @@ uv sync
 uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 ```
 
+`uv sync` builds the environment on the Python that `.python-version` names (3.14), and downloads it if the machine has none. That is the interpreter for development; tethered supports 3.11 to 3.15, and CI tests every one of them. To run the tests on another version without rebuilding that environment:
+
+```bash
+uv run --isolated --python 3.12 pytest tests/ -v
+```
+
 ## Branching
 
 The default branch is `main`. All pull requests should target `dev`. The `main` branch is for releases only — `dev` is the working branch.
@@ -160,6 +166,7 @@ docs/                     # The pages of the documentation site
 assets/                   # The README's own images: the pixel names of the sibling projects
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
 tasks.py                  # Invoke tasks: docs, docs-live
+.python-version           # The Python that uv builds the development environment on
 README.md                 # What GitHub shows: pitch, quick start, pointers
 PYPI.md                   # The package description PyPI shows
 ```
