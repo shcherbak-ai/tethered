@@ -148,16 +148,6 @@ These pages are also a site, [tethered.shcherbak.ai](https://tethered.shcherbak.
 - [Examples](examples/): twelve runnable scripts, one for each feature
 - [Contributing](CONTRIBUTING.md): development setup and guidelines
 
-## Badge
-
-Using tethered in your project? Add the badge to your README:
-
-[![egress: tethered](https://img.shields.io/badge/egress-tethered-orange?labelColor=4B8BBE)](https://github.com/shcherbak-ai/tethered)
-
-```markdown
-[![egress: tethered](https://img.shields.io/badge/egress-tethered-orange?labelColor=4B8BBE)](https://github.com/shcherbak-ai/tethered)
-```
-
 ## License
 
 [MIT](LICENSE)
