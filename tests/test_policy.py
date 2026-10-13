@@ -429,7 +429,7 @@ class TestAllowPolicyBracketNotation:
         policy = AllowPolicy(["[10.0.0.0]/8:5432"], allow_localhost=False)
         assert policy.is_allowed("10.1.2.3", 5432) is True
         assert policy.is_allowed("10.1.2.3", 80) is False
-        assert policy.is_allowed("11.1.2.3", 5432) is False
+        assert policy.is_allowed("192.0.2.3", 5432) is False
 
     def test_bracketed_non_ip_is_a_character_set(self):
         """Brackets that hold no IP address are fnmatch syntax, not a hostname."""
@@ -532,7 +532,7 @@ class TestAllowPolicyLeadingCharacterSet:
         """``[*]`` used to be unwrapped to ``*`` behind the match-all guard's back."""
         policy = AllowPolicy(["[*]"], allow_localhost=False)
         assert policy.is_allowed("evil.example", 443) is False
-        assert policy.is_allowed("8.8.8.8", 53) is False
+        assert policy.is_allowed("192.0.2.1", 53) is False
 
     def test_leading_set_round_trips_through_serialization(self):
         policy = AllowPolicy(["[ab].example.com:443"])
@@ -726,7 +726,7 @@ class TestAddressShapedWildcard:
     def test_matching_is_unchanged(self):
         policy = AllowPolicy(["10.*"], allow_localhost=False)
         assert policy.is_allowed("10.1.2.3") is True
-        assert policy.is_allowed("11.1.2.3") is False
+        assert policy.is_allowed("192.0.2.3") is False
         # The documented fnmatch semantics: a hostname that fits the text matches too.
         assert policy.is_allowed("10.attacker.example") is True
 

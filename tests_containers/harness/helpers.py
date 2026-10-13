@@ -2,7 +2,7 @@
 
 Everything here runs in the pytest process, which never holds a tethered
 policy and never imports tethered.  ``harness.servers`` starts the processes
-that do.  ``tests_containers/README.md`` documents the functions.
+that do.  ``tests_containers/AGENTS.md`` documents the functions.
 """
 
 from __future__ import annotations

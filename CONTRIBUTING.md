@@ -61,11 +61,11 @@ uv run python tests_containers/run.py --suite gunicorn -k reload --verbose
 uv run python tests_containers/run.py --list
 ```
 
-**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/README.md](tests_containers/README.md) explains how they work and how to add a suite.
+**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/AGENTS.md](tests_containers/AGENTS.md) explains how they work and how to add a suite.
 
 ## Linting and formatting
 
-Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, commitizen) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`:
+Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, deptry, commitizen) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`:
 
 ```bash
 uv run pre-commit run --all-files
@@ -80,6 +80,14 @@ uv run ruff format .       # format
 uv run ty check src/ examples/   # type check
 uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
+uv run deptry .            # imports against declared dependencies
+uv lock --check            # uv.lock matches pyproject.toml
+```
+
+The licences of the package's dependencies are checked in CI (`.github/workflows/licenseal.yml`), with [licenseal](https://github.com/shcherbak-ai/licenseal). tethered has none, so the check passes with nothing to judge. To run it locally:
+
+```bash
+uv run licenseal check --exclude-dirs tests_containers
 ```
 
 ## Documentation
@@ -141,12 +149,13 @@ tests/
     test_docs_recipes.py  # The recipes docs/COOKBOOK.md prints against the copies the container suites run
     test_docs_site.py     # The version in the site's footer against the package version
     test_llms_index.py    # The llms.txt index against nav and the description each page gives itself
+    test_changelog.py     # The compare link of every changelog version, and the version and date in CITATION.cff
 tests_examples/
     conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
 tests_containers/
     run.py                # Host runner: one image per suite and Python version, each run in a container without a network
-    README.md             # How the suites work, the helpers, adding a suite
+    AGENTS.md             # How the suites work, the helpers, adding a suite
     images/               # The Dockerfile: tethered built as a wheel and installed like a user's
     harness/              # Shared in-container code: pytest plugin, the destinations that count arrivals, probe applications
     suites/<name>/        # One directory per server, task queue or library family

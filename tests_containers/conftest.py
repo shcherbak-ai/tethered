@@ -18,5 +18,5 @@ def pytest_configure(config: pytest.Config) -> None:
     if os.environ.get("TC_IN_CONTAINER") != "1":
         raise pytest.UsageError(
             "the container suites run inside their images, not on the host: "
-            "use `uv run python tests_containers/run.py` (see tests_containers/README.md)"
+            "use `uv run python tests_containers/run.py` (see tests_containers/AGENTS.md)"
         )

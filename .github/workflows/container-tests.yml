@@ -1,7 +1,7 @@
 name: Container tests
 
 # Real application servers in Docker, with no network: tests_containers/.
-# See tests_containers/README.md.  Pull requests run the pinned requirements;
+# See tests_containers/AGENTS.md.  Pull requests run the pinned requirements;
 # the weekly run installs the latest release of everything, to notice when a
 # server or a framework changes under tethered.
 
@@ -43,10 +43,11 @@ jobs:
   matrix:
     name: Find the suites
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       # run.py needs Python 3.11+ and nothing else: the runner's own python3 will do.
       - name: List suite and Python combinations
@@ -70,7 +71,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Build the image and run the suite
         env:

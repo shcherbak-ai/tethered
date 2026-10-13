@@ -2,7 +2,7 @@
 
 ``from harness import start_server, arrived, FORBIDDEN_NAME`` is all a test
 module needs; the fixtures come from ``harness.plugin``, which the image's
-entry point (``python -m harness``) loads.  See ``tests_containers/README.md``.
+entry point (``python -m harness``) loads.  See ``tests_containers/AGENTS.md``.
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ version the runner builds an image (the build context is the repository root)
 and runs it with ``--network none --cap-add NET_ADMIN``; pytest runs inside.
 The exit status is 0 when every run passed, 1 when one did not, and 2 when
 the request could not be carried out (no Docker, an unknown suite).
-``tests_containers/README.md`` has the details.
+``tests_containers/AGENTS.md`` has the details.
 """
 
 from __future__ import annotations

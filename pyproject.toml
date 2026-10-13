@@ -51,6 +51,8 @@ dev = [
     "setuptools>=83.0.0",
     "ty>=0.0.86",
     "pyyaml>=6.0.3",
+    "deptry>=0.25.1",
+    "licenseal>=0.4.2",
 ]
 
 [tool.setuptools.packages.find]
@@ -109,13 +111,28 @@ version_files = [
 ]
 tag_format = "v$version"
 annotated_tag = true
+# The hooks run after the version fields are rewritten and before the commit.
+# The last one stops a bump whose release date was not written into
+# CITATION.cff: the changelog heading of the new version has to name the same day.
 pre_bump_hooks = [
     "uv lock --no-upgrade",
     "git add uv.lock",
+    "uv run pytest tests/test_changelog.py -q",
 ]
 
 [tool.bandit]
 exclude_dirs = ["tests"]
+
+[tool.deptry]
+known_first_party = ["tethered"]
+
+# Imported outside the package and its tests, and declared in the dev group:
+# the package itself has no dependency.
+[tool.deptry.per_rule_ignores]
+DEP004 = [
+    "httpx",   # examples/
+    "invoke",  # tasks.py, the development tasks
+]
 
 [tool.interrogate]
 ignore-init-method = true

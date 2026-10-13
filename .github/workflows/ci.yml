@@ -16,14 +16,22 @@ on:
 permissions:
   contents: read
 
+# The uv every job installs.  Without it a new uv release would change what
+# CI runs without a commit.
+env:
+  UV_VERSION: "0.13.0"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          version: ${{ env.UV_VERSION }}
 
       # Without a version this installs the one .python-version names, the
       # development interpreter, which is what uv sync and uv run then use.
@@ -72,6 +80,7 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     # .python-version names the development interpreter, and a plain uv run
     # rebuilds the environment on it whatever uv sync was told.  UV_PYTHON
     # outranks the file, so every uv command of a cell stays on its Python.
@@ -84,10 +93,12 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          version: ${{ env.UV_VERSION }}
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -106,7 +117,7 @@ jobs:
         run: uv run pytest tests/ -v --cov=src/tethered --cov-report=xml --cov-report=term-missing --cov-fail-under=100
 
       - name: Extract coverage percentage
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
         id: coverage
         run: |
           RATE=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('coverage.xml').getroot().get('line-rate'))")
@@ -114,7 +125,7 @@ jobs:
           echo "pct=$PCT" >> "$GITHUB_OUTPUT"
 
       - name: Update coverage badge
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && github.ref == 'refs/heads/main'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14' && github.ref == 'refs/heads/main'
         uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483  # v1.7.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}

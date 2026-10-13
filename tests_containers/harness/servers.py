@@ -3,7 +3,7 @@
 These are the processes that hold a tethered policy.  Each is started with a
 clean environment in a session of its own, so that everything it leaves
 behind can be found, and its output is kept for the report of a failing test.
-``tests_containers/README.md`` documents the functions.
+``tests_containers/AGENTS.md`` documents the functions.
 """
 
 from __future__ import annotations

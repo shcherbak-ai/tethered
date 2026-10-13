@@ -4,7 +4,7 @@ type: software
 title: "Tethered"
 abstract: "Runtime network egress control for Python"
 version: 0.5.3
-date-released: 2026-02-24
+date-released: 2026-08-19
 license: MIT
 repository-code: "https://github.com/shcherbak-ai/tethered"
 url: "https://github.com/shcherbak-ai/tethered"
