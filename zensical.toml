@@ -1,4 +1,4 @@
-# The documentation site: https://shcherbak-ai.github.io/tethered/
+# The documentation site: https://tethered.shcherbak.ai/
 #
 #   uv run inv docs-live   # preview at http://localhost:9000
 #   uv run inv docs        # what CI runs; the site is written to site/
@@ -14,7 +14,7 @@
 
 [project]
 site_name = "tethered"
-site_url = "https://shcherbak-ai.github.io/tethered/"
+site_url = "https://tethered.shcherbak.ai/"
 site_description = "Runtime network egress control for Python. One function call, zero dependencies, no infrastructure changes."
 site_author = "Sergii Shcherbak"
 copyright = "Copyright &copy; 2026 Sergii Shcherbak. MIT License."

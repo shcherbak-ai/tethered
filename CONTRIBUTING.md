@@ -78,10 +78,10 @@ uv run bandit -c pyproject.toml -r src/  # security scan
 
 ## Documentation
 
-The user documentation is a site built from the Markdown pages under `docs/` with [Zensical](https://zensical.org/) (`zensical.toml`).
+The user documentation is a site built from the Markdown pages under `docs/` with [Zensical](https://zensical.org/) (`zensical.toml`), and published to <https://tethered.shcherbak.ai/> from `main`.
 
 ```bash
-uv run inv docs-live   # preview at http://localhost:9000/tethered/, rebuilt when a page changes (--port N for another port)
+uv run inv docs-live   # preview at http://localhost:9000, rebuilt when a page changes (--port N for another port)
 uv run inv docs        # what CI runs: fails on a broken link or anchor
 ```
 

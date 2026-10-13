@@ -2,7 +2,9 @@ name: Documentation
 
 # Builds the documentation site (docs/, zensical.toml) on every push and pull
 # request, so a broken link or anchor fails before it is merged, and
-# publishes it to GitHub Pages from main.
+# publishes it to GitHub Pages from main. Its domain, tethered.shcherbak.ai,
+# is set in the repository's Pages settings; a deployment from a workflow
+# reads no CNAME file.
 
 on:
   push:
