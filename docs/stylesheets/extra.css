@@ -271,6 +271,24 @@ body,
   max-width: none;
 }
 
+/* A code block takes the width of the column it stands in. A block of one
+   line is as wide as that line, with room for the copy button, and never wider
+   than the column: a command is not stretched across the page. The highlighter
+   starts every line with an anchor (anchor_linenums in zensical.toml), so a
+   block without a second one has one line. */
+.md-typeset .highlight:not(:has(code > [id^="__codelineno"] ~ [id^="__codelineno"])) {
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: 0;
+}
+
+.md-typeset
+  .highlight:not(:has(code > [id^="__codelineno"] ~ [id^="__codelineno"]))
+  > pre
+  > code {
+  padding-right: 3.5em;
+}
+
 /* A rule, a host or a parameter in a table's first column stays on one line. */
 .md-typeset table:not([class]) td:first-child code {
   white-space: nowrap;
