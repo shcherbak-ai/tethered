@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.0] — 2026-10-14
+## [1.0.0] — 2026-10-13
 
 Everything below is relative to 0.5.3. Most of this release closes cases in which a policy was in place and not applied: an event loop or a resolver that tethered does not see, a Python child or an interpreter that started without the policy, a rule that was read otherwise than it was written. Where 0.5.3 went on unenforced, 1.0.0 refuses, when the policy is set or at the call, and says what to change. A deployment that ran on 0.5.3 can therefore stop at start-up after the upgrade with no change of its own. Every change that can do that is under **Breaking changes**, whatever kind of change it is, a security fix included. No function, parameter or exception was renamed or removed.
 

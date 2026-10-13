@@ -5,7 +5,7 @@ description: "Upgrading tethered from 0.5.x to 1.0.0: the breaking changes by wh
 
 # Migrating to 1.0
 
-For a deployment that runs tethered 0.5.x and moves to 1.0.0. The page is written against 0.5.3, the last release before it. The [changelog](https://github.com/shcherbak-ai/tethered/blob/main/CHANGELOG.md#100--2026-10-14) lists every change; this page has the ones that ask something of you, ordered by what a deployment uses.
+For a deployment that runs tethered 0.5.x and moves to 1.0.0. The page is written against 0.5.3, the last release before it. The [changelog](https://github.com/shcherbak-ai/tethered/blob/main/CHANGELOG.md#100--2026-10-13) lists every change; this page has the ones that ask something of you, ordered by what a deployment uses.
 
 No function, parameter or exception was renamed or removed: `activate()`, `scope()` and `deactivate()` take what they took in 0.5.3. What changed is what tethered does where a policy would not be applied. 0.5.3 went on in those cases, and the process ran under a policy that covered less than it said: nothing that went through a uvloop event loop, no Python child of an editable install, and for some malformed rules more destinations than were written. 1.0.0 refuses instead, when the policy is set or at the call, with a message that names the way out. The upgrade therefore tends to show at start-up, and most of what it shows was not enforced before.
 
