@@ -116,7 +116,7 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 ### README and package description
 
-`README.md` is what GitHub shows. Use relative paths in it for files of the repository and for images (`docs/API.md`, `docs/assets/tethered-mark.svg`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
+`README.md` is what GitHub shows. Link to a page of the documentation at its address on the site (`https://tethered.shcherbak.ai/API/`); the site describes the last release, so a page or a heading that is new on `dev` is not there yet. Use relative paths for images and for other files of the repository (`docs/assets/tethered-mark.svg`, `examples/`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
 
 The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
 
