@@ -120,6 +120,8 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
 
+The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it, from the mark, the README's heading and the README's figure. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
+
 The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
 
 ## Commit messages
@@ -179,8 +181,9 @@ docs/                     # The pages of the documentation site
     changelog.md          # CHANGELOG.md, included as a page of the site
     assets/, stylesheets/ # The images of the site and the README, and the site's look
 assets/                   # The README's own images: the pixel names of the sibling projects
+social/                   # The repository's social preview: the SVG it is drawn in and the PNG that is uploaded to GitHub
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
-tasks.py                  # Invoke tasks: docs, docs-live
+tasks.py                  # Invoke tasks: docs, docs-live, social-preview
 .python-version           # The Python that uv builds the development environment on
 README.md                 # What GitHub shows: pitch, quick start, pointers
 PYPI.md                   # The package description PyPI shows
