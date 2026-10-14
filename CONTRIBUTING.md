@@ -2,12 +2,13 @@
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), and Docker (for the `cppcheck` pre-commit hook and for the container suites).
+**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), Docker (for the `cppcheck` pre-commit hook and for the container suites), and [Node.js](https://nodejs.org/) for the development tools that `package.json` lists: the stylesheet of the README preview and the agents' browser. None of them is part of the package.
 
 ```bash
 git clone https://github.com/shcherbak-ai/tethered.git
 cd tethered
 uv sync
+npm ci
 uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 ```
 
@@ -88,6 +89,7 @@ uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 uv run deptry .            # imports against declared dependencies
 uv lock --check            # uv.lock matches pyproject.toml
+node --test .claude/hooks/playwright-files.test.mjs  # the Claude Code hook that keeps the agents' browser files in one folder
 ```
 
 The licences of the package's dependencies are checked in CI (`.github/workflows/licenseal.yml`), with [licenseal](https://github.com/shcherbak-ai/licenseal). tethered has none, so the check passes with nothing to judge. To run it locally:
@@ -119,6 +121,12 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 `README.md` is what GitHub shows. Link to a page of the documentation at its address on the site (`https://tethered.shcherbak.ai/API/`); the site describes the last release, so a page or a heading that is new on `dev` is not there yet. Use relative paths for images and for other files of the repository (`docs/assets/tethered-mark.svg`, `examples/`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
 
 The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
+
+Look at a change as GitHub will show it before pushing it. `uv run inv readme-preview` serves `README.md` at <http://127.0.0.1:9110/> (`--port N` for another port):
+
+- The HTML is what GitHub's Markdown API returns for the file, so what GitHub removes from a README is removed here too.
+- The look comes from github-markdown-css, in GitHub's colours, light or dark as the browser is set. The column is as wide as GitHub's at 1280 pixels and wider, and below 768.
+- A reload sends the README to GitHub again when it has changed. GitHub allows 60 of those an hour without a token.
 
 The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it, from the mark, the README's heading and the README's figure. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
 
@@ -183,7 +191,10 @@ docs/                     # The pages of the documentation site
 assets/                   # The README's own images: the pixel names of the sibling projects
 social/                   # The repository's social preview: the SVG it is drawn in and the PNG that is uploaded to GitHub
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
-tasks.py                  # Invoke tasks: docs, docs-live, social-preview
+tasks.py                  # Invoke tasks: docs, docs-live, readme-preview, social-preview
+package.json              # Development tools from npm, not part of the package: the agents' browser and the README preview's stylesheet
+.mcp.json                 # Starts the agents' browser (Playwright MCP)
+.claude/                  # Claude Code's shared settings and the hook that keeps the browser's files in .playwright-mcp/
 .python-version           # The Python that uv builds the development environment on
 README.md                 # What GitHub shows: pitch, quick start, pointers
 PYPI.md                   # The package description PyPI shows

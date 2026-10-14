@@ -134,7 +134,7 @@ extend_exclude = ["benchmarks/dns_lookups"]
 # the package itself has no dependency.
 [tool.deptry.per_rule_ignores]
 DEP004 = [
-    "httpx",   # examples/
+    "httpx",   # examples/, and tasks.py's README preview
     "invoke",  # tasks.py, the development tasks
 ]
 
