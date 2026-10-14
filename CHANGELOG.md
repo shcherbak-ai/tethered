@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] — 2026-10-14
+
+### Fixed
+
+- A policy without localhost no longer stops asyncio on Windows. Windows has no `socketpair()`, so CPython makes a socket pair by connecting a socket to a listener of its own on 127.0.0.1 or ::1, and every asyncio event loop makes such a pair when it is created. Under `activate(..., allow_localhost=False)` or `scope(..., allow_localhost=False)` tethered refused that connection, so `asyncio.run()`, `asyncio.new_event_loop()`, `asyncio.SelectorEventLoop()` and `socket.socketpair()` raised `EgressBlocked`, under a locked policy as well. A loop created before the policy kept working, which hid the failure. That connection is now let through: tethered recognises it by the function that makes it, CPython's own fallback in the `socket` module, and by its target, a socket that the same call is listening on, so it does not leave the process. Every other connection to loopback is checked as before, and the old advice to allow `127.0.0.1` on every port is gone from [`docs/security.md`](https://github.com/shcherbak-ai/tethered/blob/main/docs/security.md#design-trade-offs). Linux and macOS were not affected: their `socketpair()` makes no connection.
+
 ## [1.0.0] — 2026-10-13
 
 Everything below is relative to 0.5.3. Most of this release closes cases in which a policy was in place and not applied: an event loop or a resolver that tethered does not see, a Python child or an interpreter that started without the policy, a rule that was read otherwise than it was written. Where 0.5.3 went on unenforced, 1.0.0 refuses, when the policy is set or at the call, and says what to change. A deployment that ran on 0.5.3 can therefore stop at start-up after the upgrade with no change of its own. Every change that can do that is under **Breaking changes**, whatever kind of change it is, a security fix included. No function, parameter or exception was renamed or removed.
@@ -247,6 +253,7 @@ The security fixes that can stop a setup that ran on 0.5.3 are under Breaking ch
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[1.0.1]: https://github.com/shcherbak-ai/tethered/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shcherbak-ai/tethered/compare/v0.5.3...v1.0.0
 [0.5.3]: https://github.com/shcherbak-ai/tethered/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/shcherbak-ai/tethered/compare/v0.5.1...v0.5.2

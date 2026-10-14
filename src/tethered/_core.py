@@ -14,6 +14,7 @@ import logging
 import operator
 import os
 import reprlib
+import socket
 import sys
 import threading
 import types
@@ -1804,6 +1805,58 @@ def _allowed_by_every_layer(
         return False
 
 
+# How CPython makes a socket pair where the platform has no socketpair() of
+# its own, which is Windows: the function listens on an ephemeral port of
+# 127.0.0.1 or ::1 and connects a second socket to that listener.  asyncio
+# makes such a pair in the constructor of every event loop.  The code object
+# is taken when this module is imported, so that a function put in the
+# fallback's place later is not taken for it; in locked mode the snapshot
+# pins it like every other binding.  Up to Python 3.11.9 the fallback had no
+# name of its own: on Windows it is socket.socketpair itself.
+_SOCKETPAIR_FALLBACK_CODE = getattr(socket, "_fallback_socketpair", socket.socketpair).__code__
+
+# The addresses the fallback listens on (socket._LOCALHOST, _LOCALHOST_V6).
+_SOCKETPAIR_HOSTS = frozenset(("127.0.0.1", "::1"))
+
+
+def _is_own_socketpair_connect(event: str, ip_key: str | None, port: int | None) -> bool:
+    """Return True for the connect with which ``socket.socketpair()`` joins its own two sockets.
+
+    Called by :func:`_handle_connect` only where a connect would be refused,
+    or searched for a hostname, never for one that is allowed: a policy
+    without localhost would otherwise refuse the creation of every asyncio
+    event loop on Windows.  The connect is the fallback's when the frame that
+    made it runs the fallback's code (:data:`_SOCKETPAIR_FALLBACK_CODE`), the
+    target is 127.0.0.1 or ::1, and that frame's listening socket (``lsock``)
+    listens on exactly the target address.  The listener is read through the
+    methods of the C type, which a subclass cannot override and which raise
+    for anything that is not a socket.  Both ends then belong to this
+    process, and nothing leaves it.  Anything else is left to the policy: a
+    connect made elsewhere, one to an address other than the frame's own
+    listener, a listener that does not listen, and every connect where the
+    platform cannot say whether a socket listens (macOS, whose socketpair()
+    is native and never runs the fallback).
+    """
+    if event != "socket.connect" or ip_key not in _SOCKETPAIR_HOSTS:
+        return False
+    try:
+        # 0: this function, 1: _handle_connect, 2: _audit_hook, 3: the frame
+        # that called connect().
+        frame = sys._getframe(3)
+        if frame.f_code is not _SOCKETPAIR_FALLBACK_CODE:
+            return False
+        listener = frame.f_locals["lsock"]
+        bound = _csocket.socket.getsockname(listener)
+        return (
+            _canonical_ip(bound[0]) == ip_key
+            and bound[1] == port
+            and _csocket.socket.getsockopt(listener, _csocket.SOL_SOCKET, _csocket.SO_ACCEPTCONN)
+            != 0
+        )
+    except Exception:  # no such frame, no socket, a closed one: left to the policy
+        return False
+
+
 def _handle_connect(
     cfg: _Config | None,
     scope_stack: tuple[_ScopeConfig, ...],
@@ -1854,6 +1907,11 @@ def _handle_connect(
             if names:
                 _ip_to_hostname.move_to_end(ip_key)
         if not names and not _allowed_by_every_layer(cfg, scope_stack, check_host, port):
+            # The pair socket.socketpair() connects on loopback is let through
+            # here, before the search, which would re-resolve every candidate
+            # for it; below, where a layer refuses, for an address with names.
+            if _is_own_socketpair_connect(event, ip_key, port):
+                return
             # IP map miss — could be DNS divergence (load-balanced service,
             # short TTL, gevent threadpool latency) where the IP CPython
             # returned to the application differs from what tethered's
@@ -1903,6 +1961,8 @@ def _handle_connect(
             allowed = True  # fail-open: treat as allowed, continue to scope checks
 
         if not allowed:
+            if _is_own_socketpair_connect(event, ip_key, port):
+                return
             global_allowed = False
             display = resolved_from if resolved_from and resolved_from != host else host
             logger.warning(
@@ -1942,7 +2002,10 @@ def _handle_connect(
     #
     # Every denying scope is reported; a log-only one returns and the loop
     # moves on, the first enforcing one raises.
-    for blocking_scope in _check_scopes(scope_stack, hosts, port):
+    denying = _check_scopes(scope_stack, hosts, port)
+    if denying and _is_own_socketpair_connect(event, ip_key, port):
+        return
+    for blocking_scope in denying:
         _enforce_scope_block(
             blocking_scope,
             check_host,

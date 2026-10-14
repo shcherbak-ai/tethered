@@ -6,6 +6,7 @@ import asyncio
 import asyncio.proactor_events
 import contextlib
 import contextvars
+import functools
 import importlib
 import logging
 import os
@@ -2674,6 +2675,325 @@ class TestIPv6Integration:
                 pass  # Connection error is fine, EgressBlocked would be wrong
         finally:
             s.close()
+
+
+def _has_ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def _listening_is_known() -> bool:
+    """Whether ``getsockopt(SO_ACCEPTCONN)`` answers here.  macOS does not."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen()
+            return sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0
+    except (AttributeError, OSError):
+        return False
+
+
+# The exemption needs to know that the fallback's listener listens.  Where the
+# platform cannot say, it never applies; there socketpair() is native anyway.
+_LISTENING_IS_KNOWN = _listening_is_known()
+needs_listening = pytest.mark.skipif(
+    not _LISTENING_IS_KNOWN,
+    reason="the platform cannot say whether a socket listens (macOS); its socketpair() is native",
+)
+
+
+async def _answer() -> int:
+    await asyncio.sleep(0)
+    return 42
+
+
+def _assert_pair_works(pair: tuple[socket.socket, socket.socket]) -> None:
+    """Pass a byte each way through a socket pair, then close it."""
+    a, b = pair
+    with a, b:
+        a.sendall(b"x")
+        assert b.recv(1) == b"x"
+        b.sendall(b"y")
+        assert a.recv(1) == b"y"
+
+
+def _fallback_with(make_socket, code=None):
+    """``socket._fallback_socketpair`` with ``make_socket`` in place of ``socket.socket``.
+
+    The function runs the fallback's own code object unless ``code`` is given.
+    """
+    fallback = socket._fallback_socketpair
+    return types.FunctionType(
+        code or fallback.__code__,
+        {**vars(socket), "socket": make_socket},
+        None,
+        fallback.__defaults__,
+    )
+
+
+class _LetThrough(Exception):
+    """Raised by the listener's accept(): the hook let the fallback's connect through."""
+
+
+class _ConnectsThroughTheHook:
+    """The fallback's connecting socket, whose connect() is ``_audit_hook`` itself.
+
+    Coverage does not see what CPython runs inside an audit hook, so the
+    exemption is also driven by calling the hook.  It has to be called by the
+    fallback's own frame: ``functools.partial`` runs without a frame of its
+    own, so the hook's caller is the fallback, as for a real connect.  The
+    fallback calls ``csock.connect((addr, port))`` with ``addr, port`` read
+    from its listener, which hands it this object and the address to connect
+    to: the two arguments of a ``socket.connect`` event.
+    """
+
+    def __init__(self) -> None:
+        # On the instance: from Python 3.14 a partial in a class is a method.
+        self.connect = functools.partial(_audit_hook, "socket.connect")
+
+    def setblocking(self, flag: bool) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _Listener(socket.socket):
+    """A real listener that hands the fallback the hook's arguments.
+
+    Its address is reported as ``target`` when one is set.  accept() raises
+    :class:`_LetThrough`: it only comes when the hook lets the connect
+    through, and nothing really connected.
+    """
+
+    connector: _ConnectsThroughTheHook
+    target: tuple[str, int] | None = None
+
+    def getsockname(self):
+        return (self.connector, self.target or super().getsockname())
+
+    def accept(self):
+        raise _LetThrough
+
+
+class _NotASocket:
+    """A listener that is no socket and says that it listens at ``target``."""
+
+    connector: _ConnectsThroughTheHook
+
+    def __init__(self, target: tuple[str, int]) -> None:
+        self.target = target
+
+    def bind(self, address) -> None:
+        pass
+
+    def listen(self, *args) -> None:
+        pass
+
+    def getsockname(self):
+        return (self.connector, self.target)
+
+    def accept(self):
+        raise _LetThrough
+
+    def close(self) -> None:
+        pass
+
+
+def _through_the_hook(listener) -> None:
+    """Run the fallback's own code with ``listener``, its connect going straight to the hook.
+
+    Raises :class:`_LetThrough` when the hook lets the connect through and
+    ``EgressBlocked`` when it refuses it.
+    """
+    connector = _ConnectsThroughTheHook()
+    listener.connector = connector
+    made = iter([listener, connector])
+    _fallback_with(lambda *args: next(made))()
+
+
+class TestSocketpairOnLoopback:
+    """The loopback connect of ``socket.socketpair()`` passes a policy without localhost.
+
+    Where the platform has no ``socketpair()`` (Windows), CPython listens on an
+    ephemeral port of 127.0.0.1 or ::1 and connects a second socket to that
+    listener (``socket._fallback_socketpair``), and asyncio does so for every
+    event loop it creates.  With localhost off, that connect was refused, and
+    so was the creation of every event loop.  Elsewhere ``socketpair()`` is
+    native and raises no connect event, so the fallback is also called
+    directly, which tests the exemption on every platform.  Every other
+    loopback connect stays refused, also one made by the fallback's own code
+    to an address that is not its own listener's.
+
+    The tests whose name says "hook" call the hook from the fallback's frame
+    (see :class:`_ConnectsThroughTheHook`); the others go through CPython's
+    audit machinery.
+    """
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_asyncio_run(self, mode):
+        with _deny_all(mode):
+            assert asyncio.run(_answer()) == 42
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_selector_event_loop(self, mode):
+        with _deny_all(mode):
+            loop = asyncio.SelectorEventLoop()
+            try:
+                assert loop.run_until_complete(_answer()) == 42
+            finally:
+                loop.close()
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_socketpair(self, mode):
+        with _deny_all(mode):
+            _assert_pair_works(socket.socketpair())
+
+    @needs_listening
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    @pytest.mark.parametrize(
+        "family",
+        [
+            pytest.param(socket.AF_INET, id="ipv4"),
+            pytest.param(
+                socket.AF_INET6,
+                id="ipv6",
+                marks=pytest.mark.skipif(not _has_ipv6_loopback(), reason="no IPv6 loopback"),
+            ),
+        ],
+    )
+    def test_fallback(self, mode, family):
+        with _deny_all(mode):
+            _assert_pair_works(socket._fallback_socketpair(family))
+
+    @needs_listening
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_hook_lets_the_fallback_through(self, mode):
+        with _deny_all(mode), pytest.raises(_LetThrough):
+            _through_the_hook(_Listener())
+
+    @pytest.mark.skipif(_LISTENING_IS_KNOWN, reason="the platform says whether a socket listens")
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_fallback_is_refused_where_listening_is_unknown(self, mode):
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            socket._fallback_socketpair()
+
+    @pytest.mark.parametrize("mode", ["global", "scope"])
+    @pytest.mark.parametrize("named", [False, True], ids=["unnamed", "named"])
+    def test_a_yes_ends_the_check(self, mode, named, monkeypatch, fake_dns):
+        """Where a layer would refuse, the exemption is asked once, and a yes lets it through.
+
+        The answer is stubbed, so that this holds on every platform, macOS
+        included, where the real answer is never yes.
+        """
+        asked = []
+
+        def yes(event, ip_key, port):
+            asked.append((event, ip_key, port))
+            return True
+
+        fake_dns.table["localhost"] = ["127.0.0.1"]
+        with _restricted(mode, ["localhost:6379"]):
+            if named:
+                _learn("localhost")
+            monkeypatch.setattr(_core, "_is_own_socketpair_connect", yes)
+            _audit_hook("socket.connect", (None, ("127.0.0.1", 5)))
+        assert asked == [("socket.connect", "127.0.0.1", 5)]
+
+    @needs_listening
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_address_with_a_name(self, mode, fake_dns):
+        """127.0.0.1 has a name, which the policy allows on another port."""
+        fake_dns.table["localhost"] = ["127.0.0.1"]
+        with _restricted(mode, ["localhost:6379"]):
+            _learn("localhost")
+            assert _ip_to_hostname.get("127.0.0.1") == ("localhost",)
+            _assert_pair_works(socket._fallback_socketpair())
+            with pytest.raises(_LetThrough):
+                _through_the_hook(_Listener())
+
+    @needs_listening
+    @pytest.mark.parametrize("layer", ["global", "scope"])
+    def test_log_only_reports_nothing(self, layer, caplog):
+        blocked = []
+        options = {
+            "allow": [],
+            "allow_localhost": False,
+            "log_only": True,
+            "on_blocked": lambda host, port: blocked.append((host, port)),
+        }
+        with contextlib.ExitStack() as stack:
+            if layer == "global":
+                tethered.activate(**options)
+            else:
+                stack.enter_context(tethered.scope(**options))
+            with caplog.at_level(logging.WARNING, logger="tethered"):
+                _assert_pair_works(socket._fallback_socketpair())
+        assert blocked == []
+        assert caplog.records == []
+
+    @needs_listening
+    def test_no_hostname_is_resolved_for_it(self, fake_dns, tcp_listener):
+        fake_dns.table["api.example.com"] = ["203.0.113.7"]
+        tethered.activate(allow=["api.example.com"], allow_localhost=False)
+        _learn("api.example.com")
+        calls = len(fake_dns.calls)
+        _assert_pair_works(socket._fallback_socketpair())
+        assert len(fake_dns.calls) == calls
+        # Any other refused connect to an address without a name is searched for one.
+        with socket.socket() as sock, pytest.raises(tethered.EgressBlocked):
+            sock.connect(("127.0.0.1", tcp_listener))
+        assert len(fake_dns.calls) > calls
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_other_loopback_connects_are_refused(self, mode, tcp_listener):
+        with _deny_all(mode), socket.socket() as sock, pytest.raises(tethered.EgressBlocked):
+            sock.connect(("127.0.0.1", tcp_listener))
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_copy_of_the_fallback_is_refused(self, mode):
+        """The same instructions in another code object are not the fallback."""
+        copy = socket._fallback_socketpair.__code__.replace(co_name="copy")
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            _fallback_with(socket.socket, copy)()
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_hook_refuses_a_connect_to_another_listener(self, mode, tcp_listener):
+        """The fallback's code, made to connect elsewhere by a listener that lies."""
+        listener = _Listener()
+        listener.target = ("127.0.0.1", tcp_listener)
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            _through_the_hook(listener)
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_hook_refuses_a_listener_that_does_not_listen(self, mode):
+        """Bound to the address and not listening: whatever else listens there would answer."""
+
+        class Unheard(_Listener):
+            def listen(self, *args):
+                pass
+
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            _through_the_hook(Unheard())
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_hook_refuses_a_listener_that_is_not_a_socket(self, mode, tcp_listener):
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            _through_the_hook(_NotASocket(("127.0.0.1", tcp_listener)))
+
+    @pytest.mark.parametrize("mode", _DENY_MODES)
+    def test_hook_refuses_a_closed_listener(self, mode):
+        class Closed(_Listener):
+            def listen(self, *args):
+                self.target = socket.socket.getsockname(self)
+                self.close()
+
+        with _deny_all(mode), pytest.raises(tethered.EgressBlocked):
+            _through_the_hook(Closed())
 
 
 class TestConcurrency:

@@ -220,7 +220,7 @@ A joined interpreter is told to pass the token although it has none: the token n
 
 **Wildcards** use Python's `fnmatch` syntax. `*` matches any characters **including dots**, so `*.stripe.com` matches both `api.stripe.com` and `a.b.stripe.com`. This differs from TLS certificate wildcards. The characters `?` (single character) and `[seq]` (character set) are also supported. Wildcards match text, not address ranges: `10.*` also allows `10.attacker.example`. Use CIDR for ranges.
 
-**Localhost** (`127.0.0.0/8`, `::1`) is allowed by default; pass `allow_localhost=False` to change that. The addresses `0.0.0.0` and `::` (INADDR_ANY) are treated as localhost.
+**Localhost** (`127.0.0.0/8`, `::1`) is allowed by default; pass `allow_localhost=False` to change that. The addresses `0.0.0.0` and `::` (INADDR_ANY) are treated as localhost. With localhost off, one loopback connection still passes: the one with which `socket.socketpair()` joins its own two sockets on Windows, which every asyncio event loop makes when it is created ([the security model](security.md#what-tethered-protects-against) says how it is recognised).
 
 **Malformed rules raise `ValueError`** at `activate()` / `scope()`; [Rule validation](#rule-validation) lists what is rejected. Hostnames containing whitespace, control characters, or invisible Unicode are rejected and never matched by wildcard rules.
 
