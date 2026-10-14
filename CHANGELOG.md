@@ -279,3 +279,6 @@ The security fixes that can stop a setup that ran on 0.5.3 are under Breaking ch
 [0.3.3]: https://github.com/shcherbak-ai/tethered/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/shcherbak-ai/tethered/compare/v0.2.0...v0.3.2
 [0.2.0]: https://github.com/shcherbak-ai/tethered/compare/v0.1.4...v0.2.0
+
+<!-- The documentation site includes this file, and nests a list item only at four spaces. -->
+<!-- markdownlint-configure-file { "ul-indent": { "indent": 4 } } -->

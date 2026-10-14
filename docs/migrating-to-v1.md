@@ -13,7 +13,7 @@ No function, parameter or exception was renamed or removed: `activate()`, `scope
 
 | If the deployment | Read |
 |---|---|
-| runs on Python 3.10 | [Python 3.11 or later](#python-311-or-later) |
+| runs on Python 3.10 | [Python version](#python-version) |
 | serves with uvicorn, FastAPI, hypercorn, granian or sanic, or has uvloop installed for another reason | [uvloop](#uvloop) |
 | uses aiohttp with aiodns, or pycares itself | [pycares and aiodns](#pycares-and-aiodns) |
 | has an allow list that was never checked rule by rule | [Allow rules](#allow-rules) |
@@ -24,11 +24,11 @@ No function, parameter or exception was renamed or removed: `activate()`, `scope
 | runs a `log_only` rollout, or filters and alerts on tethered's log lines | [Log lines and messages](#log-lines-and-messages) |
 | copied the Django middleware from the cookbook | [Recipes and links](#recipes-and-links) |
 
-Two further sections are for everyone: [fixes that refuse what 0.5.3 let through](#fixes-that-refuse-what-053-let-through), and [what became less strict](#what-became-less-strict), with the workarounds that are no longer needed.
+Two further sections are for everyone: [fixes that refuse more](#fixes-that-refuse-more) than 0.5.3 did, and [what became less strict](#what-became-less-strict), with the workarounds that are no longer needed.
 
 ## How to upgrade
 
-1. **Move to Python 3.11 or later** if the environment is on 3.10 ([below](#python-311-or-later)).
+1. **Move to Python 3.11 or later** if the environment is on 3.10 ([below](#python-version)).
 2. **Upgrade from a shell or a deployment step, with the application stopped.**
 
     ```bash
@@ -40,7 +40,7 @@ Two further sections are for everyone: [fixes that refuse what 0.5.3 let through
 3. **Stop and start; do not reload.** A process that keeps running keeps the tethered it imported, while the Python children it starts load the new one, and a 1.0.0 child that is handed a locked or fail-closed policy with a rule it rejects does not start. A reload that re-executes the server (gunicorn's `SIGUSR2`, a uWSGI reload) also hands a locked policy on to the new process, which cannot replace it ([changing a locked policy](COOKBOOK.md#changing-a-locked-policy)).
 4. **Start it once where a failed start costs nothing, and read the log.** Everything below shows as an exception or as a `tethered:` line in the log, and each message says what to change.
 
-## Python 3.11 or later
+## Python version
 
 tethered 1.0.0 requires Python 3.11 and has no wheels for 3.10, which reached the end of its security support in October 2026. An installer leaves an environment on Python 3.10 at 0.5.3, without the fixes of this release.
 
@@ -215,7 +215,7 @@ New lines, each logged once per process (the one about a rule once per rule):
 | `tethered: ... is not the file tethered installs under that name` | Another distribution replaced `tethered.pth`; Python children will not inherit | Remove that distribution and reinstall tethered |
 | `tethered: ... is switched off by the tethered.start file beside it` | From Python 3.15 that file stops the bootstrap | Remove the file |
 
-## Fixes that refuse what 0.5.3 let through
+## Fixes that refuse more
 
 The changelog does not mark these as breaking: each closes a way around a policy. They can still show as a refusal that 0.5.3 did not make.
 
