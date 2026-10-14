@@ -46,12 +46,13 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       # uv python install without a version: the one .python-version names.
+      # --locked: fail when uv.lock does not match pyproject.toml, so the
+      # build runs on the setuptools the lock names.
       - name: Build C extension (for CodeQL tracing)
         if: matrix.language == 'c-cpp'
         run: |
           uv python install
-          uv venv
-          uv pip install setuptools
+          uv sync --locked
           uv run python setup.py build_ext --inplace
 
       - name: Perform CodeQL analysis
