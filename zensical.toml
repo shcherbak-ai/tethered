@@ -119,7 +119,7 @@ markdown_description = "tethered checks every connection made through Python's s
 "Reference" = [
   { "API.md" = "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode, log-only mode and the preflight check python -m tethered check." },
   { "COMPATIBILITY.md" = "What tethered enforces, what needs configuration, what it refuses at start-up and what it does not see, measured under real servers, task queues and client libraries." },
-  { "ARCHITECTURE.md" = "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, and the measured overhead." },
+  { "ARCHITECTURE.md" = "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, the measured overhead, and what tethered relies on that CPython does not promise." },
 ]
 "Security" = [
   { "security.md" = "The tethered security model: the threat model, what tethered protects against and what it does not, and what locked mode does and does not do." },

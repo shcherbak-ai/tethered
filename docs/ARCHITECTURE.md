@@ -1,6 +1,6 @@
 ---
 title: "Architecture"
-description: "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, and the measured overhead."
+description: "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, the measured overhead, and what tethered relies on that CPython does not promise."
 ---
 
 # Architecture — how tethered works
@@ -214,3 +214,143 @@ When a connect goes to an address that no name is known for and that no layer al
 - **Without a cache, each name searched is an upstream round trip.** Under a log-only policy nearly every connection that the policy would refuse is to an address no name is known for (a lookup the policy does not allow records nothing), so each of them goes ahead up to 30 round trips late. Under an enforcing policy the search delays the refusal of an address that no rule allows, and the decision on an address that tethered's own lookup of the name did not return (see [the security model](security.md#known-residual-dns-divergence)).
 - **Under gevent the search holds up the whole process.** It runs in the greenlet that connects, in the hub's thread, through `_socket.getaddrinfo`, which gevent does not patch, so no other greenlet runs until it is over.
 - An address that an IP or CIDR rule allows is never searched for, and a caching stub answers each name of the search locally. Where neither applies, as in a log-only rollout in an image without a cache, expect each such connect to wait one upstream round trip for every name tethered has let through recently, up to 30.
+
+## What tethered relies on
+
+Besides deciding at the audit events it handles, tethered reaches into the process in a few other ways: it writes into the frame of another function, carries out a call for its caller, recognises code by its code object or a private name, reads state below Python, and refuses imports. Each of these, and the audit events themselves, rests on things that CPython, the standard library or another library does not promise to keep: private names, the layout of a frame, the order of an event's arguments, behaviour nobody documents. When one of them changes, the mechanism built on it breaks in its own way. This section lists them all.
+
+Each entry says what tethered does, and then:
+
+- **Relies on:** the private name or the behaviour, with the Python versions and platforms where it applies.
+- **Needed by:** the setup that needs the mechanism, with the evidence: a container suite (`tests_containers/suites/<name>`), a test in `tests/`, or an entry of [the changelog](changelog.md).
+- **Pinned by:** the test that checks the assumption. Most are in `tests/test_cpython_internals.py`, which asserts each assumption directly against the interpreter it runs on, names the entry in its failure messages, and runs on every supported version and on the newest pre-release of the next one (the `next-python.yml` workflow).
+
+### Audit events
+
+- **The socket events.** `_audit_hook` decides at `socket.getaddrinfo`, `socket.connect`, `socket.sendto`, `socket.sendmsg`, `socket.gethostbyname` and `socket.gethostbyaddr`, and gives its one-time warnings at `socket.__new__`. The C guardian names the host of the same events in its refusals.
+    - Relies on: the arguments as CPython 3.11–3.15 raise them. `socket.getaddrinfo` carries `(host, port, family, type, protocol)` and not the caller's flags; the events that connect or send carry `(socket, address)`, `connect_ex()` raises `socket.connect`, and `sendmsg()` on a connected socket raises `socket.sendmsg` with `None` for the address; the lookups carry `(host,)`, and `gethostbyname_ex()` raises `socket.gethostbyname`. The table of audit events documents the names and the arguments, not these details.
+    - Needed by: every client library tethered covers (`tests_containers/suites/clients`). The `None` address by asyncio's selector transports, which write with `sendmsg()` from Python 3.12 (`tests_containers/suites/uvicorn`, a large response; changelog 1.0.0, Security).
+    - Pinned by: `TestSocketEvents`; the `sendmsg()` form by `TestAddressShapes::test_a_connected_socket_can_sendmsg_under_a_policy` in `tests/test_core.py`.
+- **The import event.** While a policy that is not log-only is active, `_refuse_import` raises `ImportError` at the `import` event of `uvloop`, `uvloop.loop`, `pycares` or `pycares._cares`.
+    - Relies on: CPython raising `import` with the absolute name of a module that is not in `sys.modules` yet, before it looks for it; `importlib.import_module("uvloop")` raising no event for the package itself, only for what its `__init__` imports; the names of the extension modules inside uvloop and pycares, which are theirs to change; and what the code that prefers them does with the `ImportError`: uvicorn and its gunicorn worker take the standard event loop, aiohttp its threaded resolver.
+    - Needed by: uvicorn, which runs on uvloop whenever it is installed, and aiohttp with aiodns installed (`tests_containers/suites/uvicorn`, `gunicorn_uvicorn`, `fastapi`, `hypercorn`, `granian`, `sanic`, `aiohttp`, `clients`; changelog 1.0.0, Breaking changes).
+    - Pinned by: `TestUvloopRefusal` and `TestPycaresRefusal` in `tests/test_core.py`, which import stand-in packages for real; the libraries themselves by the container suites.
+- **The end of site's work.** The C guardian lets an interpreter join a locked policy only until that interpreter raises the `import` event for `sitecustomize`.
+    - Relies on: `site.main()` importing `sitecustomize` after it has run the import lines of the `.pth` files (and, from Python 3.15, the entry points of the `.start` files), raising the event whether or not the module exists, in every interpreter it starts, a subinterpreter before the call that creates it returns; and on no such event in a process that runs with `-S`.
+    - Needed by: interpreters created under a lock: mod_wsgi's application groups, uWSGI's mounted applications, `InterpreterPoolExecutor` (`tests_containers/suites/modwsgi`, `uwsgi`, `stdlib_pools`; changelog 1.0.0, Breaking changes, Locked mode).
+    - Pinned by: `TestSiteStartup`; `TestJoinedInterpreter` and `TestAProcessWithoutSite` in `tests/test_subinterpreters.py`.
+- **The launch events.** `_handle_subprocess` classifies a launch and establishes the policy in its environment at `subprocess.Popen`, `os.exec`, `os.posix_spawn`, `os.spawn`, `os.system`, `os.startfile`, `_winapi.CreateProcess` and `_posixsubprocess.fork_exec`.
+    - Relies on: their arguments. `subprocess.Popen` carries `(executable, args, cwd, env)`; `os.exec` and `os.posix_spawn` carry `(path, args, env)`; `os.spawn`, raised on Windows only, carries `(mode, path, args, env)`; `_winapi.CreateProcess` carries `(application_name, command_line, current_directory)`, without the environment and, on CPython 3.11–3.15, with a command line that arrives garbled; `_posixsubprocess.fork_exec`, raised from Python 3.14, carries `(executables, args, env)`, the environment as `b"NAME=value"` entries. And on `subprocess` raising a second event for its own launches (`_winapi.CreateProcess`, `_posixsubprocess.fork_exec` or `os.posix_spawn`) with `_execute_child` on the stack, which is how such a launch is handled once.
+    - Needed by: every launch; the two native events by multiprocessing and `ProcessPoolExecutor`, whose workers raise no `subprocess.Popen` (`tests_containers/suites/stdlib_pools`; changelog 1.0.0, Security).
+    - Pinned by: `TestLaunchEvents`; the garbled command line by `test_real_create_process_event_does_not_carry_the_command_line`, and real pools by `test_spawn_worker_is_protected_after_a_whitelist_cleanup`, both in `TestLaunchesThatBypassPopen` in `tests/test_subprocess.py`.
+- **The file and environment events.** Under a lock, `_handle_pth_fs_op` and the guardian's pre-filter find the paths of `open`, `os.remove`, `os.rename`, `os.link`, `os.symlink`, `os.chmod`, `os.truncate` and `_winapi.CopyFile2`, and `_handle_env_change` and the guardian the name of `os.putenv` and `os.unsetenv`.
+    - Relies on: `open` carrying `(path, mode, flags)`, with `None` for the mode of `os.open()`; `os.remove` carrying `(path, dir_fd)`, and `os.unlink()` raising it; `os.rename` (also raised by `os.replace()`) and `os.link` carrying `(src, dst, src_dir_fd, dst_dir_fd)`; `os.symlink` carrying `(src, dst, dir_fd)`; `os.chmod` `(path, mode, dir_fd)`; `os.truncate` `(path, length)`; `_winapi.CopyFile2` `(existing, new, flags)`, through which `shutil.copy2()` writes on Windows from Python 3.12; `os.putenv` and `os.unsetenv` carrying `(name, value)` and `(name,)`, bytes on POSIX and `str` on Windows, also for a change made through `os.environ`, which raises them before it changes.
+    - Needed by: pip, `shutil.rmtree()` and uv's hard links, which reach the hook through names the guard has to recognise (changelog 1.0.0, Security), and every change to the policy variable.
+    - Pinned by: `TestFileAndEnvironmentEvents`; the guard on real operations by `TestPthGuardByAnotherName` and `TestStartFileGuard` in `tests/test_guardian.py`.
+
+### Frames, code objects and private names
+
+- **The env of _execute_child.** For a `subprocess.Popen` launch whose environment has to change (an active scope, a missing policy variable), `_inject_launch_env` writes a new mapping into the `env` local of the `_execute_child` frame.
+    - Relies on: the event being raised by `subprocess.Popen._execute_child`, a function of that name in the module `subprocess`, which keeps the environment in a local named `env` and reads it after the event; on Python 3.13 and later on the write-through `frame.f_locals` of PEP 667, and on 3.11–3.12 on `ctypes.pythonapi.PyFrame_LocalsToFast`, a C function that PEP 667 deprecates.
+    - Needed by: a scope that a Python child has to inherit (`tests_containers/suites/gunicorn`, `uvicorn` and `celery`, `test_scopes.py`; changelog 0.5.0, Added), and an explicit environment without the variable, which ordinary code passes: `ctypes.util.find_library()` runs `ldconfig` with one, which under a lock refused `import trio`, asyncssh and psycopg 3 (`tests_containers/suites/clients`, `modwsgi`, `uwsgi`; changelog 1.0.0, Fixed).
+    - Pinned by: `TestLaunchEvents::test_popen_is_raised_in_execute_child_which_reads_env_afterwards`; `TestFrameMutationHelpers` and `TestScopeSubprocessPropagation` in `tests/test_subprocess.py`.
+- **An exec carried out for the caller.** For an `os.exec*` of this interpreter whose environment lacks the policy variable or an active scope, `_exec_with_policy` makes the call itself, from inside the hook, with a completed copy of the environment.
+    - Relies on: `os.exec*` having converted the environment by the time it raises its event, so that nothing written to the caller's mapping arrives; an `os.execve()` made from inside an audit hook replacing the process like the caller's own call would; and its `OSError`, if it fails, leaving the hook as the caller's own error, which `os.execvp*()` takes to try the next directory of `PATH`.
+    - Needed by: gunicorn's binary upgrade (`SIGUSR2`) under `--preload` with a locked policy (`tests_containers/suites/gunicorn`, `test_upgrade.py`), and gevent's `Popen`, which forks and calls `os.exec*` from Python, for a scope (`tests_containers/suites/gunicorn_gevent` and `celery`, `test_scopes.py`; changelog 1.0.0, Fixed).
+    - Pinned by: `TestExecWithPolicy` and `TestExecCarriesTheScope` in `tests/test_subprocess.py`, which exec for real in a child process on POSIX; the event by `TestLaunchEvents::test_exec_carries_path_argv_and_environment`.
+- **multiprocessing's Windows spawner.** For a `_winapi.CreateProcess` from `multiprocessing.popen_spawn_win32`, `_resolve_winapi_launch` reads the worker's environment from the spawner's frame and completes it in place.
+    - Relies on: `Popen.__init__` of that module keeping the environment in a local named `env` and passing it to `_winapi.CreateProcess`, which reads it after its audit event; and on the spawner launching `sys._base_executable`, a private name, with `__PYVENV_LAUNCHER__` set to `sys.executable` inside a virtual environment (bpo-35797). Windows only.
+    - Needed by: multiprocessing and `ProcessPoolExecutor` workers on Windows, in a virtual environment under `external_subprocess_policy="block"` (changelog 1.0.0, Security).
+    - Pinned by: `TestWindowsSpawner`; real pools by `TestLaunchesThatBypassPopen::test_multiprocessing_pool_keeps_working` in `tests/test_subprocess.py`.
+- **Other copies of that spawner.** When the base interpreter is launched from anywhere else, `_find_venv_launcher_env` looks among the locals of the calling frame for a mapping with `__PYVENV_LAUNCHER__` set to `sys.executable`.
+    - Relies on: joblib's loky and billiard keeping their copy of the spawner's environment in a local of the frame that calls `_winapi.CreateProcess`, under any name. Windows only, inside a virtual environment.
+    - Needed by: joblib's process pools and billiard on Windows, whose workers were refused under `"block"` (checked by hand against joblib 1.6.0; no container suite runs on Windows).
+    - Pinned by: `TestLaunchesThatBypassPopen::test_third_party_venv_spawn_is_a_launch_of_sys_executable` in `tests/test_subprocess.py`, with a stand-in for the library.
+- **socketpair()'s own connection.** `_is_own_socketpair_connect` lets through the loopback connection with which `socket.socketpair()` joins its two sockets where the platform has no `socketpair()` of its own.
+    - Relies on: `socket.socketpair` being CPython's fallback on Windows (`socket._fallback_socketpair`, which older patch releases such as 3.11.9 do not name apart), whose code object tethered takes when it is imported; that function listening on 127.0.0.1 or ::1 in a local named `lsock` and calling `connect()` from its own frame, three frames above `_is_own_socketpair_connect`; and `getsockopt(SO_ACCEPTCONN)`, which Windows and Linux answer and macOS does not.
+    - Needed by: every asyncio event loop on Windows under a policy or scope with `allow_localhost=False` (changelog 1.0.1, Fixed).
+    - Pinned by: `TestSocketpairFallback`; `TestSocketpairOnLoopback` in `tests/test_core.py`, with the `needs_listening` mark for macOS.
+- **The caller of resolve().** The C guardian's `resolve()` serves only `_handle_getaddrinfo` and `_fallback_resolve`, which it recognises by the code object of the frame that calls it.
+    - Relies on: `PyEval_GetFrame()`, called in a C function that Python code calls, returning that Python function's frame.
+    - Needed by: locked mode's own lookups, which a replaced `_socket.getaddrinfo` or a set reentrancy flag must not take over (changelog 0.5.0, Changed, and 1.0.0, Security).
+    - Pinned by: `TestResolverWindow` and `TestContextVarTamperDetection` in `tests/test_guardian.py`.
+- **_socket under gevent and eventlet.** tethered resolves names through `_socket.getaddrinfo`, and reads sockets through the methods of `_socket.socket`, never through the `socket` module.
+    - Relies on: gevent and eventlet patching the `socket` module and leaving `_socket` alone.
+    - Needed by: gunicorn's gevent workers and Celery's gevent and eventlet pools (`tests_containers/suites/gunicorn_gevent`, `celery`; changelog 0.5.0, Fixed).
+    - Pinned by: the container suites.
+- **Locks after fork.** In a forked child, `_reinit_locks_after_fork` resets tethered's locks in place with `_at_fork_reinit()`, and leaves a re-entrant lock alone when `_is_owned()` says the forking thread holds it.
+    - Relies on: those two private methods of the lock types of `_thread`, which `threading` and `logging` use for the same purpose. POSIX only, where they exist.
+    - Needed by: a process that forks while another thread holds one of tethered's locks (changelog 1.0.0, Fixed).
+    - Pinned by: `test_lock_types_can_be_reset_after_a_fork`; `TestLocksAfterFork` in `tests/test_lifecycle.py`, which forks for real.
+- **The fork server's process.** `_warn_if_fork_server_runs` reads `multiprocessing.forkserver._forkserver._forkserver_pid`, a private attribute, to see whether a fork server was started before the policy.
+    - Relies on: that attribute being `None` until the fork server runs and its process ID after. POSIX only.
+    - Needed by: pools of the `forkserver` start method, the default on Linux from Python 3.14 (`tests_containers/suites/stdlib_pools`; changelog 1.0.0, Added).
+    - Pinned by: `test_the_fork_server_keeps_its_pid_where_tethered_reads_it`.
+- **The running Proactor loop.** For its warning, `_proactor_loop_running` asks `asyncio._get_running_loop()` whether the loop that runs is an `asyncio.proactor_events.BaseProactorEventLoop`.
+    - Relies on: those two names, and on the Proactor loop raising no `socket.connect` / `socket.sendto` event. Windows only.
+    - Needed by: asyncio on Windows, whose default loop is the Proactor loop (changelog 1.0.0, Added).
+    - Pinned by: `TestProactorLoopWarning` in `tests/test_core.py`.
+- **Which interpreter this is.** `_in_subinterpreter`, in the bootstrap, tells a subinterpreter from the main interpreter, so that an inherited locked policy is established unlocked there when no lock is held.
+    - Relies on: the private modules `_interpreters` (Python 3.13+) and `_xxsubinterpreters` (3.11–3.12), whose `get_current()` and `get_main()` return an interpreter ID, from 3.13 as an `(id, whence)` pair.
+    - Needed by: subinterpreters that inherit a locked policy in a process that holds no lock (changelog 1.0.0, Breaking changes, Child processes).
+    - Pinned by: `TestInterpreters`.
+
+### Interpreter startup
+
+- **The .pth import line.** The bootstrap is the one line of `tethered.pth`, `import os; "_TETHERED_CHILD_POLICY" in os.environ and __import__("tethered._autoactivate")`; a child that cannot establish a locked or fail-closed policy raises `SystemExit` there.
+    - Relies on: `site.py` executing a line of a `.pth` file that begins with `import` in every site directory it processes, in every interpreter it starts, subinterpreters included, up to Python 3.17 (PEP 829: 3.18 ignores such lines); reporting any other exception from it and going on, while `SystemExit` ends the start of the interpreter; and, up to 3.14, reading a virtual environment's site-packages twice, which runs the line twice, the second time with nothing to import.
+    - Needed by: every Python child process and every new interpreter that inherits a policy (changelog 0.5.0, Added; 1.0.0, Breaking changes, Child processes).
+    - Pinned by: `TestSiteStartup`; `TestAutoactivateIntegration` and `TestChildStartupFailsClosed` in `tests/test_autoactivate.py`.
+- **A .start file beside it.** `_start_file_beside` takes a `tethered.start` beside the hook for a hook that is switched off, and the locked-mode guard refuses to create one.
+    - Relies on: PEP 829 as Python 3.15 implements it: the import lines of `<name>.pth` are not run while a `<name>.start` file lies beside it, whatever that file holds. `site.py` passes over a hidden `.start` file and one it cannot read; tethered counts those as switching the hook off.
+    - Needed by: a hook that must not be switched off without anyone noticing (changelog 1.0.0, Security).
+    - Pinned by: `test_cpython_ignores_a_pth_import_line_beside_a_start_file` in `tests/test_guardian.py`. What a `tethered.start` of tethered's own would rely on, an entry point that can end the start of the interpreter, by `TestSiteStartup::test_system_exit_from_a_start_entry_point_stops_startup`.
+- **Where site.py looks.** `_pth_candidates` and `_is_user_site_pth` find the hook where `site.py` would run it, and `_is_bootstrap_file` reads it as `site.py` does.
+    - Relies on: `site.getsitepackages()` accepting a list of prefixes (an undocumented parameter), `site.PREFIXES`, `site.ENABLE_USER_SITE`, `site.USER_SITE` and `sys.flags.no_site`, and on `.pth` files being read as UTF-8 with an optional byte-order mark.
+    - Needed by: finding the hook, which an editable or `--target` install does not have (changelog 1.0.0, Security).
+    - Pinned by: `TestComputePthPath` and `TestBootstrapFile` in `tests/test_subprocess.py`.
+
+### The command line of a child
+
+- **The interpreter's options.** `_interpreter_flags` reads the options of a launch of this interpreter the way CPython does, to find `-S`, `-s` and `-I`. An option it does not know makes the launch an external one.
+    - Relies on: the options CPython accepts (`Python/getopt.c`), the same in 3.11–3.15.
+    - Needed by: every Python child; a misread option made launches external, or let `-S` through (changelog 1.0.0, Fixed and Security).
+    - Pinned by: `test_every_option_the_interpreter_lists_is_one_tethered_parses`.
+- **Windows command lines.** `_parse_windows_cmdline` splits a command line the way the Microsoft C runtime does, and `_join_windows_argv` joins the argument list of `os.spawn*` / `os.exec*` the way the C runtime does on Windows.
+    - Relies on: the C runtime's rules for splitting, and its joining of those argument lists with spaces, without quoting. Windows only.
+    - Needed by: finding `-S` in a Windows launch (changelog 1.0.0, Security).
+    - Pinned by: `test_windows_cmdline_split_matches_real_child` in `tests/test_subprocess.py`; `test_windows_spawn_joins_its_arguments_unquoted`.
+- **An interpreter that embeds Python.** `_sys_executable_is_python` takes an interpreter whose `sys.orig_argv` is empty and whose `sys.executable` is not named like an interpreter for one that a program embeds.
+    - Relies on: an embedded interpreter having no command line in `sys.orig_argv`, and uWSGI leaving the path of its own binary in `sys.executable`.
+    - Needed by: uWSGI without `--py-sys-executable` (`tests_containers/suites/uwsgi`; changelog 1.0.0, Security).
+    - Pinned by: the uwsgi suite; `TestSysExecutableThatIsNotPython` in `tests/test_subprocess.py`.
+
+### Below Python: the C guardian
+
+- **The process environment.** `process_policy_env()` reads `_TETHERED_CHILD_POLICY` from the environment of the process with `getenv` or `GetEnvironmentVariableW`, for the launch check under a lock and for the bootstrap of a new interpreter.
+    - Relies on: that being the environment a child that is given none inherits, and `os.environ` being a copy each interpreter takes when it starts.
+    - Needed by: a process with several interpreters, and a change made below Python (changelog 1.0.0, Security).
+    - Pinned by: `TestProcessEnvironmentUnderALock` in `tests/test_subprocess.py`; `TestBootstrapTakesItsTurn` in `tests/test_autoactivate.py`.
+- **Interpreter IDs and hooks.** The guardian knows the lock holder, the joined interpreters and the startup windows by interpreter ID, and records which interpreters existed when its hook was added.
+    - Relies on: `PyInterpreterState_GetID()` giving out IDs in ascending order and never twice; `PyInterpreterState_Head()` / `PyInterpreterState_Next()` listing the interpreters; a hook added with `PySys_AddAuditHook()` being called for the events of every interpreter of the process, while one added with `sys.addaudithook()` belongs to one interpreter.
+    - Needed by: a lock in a process with several interpreters (`tests_containers/suites/modwsgi`, `uwsgi`, `stdlib_pools`; changelog 1.0.0, Breaking changes, Locked mode).
+    - Pinned by: `TestInterpreters::test_an_interpreter_id_is_never_given_out_twice`; `TestLockedPolicy` and `TestTakingTurns` in `tests/test_subinterpreters.py`.
+- **Shutdown.** A thread that waits for the activation claim stops waiting when the runtime shuts down.
+    - Relies on: `Py_IsFinalizing()`, public from Python 3.13, and before that `Py_IsInitialized()` turning false in the same step.
+    - Needed by: an `activate()` or `deactivate()` that is under way in another thread while Python shuts down.
+    - Pinned by: `TestActivationClaim` in `tests/test_lifecycle.py`.
+- **A hook that is refused.** `_install_hook()` and the guardian confirm that their audit hook was added with a private probe event.
+    - Relies on: `sys.addaudithook()` and `PySys_AddAuditHook()` dropping a new hook without an error when an existing hook raises `RuntimeError` for the `sys.addaudithook` event, as documented.
+    - Needed by: a process in which another audit hook refuses new ones (changelog 1.0.0, Breaking changes).
+    - Pinned by: `TestHookInstallation` in `tests/test_lifecycle.py` and in `tests/test_guardian.py`, with a refusing hook in a child process.
+
+### Other libraries
+
+- **asyncio's lookups in a thread.** While any scope is active in the process, `_audit_hook` records a lookup that is made in a context with no policy and no scope.
+    - Relies on: `loop.getaddrinfo()` of asyncio's selector loop calling `socket.getaddrinfo` in an executor thread that does not carry the caller's context.
+    - Needed by: `scope()` under asyncio (`tests_containers/suites/uvicorn`, `test_scopes.py`; changelog 1.0.0, Fixed).
+    - Pinned by: `TestScopeUnderAsyncio` and `TestActiveScopeCount` in `tests/test_core.py`.
+- **tethered's own lookups.** `_handle_getaddrinfo` resolves an allowed name a second time to learn its addresses, and `_fallback_resolve` resolves recently allowed names again when a connection goes to an address it does not know.
+    - Relies on: the two lookups of one name returning the same addresses. A caching stub between the process and the upstream makes them agree for any TTL above 0; without one, a name whose answers change from query to query diverges, and the fallback search repairs only part of it ([measured](security.md#known-residual-dns-divergence)).
+    - Needed by: load-balanced hosts (changelog 0.5.0, Fixed).
+    - Pinned by: `TestFallbackResolve` in `tests/test_core.py`; measured with `benchmarks/dns_lookups.py`.
