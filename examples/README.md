@@ -20,7 +20,7 @@ uv run python examples/01_basic_activate.py
 | [07_log_only.py](07_log_only.py) | Log-only mode with an `on_blocked` callback: report without blocking |
 | [08_scope_in_threads.py](08_scope_in_threads.py) | A scope inside the workers of a thread pool |
 | [09_async_scope.py](09_async_scope.py) | `scope()` on async functions, as a decorator and as a context manager |
-| [10_package_maintainer.py](10_package_maintainer.py) | A library that restricts itself with `scope()` and leaves `activate()` to the application |
+| [10_package_maintainer.py](10_package_maintainer.py) | A library that finds the hosts it contacts with a log-only scope and publishes them, and an application that puts them into its policy |
 | [11_subprocess_control.py](11_subprocess_control.py) | Python child processes inheriting the policy, and `external_subprocess_policy` |
 | [12_scope_subprocess.py](12_scope_subprocess.py) | A scope reaching a child process launched inside it |
 

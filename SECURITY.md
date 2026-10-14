@@ -10,7 +10,7 @@ Confirmed vulnerabilities will be addressed in a patch release.
 
 ## Security model
 
-tethered is a defense-in-depth guardrail, not a security sandbox. It intercepts Python-level socket operations. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it, and ordinary libraries do the same without any intent when they resolve names and connect inside a C library of their own. For full process isolation, combine tethered with OS-level controls (containers, seccomp, network namespaces).
+tethered is a defense-in-depth guardrail, not a security sandbox. It intercepts Python-level socket operations. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it, and ordinary libraries do the same without any intent when they resolve names and connect inside a C library of their own. For a guarantee, combine tethered with controls below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces.
 
 The model is described in the documentation, on the [security model](https://tethered.shcherbak.ai/security/) page:
 

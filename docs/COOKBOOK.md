@@ -1,6 +1,6 @@
 ---
 title: "Cookbook"
-description: "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, and patterns for package authors."
+description: "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, how to label a scope, and how package authors use tethered in their tests."
 ---
 
 # Cookbook — frameworks, servers, blocked connections
@@ -522,83 +522,69 @@ In all of these a refused task fails like any task that raises: the workers keep
 
 Under an unlocked policy a worker interpreter that starts after `activate()` activates the same policy for itself; one that already existed holds none.
 
-## For package authors
+## Scopes in an application
 
-Patterns for libraries that want to use tethered for self-defense without interfering with the host application.
+A `scope()` holds one code path of the application to the destinations it needs: a request handler, a job, a call into a third-party SDK. Like the policy of the process, it is the application's to set.
 
-### Use `scope()`, never `activate()`
+### Name a scope with `label=`
 
-`activate()` is process-wide. A library doesn't own the process — the application does. Calling `activate()` from a library would override the host application's policy and is treated as hostile. Use `scope()`: it's context-local, intersection-only (can never widen the host's policy), and safe to combine with whatever the host already has set up.
+The `label=` is what `EgressBlocked.scope_label` and tethered's log lines carry when the scope blocks something. Use a name that says where the scope is (`"<class>.<method>"` or `"<module>.<function>"`). Without `label=`, tethered derives the label from the first few allow rules.
 
 ```python
 import tethered
 
-class WeatherClient:
-    @tethered.scope(
-        allow=["api.weatherapi.com:443"],
-        label="WeatherClient.get_forecast",
-    )
-    def get_forecast(self, city: str) -> str:
+class PaymentService:
+    @tethered.scope(allow=["api.stripe.com:443"], label="PaymentService.charge")
+    def charge(self, amount: int, token: str) -> dict:
         # nothing in this method or what it calls can reach
-        # anything except api.weatherapi.com:443
+        # anything except api.stripe.com:443
         ...
 ```
 
-The `label=` is what users will see in `EgressBlocked.scope_label` and tethered's log messages when this scope blocks something. Use a descriptive name (`"<class>.<method>"` or `"<module>.<function>"`) so blocks are attributable to your library, not to a generic `"scope(api.weatherapi.com:443)"` derived from the allow list. Without `label=`, tethered auto-derives the label from the first few allow rules.
-
 ### `scope()` in generators and under asyncio
 
-`@tethered.scope` cannot decorate a generator or async generator function; it raises `TypeError`. Inside a generator, wrap each I/O call in its own `with tethered.scope(...)` block and do not `yield` inside one. A scope that is open across a `yield` stays active in the consumer's context until the generator resumes, so your caller's code would run under your restriction.
+`@tethered.scope` cannot decorate a generator or async generator function; it raises `TypeError`. Inside a generator, wrap each I/O call in its own `with tethered.scope(...)` block and do not `yield` inside one. A scope that is open across a `yield` stays active in the consumer's context until the generator resumes, so the consumer's code would run under the restriction.
 
 ```python
 def iter_pages(client):
     url = FIRST_PAGE
     while url:
-        with tethered.scope(allow=["api.mylib.com:443"], label="mylib.iter_pages"):
+        with tethered.scope(allow=["api.example.com:443"], label="pages.iter_pages"):
             page = client.get(url).json()  # the I/O call is scoped
         yield page["items"]  # no scope is open across the yield
         url = page.get("next")
 ```
 
-When your library is used from asyncio:
+Under asyncio:
 
-- **Lookups run in an executor thread.** asyncio resolves names with `loop.getaddrinfo`, which runs in a thread that does not carry your scope. The scope's DNS-time check does not apply to that lookup; the connection that follows is checked against the scope. If the host application has called `activate()`, its policy does apply to the lookup.
+- **Lookups run in an executor thread.** asyncio resolves names with `loop.getaddrinfo`, which runs in a thread that does not carry the scope. The scope's DNS-time check does not apply to that lookup; the connection that follows is checked against the scope. If the application has called `activate()`, its policy does apply to the lookup.
 - **Await tasks inside the block.** A task created inside a `with tethered.scope(...)` block keeps the scope after the block exits. If the application has not called `activate()`, a hostname such a task looks up after the block has exited is no longer recorded, and its connection is blocked.
-- **uvloop.** On a uvloop event loop, nothing your library does through the loop raises an audit event: connections, lookups, datagrams and `asyncio.create_subprocess_exec` launches are not checked against your scope at all, and nothing is logged for them. Where the application has called `activate()` with an enforcing policy this cannot happen, because tethered keeps uvloop out of such a process. A `scope()` used on its own does not: it neither refuses the import of uvloop nor refuses to be entered over a loaded one. tethered logs a one-time warning when a scope is entered with uvloop loaded. uvicorn uses uvloop by default when it is installed, so an application without a policy of its own may well run on it.
-- **Windows.** On the default `ProactorEventLoop`, connections raise no audit event, so your scope's connect-time check does not run. tethered logs a one-time warning.
-- **The event loop belongs to the application**, so a library can fix neither of the two. State in your documentation that enforcement under asyncio needs asyncio's own selector event loop: not uvloop, and on Windows `asyncio.SelectorEventLoop` in place of the default `ProactorEventLoop`.
-- **`httpx.AsyncClient` wraps connect-time refusals.** A refused connection reaches your code inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch; use `except*` (see [Django / FastAPI middleware](#django--fastapi-middleware)). Keep that in mind for the wrapper patterns below, which are written with a plain `except`.
+- **uvloop.** On a uvloop event loop, nothing that goes through the loop raises an audit event: connections, lookups, datagrams and `asyncio.create_subprocess_exec` launches are not checked against the scope at all, and nothing is logged for them. An `activate()` policy that enforces keeps uvloop out of the process. A `scope()` used on its own does not: it neither refuses the import of uvloop nor refuses to be entered over a loaded one, and logs a one-time warning when it is entered with uvloop loaded. uvicorn uses uvloop by default when it is installed.
+- **Windows.** On the default `ProactorEventLoop`, connections raise no audit event, so the scope's connect-time check does not run. tethered logs a one-time warning.
+- **Run asyncio's own selector event loop:** not uvloop, and on Windows `asyncio.SelectorEventLoop` in place of the default `ProactorEventLoop`.
+- **`httpx.AsyncClient` wraps connect-time refusals.** A refused connection reaches your code inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch; use `except*` (see [Django / FastAPI middleware](#django--fastapi-middleware)).
 
-**A thread you start does not carry your scope.** A scope belongs to the thread, task or greenlet that entered it. A `threading.Thread` started inside the block, a `ThreadPoolExecutor` job and `loop.run_in_executor` run without it; `asyncio.to_thread` takes it along. Enter the scope inside the function the thread runs (the decorator form does that).
+**A thread you start does not carry the scope.** A scope belongs to the thread, task or greenlet that entered it. A `threading.Thread` started inside the block, a `ThreadPoolExecutor` job and `loop.run_in_executor` run without it; `asyncio.to_thread` takes it along. Enter the scope inside the function the thread runs (the decorator form does that).
 
 ### Surface actionable guidance via `hint=`
 
-When a `scope()` blocks a connection inside your library, the host process sees `EgressBlocked` with a default message that names the host and the scope label — but not what to do next. `hint=` gives you a single source of truth for the egress contract (and the docs URL) so that one line of guidance lands in the host's traceback automatically:
+When a scope blocks a connection, `EgressBlocked` names the host and the scope's label, but not what to do next. `hint=` adds one line of guidance to the exception:
 
 ```python
 @tethered.scope(
-    allow=["api.weatherapi.com:443"],
-    label="WeatherClient.get_forecast",
-    hint=(
-        "WeatherClient needs api.weatherapi.com:443. "
-        "If your app uses tethered.activate(), add it to the allowlist. "
-        "See https://example.com/weatherclient#security-model"
-    ),
+    allow=["api.stripe.com:443"],
+    label="PaymentService.charge",
+    hint="Payment flow: only api.stripe.com:443 is reachable here. See https://wiki.example.com/egress",
 )
-def get_forecast(self, city: str) -> str:
+def charge(self, amount: int, token: str) -> dict:
     ...
 ```
 
-The hint surfaces both as `EgressBlocked.scope_hint` (a `str | None` attribute readable by host code) and as a trailing `Hint: …` line on the default exception message.
+The hint surfaces both as `EgressBlocked.scope_hint` (a `str | None` attribute) and as a trailing `Hint: …` line on the default exception message.
 
-**When does the hint fire?** Whenever any `EgressBlocked` is raised while a hinted `scope()` is on the stack — regardless of which layer produced the block:
+The hint fires whenever any `EgressBlocked` is raised while a hinted `scope()` is on the stack, whichever layer produced the block: the scope itself, another scope on the stack, or the `activate()` policy. The deepest hinted scope on the stack wins; an unhinted inner scope falls through to the outer hint.
 
-- **Your own scope blocks** — destination outside the scope's allowlist. This is the primary case; it works whether or not the host has called `activate()` at all, since `scope()` self-enforces.
-- **An inner (nested) scope blocks** — for example, a sub-helper inside your library entered a tighter `scope()` of its own. Your outer scope's hint still surfaces (the deepest hinted scope on the stack wins; an unhinted inner scope falls through to the outer hint).
-- **The host's `activate()` policy blocks** — the host has tethered configured but forgot to allowlist your endpoint. Your guidance still reaches them.
-- **An outer scope set by the host or a higher-level library blocks** — same rule. App developers combining `activate()` with `scope()` can put their own `hint=` on outer scopes (e.g. `scope(allow=["*.stripe.com"], hint="Payment flow — only Stripe is reachable here")`) and have it surface through any block downstream that doesn't set its own.
-
-`hint=` does not replace per-package CLI translation. If your package presents bespoke error UX (e.g. raising `ClickException` from a CLI), keep doing that — the wrapper can read `exc.scope_hint` and forward it without duplicating the contract in code:
+A command-line application can show the hint in place of the traceback:
 
 ```python
 import click
@@ -609,59 +595,86 @@ except tethered.EgressBlocked as exc:
     raise click.ClickException(exc.scope_hint or str(exc)) from exc
 ```
 
-The hint travels with the scope through subprocess auto-propagation, so a child process launched through `subprocess` inside your scope and blocked on the same call sees the same guidance. (Spawn-mode `multiprocessing` workers do not receive scopes; see [the subprocess page](SUBPROCESS.md#scopes-propagate-to-subprocesses-too).)
+The hint travels with the scope through subprocess auto-propagation, so a child process launched through `subprocess` inside the scope and blocked on the same call sees the same guidance. (Spawn-mode `multiprocessing` workers do not receive scopes; see [the subprocess page](SUBPROCESS.md#scopes-propagate-to-subprocesses-too).)
 
 #### A note on Unicode in hints (and labels)
 
-`hint=` and `label=` cross the subprocess boundary unchanged: they travel as JSON, with non-ASCII characters as `\uXXXX` escapes that the child decodes. Whether such a character *renders* correctly in the host's traceback or log output depends on the host's stdio / log-handler encoding — not on tethered. If you ship to environments where you can't assume UTF-8 stdio, prefer ASCII for hints and labels.
+`hint=` and `label=` cross the subprocess boundary unchanged: they travel as JSON, with non-ASCII characters as `\uXXXX` escapes that the child decodes. Whether such a character *renders* correctly in a traceback or log output depends on the stdio / log-handler encoding of the process, not on tethered. Where UTF-8 stdio cannot be assumed, prefer ASCII for hints and labels.
 
-### Adding `tethered` to your deps imposes `tethered.pth` on every downstream
+### Report blocks under your own logger
 
-`tethered` ships a top-level `tethered.pth` file that CPython's `site.py` processes at every interpreter startup (the same mechanism `coverage.py` uses for subprocess instrumentation). By depending on tethered, your library installs that `.pth` into every consumer's environment — even consumers who never directly import your library. The `.pth` is a one-line short-circuit that costs ~50µs when `_TETHERED_CHILD_POLICY` is unset (the common case), but it IS a global side effect of your dependency. Mention it in your release notes; security-conscious teams will want to know.
-
-### Route scope blocks to your library's logger
-
-`scope()` accepts an `on_blocked=(host, port) -> None` callback. Use it to surface unexpected blocks under your library's own logger so users can attribute the event to your library, not to tethered itself:
+`scope()` accepts an `on_blocked=(host, port) -> None` callback, called for every block the scope produces. Use it to report the event under a logger of your own:
 
 ```python
 import logging
 import tethered
 
-mylib_log = logging.getLogger("mylib.security")
+security_log = logging.getLogger("myapp.security")
 
 def _on_block(host: str, port: int | None) -> None:
-    mylib_log.warning(
-        "mylib unexpected egress to %s:%s — likely a bug; please file an issue",
-        host, port,
-    )
+    security_log.warning("unexpected egress to %s:%s", host, port)
 
-@tethered.scope(allow=["api.mylib.com:443"], on_blocked=_on_block)
+@tethered.scope(allow=["api.example.com:443"], on_blocked=_on_block)
 def fetch_data(): ...
 ```
 
-Tethered will still log under the `"tethered"` logger as well — your callback is additive, not a replacement. If you want to fully isolate the event from the `"tethered"` namespace, configure a logging filter on `"tethered"` or wrap the call as shown below.
+tethered still logs under the `"tethered"` logger as well: the callback is additive, not a replacement.
 
-### Wrap `EgressBlocked` in a library-specific exception
+## For package authors
 
-When `tethered.EgressBlocked` propagates from inside your library, the user's traceback shows your library's stack — but the exception class is `tethered.EgressBlocked`. Wrapping it in a library-specific exception with `from e` gives users a class they can catch with library-aware semantics, and lets you decorate the message with library context:
+A library does not turn tethered on. The application that runs the process decides on its policy: a library that calls `activate()` or enters a `scope()` in the code it ships decides for an application that did not choose it. Use tethered in your tests, and tell your users which hosts your library contacts.
+
+### What a runtime dependency on tethered does to an application
+
+- **Every environment gets `tethered.pth`.** `site.py` reads it at the start of every interpreter in the environment. It imports nothing unless `_TETHERED_CHILD_POLICY` is set, but it is there in every application that installs your library.
+- **A scope changes the whole process while it is open.** Entering one installs tethered's audit hook for the life of the process, and while any scope is open tethered looks up every host name a second time, in every thread, to record its addresses.
+- **A scope can only narrow.** It never protects the application from anything the application allowed. The one effect the application can see is a refusal: of a host it allowed, or of a proxy or a mirror its environment points your library to (`HTTPS_PROXY`, a mirror's endpoint).
+- **A scope sees only Python's sockets, in the thread that entered it.** Work your library hands to a thread of its own, and a transfer client written in C or Rust, run without the scope.
+
+### Tell your users which hosts your library contacts
+
+Keep the list in one place in your code, use it in your tests, and print it in your documentation and in your changelog when it changes. An application copies it into its allow list: importing your library to read the list before `activate()` would run its import-time code outside the policy.
 
 ```python
-class MyLibPolicyViolation(RuntimeError):
-    """Raised when mylib code attempted unexpected egress."""
-
-@tethered.scope(allow=["api.mylib.com:443"])
-def fetch_data():
-    try:
-        return _do_fetch()
-    except tethered.EgressBlocked as e:
-        raise MyLibPolicyViolation(
-            f"mylib attempted egress to {e.host} (scope={e.scope_label}); "
-            "this is a bug — please file an issue"
-        ) from e
+# mylib/__init__.py
+#: The hosts mylib contacts. Printed in the documentation.
+HOSTS = ("api.weatherapi.com:443",)
 ```
 
-`e.scope_label` is the label of the scope that blocked the call, or `None` if the block came from the host's global policy. Give your scope a `label=` ([above](#use-scope-never-activate)) and the message attributes the block to your library.
+### Find out which hosts your library contacts
 
-### Make `tethered` a regular runtime dependency
+Run the call inside a log-only scope that allows nothing, and collect what it reports:
 
-Don't try to "soft-depend" on tethered (`try: import tethered; except ImportError: pass`). Partial activation is worse than no activation — half your code paths defended, half not, with no consistent signal to users about which is which. If your library's threat model justifies tethered, depend on it unconditionally and document the egress contract in your README so users know what hosts your library is allowed to reach.
+```python
+import tethered
+
+seen = set()
+with tethered.scope(allow=[], log_only=True, on_blocked=lambda host, port: seen.add((host, port))):
+    mylib.WeatherClient().get_forecast("London")  # the call to look at
+print(seen)  # {('api.weatherapi.com', None), ('api.weatherapi.com', 443)}
+```
+
+A lookup is reported with the port `None`, a connection with its port, and nothing is refused. Loopback is not reported unless you pass `allow_localhost=False`. The list holds only what goes through Python's sockets in the thread that entered the scope: a download your library hands to a thread of its own, or to a transfer client written in C or Rust, is missing from it, and the call still succeeds. Compare the list with what you know your library does before you publish it.
+
+### Use tethered in your tests
+
+Make tethered a development dependency (`uv add --dev tethered`) and activate a locked policy for the test session. A test that reaches a host your library does not list then fails:
+
+```python
+# conftest.py
+import pytest
+import tethered
+
+import mylib
+
+_TOKEN = object()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def egress_policy():
+    tethered.activate(allow=list(mylib.HOSTS), locked=True, lock_token=_TOKEN)
+    yield
+    tethered.deactivate(lock_token=_TOKEN)
+```
+
+`locked=True` keeps a test from switching the policy off. With `allow=[]` the same fixture keeps the test suite off the network altogether, loopback aside.

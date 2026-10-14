@@ -89,7 +89,7 @@ def charge(amount: int, token: str) -> dict:
 
 A scope is a decorator or a `with` block, for sync and async code, and it works without `activate()`. With both in place a connection must be allowed by both: a scope narrows the policy and never widens it.
 
-Writing a library? Use `scope()` and leave `activate()` to the application, which owns the process ([guide for package authors](https://tethered.shcherbak.ai/COOKBOOK/#for-package-authors)).
+Writing a library? Use tethered in your tests, and leave both `activate()` and `scope()` to the application, which owns the process ([guide for package authors](https://tethered.shcherbak.ai/COOKBOOK/#for-package-authors)).
 
 ### Child processes
 
@@ -113,6 +113,14 @@ Under a lock, tampering with tethered's own code or with the active policy is de
 
 `"block"` also stops the helper programs some libraries launch when they are imported, so import those first ([details](https://tethered.shcherbak.ai/SUBPROCESS/#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](https://tethered.shcherbak.ai/security/#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
+### Roll it out
+
+1. **Check the environment.** `python -m tethered check`, run where the application runs, lists what tethered would refuse there, what it would not see and what needs configuration. It changes nothing ([the check](https://tethered.shcherbak.ai/API/#preflight-check)).
+2. **Enforce in your tests.** Activate the policy, locked, from a session fixture in `conftest.py` ([example](https://tethered.shcherbak.ai/COOKBOOK/#use-tethered-in-your-tests)). A test that reaches a host you did not list fails, and production is not touched.
+3. **Observe in production** with `log_only=True`: every connection the policy would refuse is logged, and none is refused. The audit hook is installed all the same, each allowed host name is looked up a second time, and Python children inherit the policy. What tethered does not see is not logged ([log-only mode](https://tethered.shcherbak.ai/API/#log-only-mode)).
+4. **Enforce** once the log shows nothing the application needs: drop `log_only`.
+5. **Lock it** ([above](#lock-it-down-in-production)).
+
 ## Allow list syntax
 
 | Rule | Matches |
@@ -128,17 +136,18 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 
 ## Limits
 
-- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need hard isolation, combine tethered with OS-level controls: containers, seccomp, network namespaces. The [security model](https://tethered.shcherbak.ai/security/) has the full threat model.
+- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need a guarantee, combine tethered with a control below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces. The [security model](https://tethered.shcherbak.ai/security/) has the full threat model.
 - **Libraries that connect in C are not seen.** tethered sees what goes through Python's `socket` module: requests, httpx, urllib3, aiohttp and the pure-Python database and broker clients. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not checked. The [compatibility page](https://tethered.shcherbak.ai/COMPATIBILITY/) says what was measured, server by server and library by library.
 - **Under asyncio, the standard event loop only.** A uvloop event loop raises no audit events, so tethered refuses to enforce a policy next to it, and uvicorn picks uvloop whenever it is installed. Name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](https://tethered.shcherbak.ai/COOKBOOK/#servers-and-interpreter-pools)).
 - **On Windows, run asyncio on `asyncio.SelectorEventLoop`.** The default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there.
+- **Free-threaded Python runs with the GIL once a policy is active.** tethered's C extension does not declare free-threading support, so Python turns the GIL back on when it is loaded: by `activate()`, and in a child process that inherits a policy or a scope. Importing tethered and entering a `scope()` do not load it.
 
 ## Documentation
 
 The documentation is at [tethered.shcherbak.ai](https://tethered.shcherbak.ai/), with an index for language models and coding agents at [llms.txt](https://tethered.shcherbak.ai/llms.txt).
 
 - [API reference](https://tethered.shcherbak.ai/API/): `activate`, `scope`, `deactivate`, the exceptions, locked and log-only mode
-- [Cookbook](https://tethered.shcherbak.ai/COOKBOOK/): what each server, task queue and pool needs; handling a blocked connection in Django, FastAPI and Celery; patterns for package authors
+- [Cookbook](https://tethered.shcherbak.ai/COOKBOOK/): what each server, task queue and pool needs; handling a blocked connection in Django, FastAPI and Celery; scopes in an application; tethered in a library's tests
 - [Compatibility](https://tethered.shcherbak.ai/COMPATIBILITY/): what is enforced, what needs configuration and what is not seen, measured under real servers, task queues and client libraries
 - [Subprocess control](https://tethered.shcherbak.ai/SUBPROCESS/): how a policy and a scope reach child processes, and `external_subprocess_policy`
 - [Architecture](https://tethered.shcherbak.ai/ARCHITECTURE/): the audit hook, scopes, the C guardian, measured overhead

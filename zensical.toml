@@ -109,10 +109,10 @@ markdown_description = "tethered checks every connection made through Python's s
 
 [project.plugins.llmstxt.sections]
 "Get started" = [
-  { "quickstart.md" = "Install tethered, set an allow list for the process, narrow a code path, and lock the policy in production." },
+  { "quickstart.md" = "Install tethered, set an allow list for the process, narrow a code path, lock the policy in production, and roll it out in stages." },
 ]
 "Guides" = [
-  { "COOKBOOK.md" = "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, and patterns for package authors." },
+  { "COOKBOOK.md" = "What each server, task queue and pool needs for a tethered policy to hold in every worker, how to handle a blocked connection in Django, FastAPI and Celery, how to label a scope, and how package authors use tethered in their tests." },
   { "SUBPROCESS.md" = "How a tethered policy and a scope reach Python child processes, and what external_subprocess_policy does with every other launch." },
   { "migrating-to-v1.md" = "Upgrading tethered from 0.5.x to 1.0.0: the breaking changes by what a deployment uses, the message each one shows, and the change that puts it right." },
 ]

@@ -100,8 +100,8 @@ tethered.scope(
 | `log_only` | Log what would be blocked instead of raising. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors. Default `False`. |
 | `on_blocked` | Callback `(host, port) -> None` on every blocked connection. |
-| `label` | Human-readable name for this scope. Appears in log messages and as `EgressBlocked.scope_label` when this scope produces a block. Library authors should use it to identify call sites — e.g. `label="WeatherClient.get_forecast"`. Defaults to an auto-derived `"scope(<first 3 allow rules>)"` summary. |
-| `hint` | Actionable guidance attached to any `EgressBlocked` raised while this scope is the deepest hinted scope on the stack — e.g. `hint="mylib needs api.mylib.com:443 — see https://…/security"`. Surfaces as `EgressBlocked.scope_hint` and as a trailing `Hint: …` line on the message. Runs of whitespace, embedded newlines included, collapse to a single space; `None`, an empty string and whitespace alone mean no hint. The hint travels with the scope into child processes. |
+| `label` | Human-readable name for this scope. Appears in log messages and as `EgressBlocked.scope_label` when this scope produces a block. Use it to name the call site, e.g. `label="PaymentService.charge"`. Defaults to an auto-derived `"scope(<first 3 allow rules>)"` summary. |
+| `hint` | Actionable guidance attached to any `EgressBlocked` raised while this scope is the deepest hinted scope on the stack — e.g. `hint="Payment flow: only api.stripe.com:443 is reachable here"`. Surfaces as `EgressBlocked.scope_hint` and as a trailing `Hint: …` line on the message. Runs of whitespace, embedded newlines included, collapse to a single space; `None`, an empty string and whitespace alone mean no hint. The hint travels with the scope into child processes. |
 
 Use as a **context manager** (`with tethered.scope(allow=[...]):`) or a **decorator** (`@tethered.scope(allow=[...])`). Supports both sync and async functions. Cleanup is automatic — no `deactivate()` call needed.
 
@@ -117,7 +117,7 @@ Three caveats apply under asyncio:
 
 Scopes can only **restrict**, never widen. If the app also called `activate()`, the effective policy is the intersection — a connection must be allowed by both.
 
-> **Package maintainers:** Use `scope()`, never `activate()`. Your library doesn't own the process — the app does. `activate()` is a process-wide operation that would interfere with the host application's own policy. `scope()` is context-local and safe to use from any library.
+> **Package authors:** a library does not turn tethered on, with `activate()` or with `scope()`: the application decides on the policy of its process. Use tethered in your tests, and publish the hosts your library contacts ([the cookbook](COOKBOOK.md#for-package-authors)).
 
 ## `tethered.deactivate()`
 
@@ -142,7 +142,7 @@ except tethered.EgressBlocked as e:
     print(e.host)           # "evil.test"
     print(e.port)           # 443
     print(e.resolved_from)  # original hostname if connecting by resolved IP
-    print(e.scope_label)    # "scope(api.mylib.com:443)" if a scope blocked it; None for global blocks
+    print(e.scope_label)    # "scope(api.example.com:443)" if a scope blocked it; None for global blocks
     print(e.scope_hint)     # actionable guidance from the deepest hinted scope, or None
 ```
 
@@ -151,7 +151,7 @@ except tethered.EgressBlocked as e:
 | `host` | `str` | The host (or IP) the call attempted to reach. |
 | `port` | `int \| None` | The port, when known (`None` for `getaddrinfo` / DNS-only events). |
 | `resolved_from` | `str \| None` | When connecting by a resolved IP, the hostname most recently seen resolving to that IP. `None` for direct hostname connects or when no mapping is known. |
-| `scope_label` | `str \| None` | The label of the `scope()` that blocked the call (e.g. `"scope(api.mylib.com:443)"`), or `None` if the block came from the global `activate()` policy. Useful for libraries that wrap `EgressBlocked` and want to attribute the block to the right scope when multiple are nested. See [COOKBOOK.md#for-package-authors](COOKBOOK.md#for-package-authors). |
+| `scope_label` | `str \| None` | The label of the `scope()` that blocked the call (e.g. `"scope(api.example.com:443)"`), or `None` if the block came from the global `activate()` policy. Useful for code that wraps `EgressBlocked` and attributes the block to the right scope when several are nested. See [the cookbook](COOKBOOK.md#name-a-scope-with-label). |
 | `scope_hint` | `str \| None` | The `hint=` set on the deepest hinted `scope()` on the stack at block-time, or `None` when no hinted scope was active. The deepest hinted scope wins whichever layer produced the block: an outer hint surfaces when no closer scope set one, and a hint also surfaces when the global `activate()` policy is what blocks, so a library's guidance reaches the user in blocks the host application's policy produces. |
 
 When `scope_label` is non-`None`, the message includes a trailing `(blocked by <label>)` suffix so the source of the block is visible in tracebacks even without inspecting the attribute. When `scope_hint` is non-`None`, the message gains a trailing line of the form `Hint: <hint>` so the guidance is visible in tracebacks too. An IPv6 address with a port is written the way an allow rule writes it: `[2001:db8::1]:443`.
@@ -255,7 +255,7 @@ In addition, locked mode hardens the subprocess auto-propagation channel against
 
 ## Log-only mode
 
-Monitor without blocking — useful for rollout or auditing:
+Monitor without blocking, as the step before enforcement when [rolling a policy out](quickstart.md#roll-it-out), or for auditing:
 
 ```python
 tethered.activate(
@@ -266,6 +266,8 @@ tethered.activate(
 ```
 
 tethered logs to the `"tethered"` logger via stdlib `logging`. To see log-only warnings, ensure your application has logging configured (e.g., `logging.basicConfig()`). What a log-only policy or scope lets through is logged as `tethered: would block ...` (`would block connect to evil.test:443`); an enforcing one logs `tethered: blocked ...` for what it refuses.
+
+A log-only policy refuses nothing, and it still acts on the process. tethered's audit hook is installed for the life of the process. Each host name the policy allows is looked up a second time, by tethered, to record its addresses ([measured cost](ARCHITECTURE.md#performance)). Python child processes inherit the policy. No import is refused, so uvloop and pycares load under it. What tethered does not see is not reported either: a library that connects in C, everything on a uvloop event loop, and connections on Windows' default `ProactorEventLoop` ([what "not seen" means](COMPATIBILITY.md#what-not-seen-means)). A quiet log therefore says that nothing tethered sees would be blocked.
 
 `log_only` is per layer: the global policy and each scope have their own. A log-only layer never switches off an enforcing one. When a log-only global policy denies, the scopes are still checked. Scopes are evaluated outermost first: each denying log-only scope logs and calls its `on_blocked`, and the first denying scope that enforces raises `EgressBlocked`.
 

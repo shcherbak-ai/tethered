@@ -1,6 +1,6 @@
 ---
 title: "Quick start"
-description: "Install tethered, set an allow list for the process, narrow a code path, and lock the policy in production."
+description: "Install tethered, set an allow list for the process, narrow a code path, lock the policy in production, and roll it out in stages."
 ---
 
 # Quick start
@@ -45,7 +45,7 @@ def charge(amount: int, token: str) -> dict:
 
 A scope is a decorator or a `with` block, for sync and async code, and it works without `activate()`. With both in place a connection must be allowed by both: a scope narrows the policy and never widens it.
 
-Writing a library? Use `scope()` and leave `activate()` to the application, which owns the process ([guide for package authors](COOKBOOK.md#for-package-authors)).
+Writing a library? Use tethered in your tests, and leave both `activate()` and `scope()` to the application, which owns the process ([guide for package authors](COOKBOOK.md#for-package-authors)).
 
 ## Child processes
 
@@ -69,6 +69,14 @@ Under a lock, tampering with tethered's own code or with the active policy is de
 
 `"block"` also stops the helper programs some libraries launch when they are imported, so import those first ([details](SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](security.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
+## Roll it out
+
+1. **Check the environment.** `python -m tethered check`, run where the application runs, lists what tethered would refuse there, what it would not see and what needs configuration. It changes nothing ([the check](API.md#preflight-check)).
+2. **Enforce in your tests.** Activate the policy, locked, from a session fixture in `conftest.py` ([example](COOKBOOK.md#use-tethered-in-your-tests)). A test that reaches a host you did not list fails, and production is not touched.
+3. **Observe in production** with `log_only=True`: every connection the policy would refuse is logged, and none is refused. The audit hook is installed all the same, each allowed host name is looked up a second time, and Python children inherit the policy. What tethered does not see is not logged ([log-only mode](API.md#log-only-mode)).
+4. **Enforce** once the log shows nothing the application needs: drop `log_only`.
+5. **Lock it** ([above](#lock-it-down-in-production)).
+
 ## Allow list syntax
 
 | Rule | Matches |
@@ -84,7 +92,8 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 
 ## Limits
 
-- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need hard isolation, combine tethered with OS-level controls: containers, seccomp, network namespaces. The [security model](security.md) has the full threat model.
+- **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need a guarantee, combine tethered with a control below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces. The [security model](security.md) has the full threat model.
 - **Libraries that connect in C are not seen.** tethered sees what goes through Python's `socket` module: requests, httpx, urllib3, aiohttp and the pure-Python database and broker clients. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not checked. The [compatibility page](COMPATIBILITY.md) says what was measured, server by server and library by library.
 - **Under asyncio, the standard event loop only.** A uvloop event loop raises no audit events, so tethered refuses to enforce a policy next to it, and uvicorn picks uvloop whenever it is installed. Name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](COOKBOOK.md#servers-and-interpreter-pools)).
 - **On Windows, run asyncio on `asyncio.SelectorEventLoop`.** The default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there.
+- **Free-threaded Python runs with the GIL once a policy is active.** tethered's C extension does not declare free-threading support, so Python turns the GIL back on when it is loaded: by `activate()`, and in a child process that inherits a policy or a scope. Importing tethered and entering a `scope()` do not load it.

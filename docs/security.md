@@ -9,7 +9,7 @@ What tethered defends against, what it does not, and what locked mode adds to th
 
 ## Threat model
 
-> **tethered is a defense-in-depth guardrail, not a security sandbox.** It intercepts Python-level socket operations. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it. Ordinary libraries do the same without any intent when they resolve names and connect inside a C library of their own: psycopg2, pycurl and grpcio are examples, and tethered sees nothing they do. For the most common case, the uvloop event loop that uvicorn picks whenever it is installed, tethered refuses to run rather than run unenforced. For full process isolation, combine tethered with OS-level controls (containers, seccomp, network namespaces).
+> **tethered is a defense-in-depth guardrail, not a security sandbox.** It intercepts Python-level socket operations. Code that uses `ctypes`, `cffi`, subprocesses, or C extensions with direct syscalls can bypass it. Ordinary libraries do the same without any intent when they resolve names and connect inside a C library of their own: psycopg2, pycurl and grpcio are examples, and tethered sees nothing they do. For the most common case, the uvloop event loop that uvicorn picks whenever it is installed, tethered refuses to run rather than run unenforced. For a guarantee, combine tethered with controls below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces.
 
 tethered's protections are scoped at Python audit events. They defend against:
 
@@ -195,6 +195,7 @@ On asyncio, early activation does one more thing: it keeps uvloop out of the pro
 
 For defense-in-depth, combine tethered with:
 
+- An egress proxy or a network policy that names the allowed hosts, for the traffic that does not go through Python's sockets.
 - OS-level sandboxing (containers, seccomp-bpf, network namespaces) for hard isolation.
 - Subprocess restrictions (`external_subprocess_policy="block"` for hardened environments, plus seccomp filters for non-Python binaries).
 - Import restrictions to prevent `ctypes`/`cffi` loading in untrusted code paths.

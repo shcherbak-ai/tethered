@@ -61,4 +61,4 @@ Your code, your dependencies and AI-generated code share one Python process, and
 </div>
 
 > [!NOTE]
-> **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need hard isolation, combine tethered with OS-level controls: containers, seccomp, network namespaces.
+> **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need a guarantee, combine tethered with a control below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces.

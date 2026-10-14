@@ -217,14 +217,14 @@ with tethered.scope(allow=["api.allowed.com"]):
     subprocess.run([sys.executable, "-c", "..."])
 ```
 
-This works **without** `activate()` — a library can use `scope()` alone for self-defense and the narrowing extends through subprocess boundaries:
+This works **without** `activate()`: a scope used on its own narrows its code path, and the narrowing extends through subprocess boundaries:
 
 ```python
-# Inside a library, no app-level activate() needed:
-@tethered.scope(allow=["api.mylib.com"])
+# No activate() needed:
+@tethered.scope(allow=["api.example.com"])
 def do_work():
-    subprocess.run([sys.executable, "-m", "mylib_helper"])
-    # The helper subprocess only reaches api.mylib.com.
+    subprocess.run([sys.executable, "-m", "myapp.helper"])
+    # The helper subprocess only reaches api.example.com.
 ```
 
 Race-free across threads (frame-locals are per-call, not shared global state): two threads can be in different scopes and concurrently launch subprocesses that each receive their parent thread's scope.
