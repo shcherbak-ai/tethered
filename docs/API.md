@@ -1,6 +1,6 @@
 ---
 title: "API reference"
-description: "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode and log-only mode."
+description: "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode, log-only mode and the preflight check python -m tethered check."
 ---
 
 # API reference
@@ -305,3 +305,40 @@ with tethered.scope(allow=["*.stripe.com:443", "*.twilio.com:443"]):
         httpx.post("https://api.stripe.com/v1/charges")    # works
         httpx.post("https://api.twilio.com/v1/messages")   # raises EgressBlocked
 ```
+
+## Preflight check
+
+```bash
+uv run python -m tethered check
+```
+
+Or `python -m tethered check` with the interpreter the application runs on. Run in the environment where the application will run, before a policy is put in place there, the command reports which rows of [the compatibility page](COMPATIBILITY.md) apply to that environment: what tethered would refuse, what it would not see, and what needs configuration. Each finding says what is there, what it means and what to do, with a link to the page that has the details:
+
+```text
+Client libraries
+  A row of the compatibility page is a library in one arrangement. That a library is
+  installed, or even loaded, does not mean the application uses it in that arrangement.
+
+  - psycopg2-binary 2.9.13 is installed.
+    Measured arrangement "psycopg2 (psycopg2-binary)": not seen (libpq resolves and
+    connects in C). Under any policy the name is looked up and the address and the port
+    are reached, and nothing is reported: locked=True, fail_closed=True and log_only
+    change nothing.
+    What to do: Use a pure-Python driver, pg8000 or asyncpg, which are enforced, or a
+    control below Python: a network policy, a firewall rule, seccomp.
+    See https://tethered.shcherbak.ai/COMPATIBILITY/#postgresql
+```
+
+The findings come in five groups:
+
+- **Event loops.** uvloop installed: under a policy that is not `log_only` its import is refused, and `activate()` over a loaded uvloop raises `RuntimeError` (see [Event loops and resolvers](#event-loops-and-resolvers)). On Windows, asyncio's default `ProactorEventLoop`, which gets no connect-time enforcement.
+- **Name resolution.** Resolvers that look names up where tethered does not see it, so that a host the allow list names is refused: pycares and aiodns (their import is refused under a policy, and aiohttp falls back to its threaded resolver), dnspython, gevent with `GEVENT_RESOLVER=ares` and eventlet without `EVENTLET_NO_GREENDNS=yes` in the environment of the command.
+- **Client libraries.** Each installed library that the compatibility page measured as not seen, partly enforced, or refusing allowed hosts in some arrangement, with the arrangement named and the remedy the page gives.
+- **Child processes.** No `tethered.pth` in a site directory this interpreter processes (an editable install has none), a file of that name that is not tethered's, and from Python 3.15 a `tethered.start` beside it, each of which leaves Python children without the policy; a `sys.executable` that is not an interpreter, and uWSGI installed; on POSIX with Python 3.11–3.13, multiprocessing launches that raise no audit event; forkserver as the default start method.
+- **Interpreter.** A free-threaded build, on which tethered's C extension re-enables the GIL, and a missing C extension, without which `locked=True` raises `RuntimeError`.
+
+**It reports what is installed, not what the application uses.** A library can be installed and never used, or used in an arrangement that is enforced: mysql-connector-python is not seen with its C extension and enforced with `use_pure=True`. Whether the application uses what a finding names is for its owner to judge. The environment variables it reads are those of the shell it runs in, which need not be those of the application.
+
+**It changes nothing.** The command activates no policy and installs no audit hook, makes no network call, imports no third-party module (it reads the metadata of the installed distributions and asks the import system whether a module can be found), and writes nothing but its report to standard output. In an environment that carries `_TETHERED_CHILD_POLICY`, the interpreter takes that policy on at startup through the `tethered.pth` bootstrap, as every Python interpreter there does, before the command runs.
+
+**Exit status.** 0 whenever the check ran, whatever it found: the findings are information, not failures. A usage error exits with 2.

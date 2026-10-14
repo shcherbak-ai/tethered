@@ -6,6 +6,10 @@ as it was measured; ``test_clients.py`` measures it again and fails when
 anything differs.  This module is imported by the pytest process and by the
 processes under test, and imports no client library itself.
 
+The rows of ``TABLE`` that are not enforced are copied into the package, as
+``src/tethered/_clients.py``, for ``python -m tethered check``;
+``tests/test_check.py`` fails until a change here is made there too.
+
 How to read a row (``Expect``), for the allow list ``allowed.test:9001``:
 
 * ``lookup_event`` / ``connect_event``: without tethered, did the library raise

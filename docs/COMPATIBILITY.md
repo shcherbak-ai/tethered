@@ -9,6 +9,8 @@ What tethered enforces under the servers, task queues and client libraries peopl
 
 ## How to read this page
 
+**Which rows apply to you.** `python -m tethered check`, run with the interpreter of the application in the environment where it runs, lists the rows of this page that apply to what is installed there, and changes nothing ([the preflight check](API.md#preflight-check)).
+
 **What was measured.** Each suite builds a wheel of tethered from the source tree, installs it into the official `python:X.Y-slim` Docker image the way a user installs it, starts the real server or library, and asks it to reach four destinations: a host the policy allows (`allowed.test:9001`), a forbidden name, a forbidden raw address, and the allowed name on a port the rule does not cover. The destinations count every connection and datagram that arrives. "Refused" on this page means that nothing arrived, not only that the application saw an exception. Every suite runs on Python 3.11, 3.12, 3.13, 3.14 and 3.15, on Linux x86-64 with glibc.
 
 **The results.**

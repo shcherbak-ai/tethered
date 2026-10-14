@@ -117,7 +117,7 @@ markdown_description = "tethered checks every connection made through Python's s
   { "migrating-to-v1.md" = "Upgrading tethered from 0.5.x to 1.0.0: the breaking changes by what a deployment uses, the message each one shows, and the change that puts it right." },
 ]
 "Reference" = [
-  { "API.md" = "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode and log-only mode." },
+  { "API.md" = "The tethered API: activate(), scope() and deactivate() with every parameter, the exceptions, the allow list syntax, locked mode, log-only mode and the preflight check python -m tethered check." },
   { "COMPATIBILITY.md" = "What tethered enforces, what needs configuration, what it refuses at start-up and what it does not see, measured under real servers, task queues and client libraries." },
   { "ARCHITECTURE.md" = "How tethered works: the audit hook and the events it handles, scopes, child processes, the C guardian behind locked mode, and the measured overhead." },
 ]
