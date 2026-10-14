@@ -1,0 +1,95 @@
+name: Next Python
+
+# The test suite on the newest pre-release of the next CPython, on Linux.
+# tethered relies on things CPython does not promise (docs/ARCHITECTURE.md,
+# "What tethered relies on"), and tests/test_cpython_internals.py checks each
+# of them directly.  A change in CPython that breaks one fails here, in the
+# alpha and beta months, before a release reaches users.
+#
+# The interpreter comes from the deadsnakes PPA, which publishes the alphas,
+# betas and release candidates of the next version for Ubuntu, headers
+# included, usually within days of each: every run installs the newest one,
+# with nothing to bump here.  When that version is released, move it into the
+# test matrix of ci.yml and point NEXT_PYTHON at the one after.
+#
+# Advisory: no other workflow waits for this one, and its check is not one of
+# the checks a pull request needs before it is merged.  A failure stays red,
+# for whoever reads the run, and does not stop a merge or a release.
+
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "src/**"
+      - "setup.py"
+      - "tests/**"
+      - ".github/workflows/next-python.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next-python-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The uv every job installs.  Without it a new uv release would change what
+# CI runs without a commit.  uv must not download a Python of its own here.
+env:
+  UV_VERSION: "0.13.0"
+  UV_PYTHON_DOWNLOADS: never
+  NEXT_PYTHON: "3.16"
+
+jobs:
+  test:
+    name: Tests on the next Python
+    runs-on: ubuntu-24.04
+    # A replay in a container took under a minute (install 15 s, tests 15 s).
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      # pythonX.Y-dev brings the headers the C extension is built against.
+      # Every uv command after this step runs on that interpreter: UV_PYTHON
+      # names it by its path, which outranks .python-version.  (Without a
+      # request uv prefers any stable Python on the runner to a pre-release.)
+      - name: Install the newest pre-release of Python ${{ env.NEXT_PYTHON }}
+        run: |
+          sudo add-apt-repository --yes ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            "python$NEXT_PYTHON-dev" "python$NEXT_PYTHON-venv"
+          apt-cache policy "python$NEXT_PYTHON"
+          echo "UV_PYTHON=/usr/bin/python$NEXT_PYTHON" >> "$GITHUB_ENV"
+
+      # Builds tethered, and with it the C extension, against that Python.
+      - name: Install dependencies
+        run: uv sync --locked --python "$UV_PYTHON"
+
+      # A run on another Python, or without the extension, would pass all the
+      # same and test nothing new.
+      - name: Check that uv run is on Python ${{ env.NEXT_PYTHON }}, with the extension built for it
+        run: |
+          uv run python -c "
+          import sys, sysconfig
+          print(sys.version)
+          assert sys.version_info[:2] == tuple(map(int, '$NEXT_PYTHON'.split('.'))), sys.version
+          import tethered._guardian as guardian
+          print(guardian.__file__)
+          assert guardian.__file__.endswith(sysconfig.get_config_var('EXT_SUFFIX'))
+          "
+
+      # No coverage threshold (pyproject.toml sets one, hence the 0): branches
+      # that depend on the version may be taken differently on a release that
+      # is not supported yet.  The report still shows what was not run.
+      - name: Run the tests
+        run: >-
+          uv run pytest tests/ -v -n auto
+          --cov=src/tethered --cov-report=term-missing --cov-fail-under=0
