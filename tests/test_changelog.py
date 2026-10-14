@@ -1,11 +1,14 @@
-"""The changelog links every version to its comparison, and CITATION.cff repeats its date.
+"""The changelog links each version to its comparison; the version fields and the date agree.
 
 A version of ``CHANGELOG.md`` without its compare link raises no error
 anywhere: the heading just keeps its brackets.  ``CITATION.cff`` names a
 version and the day it was released; ``cz bump`` rewrites the version
-(``version_files`` in ``pyproject.toml``) and leaves the date alone.  These
-tests fail when a link is missing or out of place, and when the date is not
-the one the changelog gives that version.
+(``version_files`` in ``pyproject.toml``) and leaves the date alone.
+``pyproject.toml`` names the version of the distribution and the one
+commitizen starts from, and no build compares either with
+``tethered.__version__``.  These tests fail when a link is missing or out of
+place, when the date is not the one the changelog gives that version, and
+when a version field names another version.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import itertools
 import pathlib
 import re
+import tomllib
 
 import pytest
 
@@ -63,3 +67,10 @@ def test_the_citation_file_names_the_package_version_and_its_release_date() -> N
     assert version == tethered.__version__
     # The release change writes the day into the changelog heading and here.
     assert date == _released()[version]
+
+
+def test_pyproject_names_the_package_version() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as file:
+        pyproject = tomllib.load(file)
+    assert pyproject["project"]["version"] == tethered.__version__
+    assert pyproject["tool"]["commitizen"]["version"] == tethered.__version__
