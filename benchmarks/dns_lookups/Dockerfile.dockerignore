@@ -1,0 +1,22 @@
+# The build context of the Dockerfile next to this file is the repository
+# root.  Everything is left out except what the image is made of: the package
+# sources and the benchmark's own files.
+
+*
+
+!pyproject.toml
+!setup.py
+!MANIFEST.in
+!README.md
+!LICENSE
+!src
+!benchmarks/dns_lookups
+
+# Nothing compiled or cached on the host goes into the image.
+**/__pycache__
+**/*.py[cod]
+**/*.so
+**/*.pyd
+**/*.egg-info
+**/*.log
+src/**/build

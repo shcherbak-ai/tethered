@@ -1,0 +1,7 @@
+# What the DNS benchmark's image installs besides tethered: gevent, for the
+# setup that runs lookups through gevent's default resolver (a thread pool).
+# The same pins as tests_containers/suites/gunicorn_gevent/requirements.txt.
+gevent==26.9.0
+greenlet==3.5.6
+zope.event==6.2
+zope.interface==8.6

@@ -126,6 +126,9 @@ exclude_dirs = ["tests"]
 
 [tool.deptry]
 known_first_party = ["tethered"]
+# What runs inside the DNS benchmark's image, which installs what it imports
+# (benchmarks/dns_lookups/requirements.txt), as tests_containers/ does.
+extend_exclude = ["benchmarks/dns_lookups"]
 
 # Imported outside the package and its tests, and declared in the dev group:
 # the package itself has no dependency.

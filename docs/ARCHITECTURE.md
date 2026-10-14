@@ -28,9 +28,9 @@ When a connection to an IP address is refused and no hostname is known for that 
 
 ## DNS-divergence fallback
 
-The audit-hook architecture has an inherent limitation: tethered's resolution (called from inside the `socket.getaddrinfo` audit hook) and CPython's own resolution (whose result is returned to the application) are **two independent DNS queries**. For load-balanced services with short TTLs, and especially under gevent's threadpool resolver, the two queries can return different IP sets — leaving the connect-time IP unmapped. Eager population can never be perfect within the audit API.
+The audit-hook architecture has an inherent limitation: tethered's resolution (called from inside the `socket.getaddrinfo` audit hook, before CPython's) and CPython's own resolution (whose result is returned to the application) are **two independent DNS queries**. For a name whose answers differ from one query to the next, as with a load balancer that hands out a different subset of its addresses each time, the two queries can return different IP sets wherever no cache answers both — leaving the connect-time IP unmapped. Without a cache that holds whatever the TTL; behind a caching stub only for a TTL of 0. gevent's default resolver makes no difference: both queries run one after the other in the same thread of its pool. Eager population can never be perfect within the audit API; [the security model](security.md#known-residual-dns-divergence) has the measured refusal rates.
 
-When `_handle_connect` sees an unmapped IP, `_fallback_resolve` re-resolves up to 30 most-recently-allowed hostnames (LRU order, newest first) and checks if any maps to the connecting IP. On a hit it returns the hostname and enriches the IP map so future connects to that IP take the fast path. On a miss it returns `None` and the connect-time policy check then sees the bare IP, which doesn't match any hostname allow rule, and blocks. Hot path (mapped IP) is unaffected — the fallback fires only on misses, and it is skipped when every layer already allows the raw IP (loopback, an IP or CIDR rule), because no hostname could change that outcome.
+When `_handle_connect` sees an unmapped IP, `_fallback_resolve` re-resolves up to 30 most-recently-allowed hostnames (LRU order, newest first) and checks if any maps to the connecting IP. On a hit it returns the hostname and enriches the IP map so future connects to that IP take the fast path. On a miss it returns `None` and the connect-time policy check then sees the bare IP, which doesn't match any hostname allow rule, and blocks. Hot path (mapped IP) is unaffected — the fallback fires only on misses, and it is skipped when every layer already allows the raw IP (loopback, an IP or CIDR rule), because no hostname could change that outcome. A miss costs one lookup per name searched, until one matches: through a caching stub a local round trip, without one an upstream round trip, and nothing is remembered of a search that found no name, so the next connect to the address searches again ([measured](#the-fallback-search)).
 
 Candidates are recorded after the scope checks, so only names whose lookup the global policy and every enforcing scope let through are ever re-resolved. `gethostbyname` lookups record a candidate too, but no mapping; the fallback is how an address obtained that way is matched to its name.
 
@@ -172,8 +172,45 @@ The audit hook runs on every relevant socket event, but the cost per event is sm
 | Operation | Overhead added |
 |---|---|
 | `socket.connect` | ~25 µs |
-| `socket.getaddrinfo` | ~120 µs (~2×): tethered resolves the name itself to record which hostname each address belongs to |
+| `socket.getaddrinfo` | ~120 µs (~2×) for `localhost`: tethered resolves the name itself to record which hostname each address belongs to. Against a DNS server that second lookup costs what the resolver charges for it, [below](#the-second-lookup-against-a-dns-server) |
 | Any audit event that is not a network event | ~150 ns |
 | `with tethered.scope(...)` enter + exit | ~1 µs (the cost of the context manager, with or without `activate()`) |
 
 Numbers vary with hardware, operating system and Python version. Reproduce them with [`uv run python benchmarks/overhead.py`](https://github.com/shcherbak-ai/tethered/blob/main/benchmarks/overhead.py).
+
+### The second lookup against a DNS server
+
+When an allowed name is looked up, tethered looks it up a second time itself, inside the audit hook and before CPython's own lookup, to record which addresses belong to the name (`_csocket.getaddrinfo`, under a lock `_c_guardian.resolve`). It does so under every policy, a log-only one included, and in every thread while a scope is open anywhere in the process. `localhost` is answered from `/etc/hosts`; against a DNS server the second lookup costs what the resolver between the process and the server charges for it. [`benchmarks/dns_lookups.py`](https://github.com/shcherbak-ai/tethered/blob/main/benchmarks/dns_lookups.py) measures it in a container with no network, where a DNS server of the benchmark's own plays the upstream: it answers every query 20 ms after it arrives (`--latency-ms`), and counts the queries it receives. `socket.getaddrinfo(name, 443, type=SOCK_STREAM)`, 300 calls per row, allow list naming the host:
+
+| Between the process and the upstream | Lookups reaching the upstream per call, deactivated → activated | Median, deactivated → activated | Added |
+|---|---|---|---|
+| Nothing: glibc asks the upstream that `/etc/resolv.conf` names, as in a slim container image | 1 → 2 | 20.5 → 41.2 ms | +20.7 ms, one upstream round trip |
+| The same, locked | 1 → 2 | 20.5 → 40.8 ms | +20.4 ms |
+| The same, through gevent's default resolver (a pool of 10 threads), one lookup at a time | 1 → 2 | 20.5 → 41.0 ms | +20.5 ms |
+| The same, 20 lookups at once | 1 → 2 | 42.2 → 84.1 ms; 471 → 237 lookups per second | each lookup twice as long, half the throughput |
+| systemd-resolved (`nameserver 127.0.0.53`), the name in its cache | 0 → 0 | 0.094 → 0.150 ms | +0.06 ms |
+| systemd-resolved, the name not in its cache | 1 → 1 | 20.6 → 21.2 ms | +0.1 to +0.6 ms |
+| dnsmasq, the name in its cache | 0 → 0 | 0.036 → 0.081 ms | +0.04 ms |
+| dnsmasq, the name not in its cache | 1 → 1 | 20.7 → 20.7 ms | +0.04 to +0.07 ms |
+| Windows 11, the DNS Client service, `pypi.org` (measured once) | not counted | 0.123 → 0.320 ms | +0.2 ms |
+
+The container rows were measured with tethered 1.0.1 on Python 3.14.8 in `python:3.14-slim` (Debian 13, glibc 2.41), with systemd-resolved 257.13 run without systemd, dnsmasq 2.91 and gevent 26.9.0, in two runs of the benchmark; the medians are from the second, and no median of the first differed from it by more than 1 ms. The Windows row was measured once on Windows 11 (build 26300) with Python 3.14.8, against the real name. A lookup is counted by its A query; each also sends an AAAA query, which went to the upstream with it where nothing caches and was answered from the stub's negative cache otherwise.
+
+- **Without a cache, every lookup of an allowed name costs one more upstream round trip**, whatever that round trip takes, and the upstream receives twice the queries, A and AAAA alike. glibc keeps no cache of its own, so this is the case of every container image whose `/etc/resolv.conf` names a DNS server. Where lookup latency or the upstream's query rate matters, put a caching stub between the process and the upstream. dnsmasq runs in a container as an ordinary process. systemd-resolved, which Ubuntu and Fedora hosts use, runs in one without systemd too, but forwards nothing while no network interface other than loopback is up, and caches nothing that a server on a loopback address answers.
+- **With a caching stub the second query is answered locally.** tethered's lookup comes first: when the stub does not have the name, it is tethered's query that goes to the upstream, and CPython's own lookup is answered from the cache it filled. The upstream receives one query per lookup, as without tethered, and the added time is a local round trip, well under a millisecond. On Windows the DNS Client service is such a cache: the added time was 0.2 ms.
+- **Under gevent's default resolver** tethered's lookup runs in the same thread of gevent's resolver pool as gevent's own, right before it. The hub is not held up (the longest stall measured was 2.5 ms, with or without tethered), but each lookup occupies a thread of the pool twice as long: with more lookups at once than the pool has threads, each takes twice as long and the pool resolves half as many per second.
+
+### The fallback search
+
+When a connect goes to an address that no name is known for and that no layer allows as an IP, tethered searches the names it has recently let through before it decides ([DNS-divergence fallback](#dns-divergence-fallback)): one lookup per name, newest first, up to 30, and again for every such connect. Measured with the same benchmark and versions, with 30 allowed names looked up first and then 20 connects to an address the policy does not allow:
+
+| Between the process and the upstream | Lookups reaching the upstream per connect | Median connect, deactivated → log-only (goes ahead) / enforcing (refused) |
+|---|---|---|
+| Nothing | 30 | 0.016 ms → 617 ms / 617 ms |
+| The same, through gevent's default resolver | 30 | 0.062 ms → 615 ms / 618 ms, with every greenlet held up as long |
+| systemd-resolved | 0 to 0.5 | 0.004 ms → 2.8 ms / 2.7 ms |
+| dnsmasq | 0 | 0.020 ms → 1.9 ms / 1.5 ms |
+
+- **Without a cache, each name searched is an upstream round trip.** Under a log-only policy nearly every connection that the policy would refuse is to an address no name is known for (a lookup the policy does not allow records nothing), so each of them goes ahead up to 30 round trips late. Under an enforcing policy the search delays the refusal of an address that no rule allows, and the decision on an address that tethered's own lookup of the name did not return (see [the security model](security.md#known-residual-dns-divergence)).
+- **Under gevent the search holds up the whole process.** It runs in the greenlet that connects, in the hub's thread, through `_socket.getaddrinfo`, which gevent does not patch, so no other greenlet runs until it is over.
+- An address that an IP or CIDR rule allows is never searched for, and a caching stub answers each name of the search locally. Where neither applies, as in a log-only rollout in an image without a cache, expect each such connect to wait one upstream round trip for every name tethered has let through recently, up to 30.
