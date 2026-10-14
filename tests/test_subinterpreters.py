@@ -411,7 +411,9 @@ class TestLockedPolicy:
             out["sum"] = sum(range(1000))
             core = sys.modules["tethered._core"]
             out["config"] = core._config
-            out["is_active"] = core._c_guardian.is_active()
+            out["guardian loaded"] = core._c_guardian is not None
+            import tethered._guardian as guardian
+            out["is_active"] = guardian.is_active()
             from tethered._autoactivate import _in_subinterpreter
             out["in_subinterpreter"] = _in_subinterpreter()
             """
@@ -419,6 +421,9 @@ class TestLockedPolicy:
         assert result["sum"] == 499500
         assert result["in_subinterpreter"] is True
         assert _in_subinterpreter() is False
+        # Importing tethered loaded no extension there, and the guardian refuses
+        # that interpreter all the same.
+        assert result["guardian loaded"] is False
         # The lock is the process's, and visible as such; the policy is not
         # this interpreter's.
         assert result["is_active"] is True
@@ -1138,6 +1143,7 @@ class TestJoinedInterpreter:
             before="""
             import tethered._core as core
 
+            core._load_guardian()  # what the bootstrap does first: no bootstrap ran here
             guardian = core._c_guardian
             attempt("join", core._join_locked, guardian.locked_payload())
             attempt("guardian.join", guardian.join, vars(core), None, [])
@@ -2018,9 +2024,12 @@ class TestInterpretersSharingTheGil:
                         "tethered.activate(allow=[], locked=True, lock_token=token)\\n"
                         "import sys\\n"
                         "sys.audit('socket.connect', None, ('127.0.0.1', 9))\\n")
-            out["while locked"] = [
+            # This interpreter has only imported tethered, which loads no
+            # extension: deactivate() loads it, and is refused all the same.
+            out["loaded"] = core._c_guardian is not None
+            out["while locked"] = [connect(), deactivate()]
+            out["while locked"] += [
                 core._c_guardian.is_active(), core._c_guardian.verify(), core._config,
-                connect(), deactivate(),
             ]
             run(interp, "tethered.deactivate(lock_token=token)\\n")
             out["after"] = [core._c_guardian.is_active(), connect(), deactivate()]
@@ -2035,12 +2044,13 @@ class TestInterpretersSharingTheGil:
         assert child.returncode == 0, child.stderr
         assert "TAMPER DETECTED" not in child.stderr
         result = json.loads(result_file.read_text())
+        assert result["loaded"] is False
         assert result["while locked"] == [
+            ["EgressBlocked", f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}"],
+            "TetheredLocked",
             True,
             False,
             None,
-            ["EgressBlocked", f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}"],
-            "TetheredLocked",
         ]
         assert result["after"] == [False, "ok", "ok"]
 
@@ -2099,6 +2109,7 @@ class TestInterpretersSharingTheGil:
 
         refused = f"Blocked by tethered: 127.0.0.1 {NO_NETWORK}"
         assert result["main"] == {
+            "loaded": False,
             "is_active": True,
             "verify": False,
             "reach": [refused, refused],
@@ -2216,11 +2227,14 @@ out = {
     "joined before": lines[:2],
     "joined after": lines[2:-1],
     "dropped its copy": lines[-1],
+    # (In this order: the main interpreter has only imported tethered, and
+    # deactivate() is what loads the extension there.)
     "main": {
-        "is_active": core._c_guardian.is_active(),
-        "verify": core._c_guardian.verify(),
+        "loaded": core._c_guardian is not None,
         "reach": reach(),
         "deactivate": outcome(tethered.deactivate).partition(":")[0],
+        "is_active": core._c_guardian.is_active(),
+        "verify": core._c_guardian.verify(),
         "guardian.deactivate": outcome(core._c_guardian.deactivate, object()),
         "join": outcome(core._join_locked, core._c_guardian.locked_payload()),
     },
@@ -2343,7 +2357,9 @@ try:
     import _interpreters as interps
 except ImportError:
     import _xxsubinterpreters as interps
-import tethered._core as core  # loads the extension here; nothing is locked
+import tethered._core as core
+
+core._load_guardian()  # loads the extension here; nothing is locked
 
 out_dir, racers, policies = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
@@ -2359,6 +2375,8 @@ def run(interp, code):
     else:
         interps.run_string(interp, code)
 
+# (Importing tethered loads no extension there: each racer's activate() loads
+# it, in the race, and only then takes the claim.)
 PREPARE = "import tethered\\nimport tethered._core\\n"
 
 RACE = """
@@ -2436,7 +2454,9 @@ try:
     import _interpreters as interps
 except ImportError:
     import _xxsubinterpreters as interps
-import tethered._core as core  # loads the extension here; nothing is locked
+import tethered._core as core
+
+core._load_guardian()  # loads the extension here; nothing is locked
 
 out_dir, others = sys.argv[1], int(sys.argv[2])
 
@@ -2452,7 +2472,8 @@ def run(interp, code):
     else:
         interps.run_string(interp, code)
 
-PREPARE = "import tethered\\nimport tethered._core\\n"
+# (Loads the extension there before the race: activate() would, first thing.)
+PREPARE = "import tethered\\nimport tethered._core\\ntethered._core._load_guardian()\\n"
 
 COMMON = """
 import json, sys, time
@@ -2568,6 +2589,7 @@ except ImportError:
 import tethered
 import tethered._core as core
 
+core._load_guardian()  # what activate() does first: import tethered loads no extension
 shared_gil = sys.argv[1] == "shared"
 claim = core._activation_claim
 guardian = core._c_guardian
@@ -2623,6 +2645,7 @@ import json, os, sys, time
 import tethered
 import tethered._core as core
 
+core._load_guardian()
 claim = core._activation_claim
 
 def outcome(call, *args, **kwargs):
@@ -2782,6 +2805,7 @@ class TestAJoinThatFails:
             import _xxsubinterpreters as interps
         import tethered._core as core
 
+        core._load_guardian()  # what activate() does first: import tethered loads no extension
         variable = sys.argv[1]
         locked_policy = {
             "allow": ["allowed.test"], "allow_localhost": True, "log_only": False,
@@ -2896,6 +2920,8 @@ import json, sys
 loaded_at_startup = "tethered._core" in sys.modules
 sys.path.insert(0, %r)
 import tethered._core as core
+
+core._load_guardian()  # what the bootstrap does first
 
 def outcome(call, *args):
     try:
@@ -3258,7 +3284,9 @@ class TestConcurrency:
         """Several interpreters, each under its own GIL, lock a policy at the same moment.
 
         Nothing has been locked in the process before, so they also race to
-        install the guardian's audit hook.  They take turns (the activation
+        install the guardian's audit hook, and each racer's ``activate()``
+        loads the extension there first (importing tethered does not): the
+        claim it then takes is the guardian's.  They take turns (the activation
         claim): the first one publishes its policy and locks it, and each of
         the others, when its turn comes, finds the lock taken and is told so
         at the door, before it has written anything.  They are left without

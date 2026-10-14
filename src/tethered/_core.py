@@ -24,12 +24,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from tethered._guardian import _ActivationClaim
+
 from tethered._policy import AllowPolicy, _could_be_ip, _normalize_host
 
-try:
-    from tethered import _guardian as _c_guardian
-except ImportError:  # pragma: no cover
-    _c_guardian = None
+# The C guardian (locked mode, the activation claim).  ``import tethered``
+# does not load it: _load_guardian() does, at the start of activate(),
+# deactivate() and the startup bootstrap.  None until then, and where the
+# extension cannot be imported.
+_c_guardian = None
 
 logger = logging.getLogger("tethered")
 
@@ -393,7 +396,12 @@ class _UnsharedClaim:
 # pending exception (a KeyboardInterrupt, one set from another thread)
 # after ``__enter__`` has returned and before the block is entered, and
 # then never calls ``__exit__``.
-_activation_claim = _UnsharedClaim() if _c_guardian is None else _c_guardian.activation_claim
+#
+# _load_guardian() binds the guardian's claim here at the start of
+# activate(), deactivate() and the startup bootstrap, so before any policy
+# exists for the launch hook to republish.  Until then, and where the
+# extension is missing, an _UnsharedClaim stands in.
+_activation_claim: _UnsharedClaim | _ActivationClaim = _UnsharedClaim()
 
 _config: _Config | None = None
 
@@ -452,7 +460,13 @@ _active_scope_count: int = 0
 _scope_count_lock = threading.Lock()
 
 
-if hasattr(os, "register_at_fork"):  # pragma: no cover — POSIX only
+# os.register_at_fork where a process can fork, None elsewhere:
+# _reinit_locks_after_fork exists and is registered only where it is a
+# function.  (A constant, so that tests can take the other platform's branch
+# of _watch_forks.)
+_REGISTER_AT_FORK = getattr(os, "register_at_fork", None)
+
+if _REGISTER_AT_FORK is not None:  # pragma: no cover — POSIX only
 
     def _reinit_locks_after_fork() -> None:
         """Make this module's locks usable in a forked child, whoever held them in the parent.
@@ -474,9 +488,9 @@ if hasattr(os, "register_at_fork"):  # pragma: no cover — POSIX only
         one assignment).
 
         Defined only where a process can fork: locks have no
-        ``_at_fork_reinit`` elsewhere.  Coverage is not counted for it (the
-        figure is taken on every platform); ``TestLocksAfterFork`` tests it
-        wherever it exists.
+        ``_at_fork_reinit`` elsewhere.  Registered by :func:`_watch_forks`.
+        Coverage is not counted for it (the figure is taken on every
+        platform); ``TestLocksAfterFork`` tests it wherever it exists.
         """
         # Both methods are private to the lock types and absent from their
         # stubs, hence called by name.
@@ -488,7 +502,82 @@ if hasattr(os, "register_at_fork"):  # pragma: no cover — POSIX only
             if rlock is not None and not is_owned(rlock):
                 reinit(rlock)
 
-    os.register_at_fork(after_in_child=_reinit_locks_after_fork)
+
+# True until _watch_forks() has registered the fork handler.
+_fork_handler_pending = True
+
+
+def _watch_forks() -> None:
+    """Register :func:`_reinit_locks_after_fork` with ``os.register_at_fork``, where it exists.
+
+    ``import tethered`` registers nothing.  The handler is registered
+    before the first of the locks it resets is taken, by the two functions
+    every route to them goes through first: :func:`_load_guardian`, which
+    ``activate()``, ``deactivate()`` and the startup bootstrap call before
+    they take ``_lifecycle_lock``, the claim or ``_ip_map_lock``, and
+    :func:`_install_hook`, which a ``scope()`` takes ``_state_lock`` in and
+    calls before ``_scope_count_lock``.  The audit hook, which takes
+    ``_ip_map_lock``, is installed by ``_install_hook``.
+
+    Callers ask ``_fork_handler_pending`` first.  It is cleared after the
+    registration, so that an exception between the two leaves the
+    registration to the next call.  Two threads that both find it set
+    register the handler twice, which resets the locks twice in a child
+    and does no harm.
+    """
+    global _fork_handler_pending
+    if _REGISTER_AT_FORK is not None:
+        _REGISTER_AT_FORK(after_in_child=_reinit_locks_after_fork)
+    _fork_handler_pending = False
+
+
+# True until _load_guardian() has run.
+_guardian_load_pending = True
+
+
+def _load_guardian() -> None:
+    """Load the C guardian, once, and bind ``_c_guardian`` and ``_activation_claim`` to it.
+
+    ``import tethered`` loads no C extension (on a free-threaded build,
+    importing it re-enables the GIL).  What needs it calls this first:
+    ``activate()``, ``deactivate()``, :func:`_join_locked` and the startup
+    bootstrap (``_autoactivate``).  Each of them calls it before it takes
+    ``_lifecycle_lock`` or the claim, so every transition of every
+    interpreter takes the guardian's claim.  ``scope()`` does not: it never
+    asks the guardian anything.  The hook does only where a policy is in
+    place in this interpreter, which comes after a call to this.  (An
+    interpreter that has only entered scopes resolves names through
+    ``_socket``, which is also what ``resolve()`` serves an interpreter
+    outside a ``log_only`` lock; under an enforcing lock the guardian's own
+    hook refuses its lookups and launches before this module's runs.)
+
+    A policy is locked only after this has run, so the integrity snapshot
+    pins the two bindings it makes.  It binds them only while
+    ``_c_guardian`` is ``None``: a guardian already in place (a test's
+    stand-in) is left as it is, and so, once a policy is locked, is the
+    pinned one.  The claim is bound first, so that a thread that finds
+    ``_c_guardian`` bound finds its claim bound too.
+
+    Where the extension cannot be imported, ``_c_guardian`` stays ``None``
+    and the ``_UnsharedClaim`` stays in place: nothing can be locked, as
+    ``activate(locked=True)`` then says.  Any other error of the import is
+    raised to the caller, and the next call tries again.  The fork handler
+    is registered first (:func:`_watch_forks`).
+    """
+    global _activation_claim, _c_guardian, _guardian_load_pending
+    if _fork_handler_pending:
+        _watch_forks()
+    if not _guardian_load_pending:
+        return
+    try:
+        from tethered import _guardian
+    except ImportError:
+        pass
+    else:
+        if _c_guardian is None:
+            _activation_claim = _guardian.activation_claim
+            _c_guardian = _guardian
+    _guardian_load_pending = False
 
 
 def _adjust_scope_count(delta: int) -> None:
@@ -3579,8 +3668,13 @@ def _install_hook() -> None:
 
     Raises ``RuntimeError`` when the hook is not live.  ``_hook_installed``
     then stays ``False`` and a later call tries again.
+
+    The fork handler is registered first (:func:`_watch_forks`): this is
+    where a ``scope()`` takes the first of the locks it resets.
     """
     global _hook_installed
+    if _fork_handler_pending:
+        _watch_forks()
     with _state_lock:
         if _hook_installed:
             return
@@ -4074,6 +4168,7 @@ def activate(
     """
     global _config
 
+    _load_guardian()
     _validate_allow(allow)
     _validate_bool(log_only, "log_only")
     _validate_bool(fail_closed, "fail_closed")
@@ -4315,6 +4410,10 @@ def deactivate(*, lock_token: object | None = None) -> None:
     """
     global _config
 
+    # Even with nothing active here: another interpreter may hold a lock,
+    # which only the guardian knows of, and the variable this call clears
+    # is the whole process's.
+    _load_guardian()
     # (The try around the with: see _activation_claim.)
     held = _activation_claim.held()
     try:
@@ -4380,6 +4479,7 @@ def _join_locked(payload: str) -> None:
     ``TypeError`` / ``ValueError`` / ``KeyError`` for a payload that is not
     that of a locked policy.  ``_config`` is bound only by a successful join.
     """
+    _load_guardian()
     if _c_guardian is None:
         msg = "tethered: joining a locked policy requires the C guardian extension"
         raise RuntimeError(msg)

@@ -165,10 +165,16 @@ def _autoactivate_from_env() -> None:
 
 
 def _claim_and_guardian() -> tuple | None:
-    """Return ``_core``'s activation claim and C guardian, or ``None`` if tethered cannot load."""
+    """Return ``_core``'s activation claim and C guardian, or ``None`` if tethered cannot load.
+
+    The guardian is loaded here (``import tethered`` does not load it), so
+    that the bootstrap takes the claim every interpreter takes and can ask
+    whether a policy is locked.
+    """
     try:
         import tethered._core as _core
 
+        _core._load_guardian()
         return _core._activation_claim, _core._c_guardian
     except Exception:
         return None

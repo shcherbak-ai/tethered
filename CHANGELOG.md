@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] — 2026-10-14
+
+### Changed
+
+- Importing tethered no longer loads its C extension or registers a fork handler. The extension is loaded by the first `activate()` or `deactivate()`, and by the start-up bootstrap of a child process or subinterpreter that inherits a policy or a scope. The handler that resets tethered's locks in a forked child is registered by the first of those calls or by the first `scope()`. On a free-threaded build of Python this keeps the GIL off where tethered is only imported: the extension does not declare free-threading support, so loading it re-enables the GIL for the whole process. A program that imports tethered, or only enters scopes, now keeps running without the GIL, and the GIL is re-enabled, with Python's `RuntimeWarning`, at the first `activate()` or `deactivate()`. What is enforced does not change, nor does locked mode, nor a missing extension (`locked=True` still raises `RuntimeError`). tethered is still not validated on free-threaded Python and publishes no free-threaded wheels.
+
 ## [1.0.1] — 2026-10-14
 
 ### Fixed
@@ -253,6 +259,7 @@ The security fixes that can stop a setup that ran on 0.5.3 are under Breaking ch
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[1.0.2]: https://github.com/shcherbak-ai/tethered/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/shcherbak-ai/tethered/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shcherbak-ai/tethered/compare/v0.5.3...v1.0.0
 [0.5.3]: https://github.com/shcherbak-ai/tethered/compare/v0.5.2...v0.5.3

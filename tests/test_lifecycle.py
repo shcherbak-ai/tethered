@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import threading
+import types
 
 import pytest
 
@@ -518,6 +519,7 @@ import os, sys, threading, time
 
 import tethered._core as core
 
+core._load_guardian()  # what activate() does first: import tethered loads no extension
 claim = core._activation_claim
 held = threading.Event()
 
@@ -1630,6 +1632,41 @@ print("child", os.waitstatus_to_exitcode(status), flush=True)
 os._exit(0)
 """
 
+# The same in a process that has only entered a scope: the fork handler is
+# registered there too, without the C extension.
+_FORK_AFTER_A_SCOPE = """
+import os, signal, sys, threading
+import tethered
+import tethered._core as core
+
+with tethered.scope(allow=["*.example.com"]):
+    pass
+held = threading.Event()
+
+
+def hold():
+    core._state_lock.acquire()
+    core._scope_count_lock.acquire()
+    held.set()
+    threading.Event().wait()
+
+
+threading.Thread(target=hold, daemon=True).start()
+assert held.wait(10)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(20)
+    try:
+        with tethered.scope(allow=["*.example.com"]):  # needs both locks
+            pass
+    except BaseException:
+        os._exit(3)
+    os._exit(4 if "tethered._guardian" in sys.modules else 0)
+_, status = os.waitpid(pid, 0)
+print("child", os.waitstatus_to_exitcode(status), flush=True)
+os._exit(0)
+"""
+
 
 @pytest.mark.skipif(
     not hasattr(os, "register_at_fork"), reason="a process cannot fork on this platform"
@@ -1700,11 +1737,305 @@ class TestLocksAfterFork:
             assert claim._lock.acquire(blocking=False) is True
             claim._lock.release()
 
-    def test_a_forked_child_is_not_stuck_behind_a_lock_of_another_thread(self, tmp_path):
+    @pytest.mark.parametrize(
+        "script",
+        [_FORK_WITH_A_HELD_LOCK, _FORK_AFTER_A_SCOPE],
+        ids=["after-activate", "after-a-scope-only"],
+    )
+    def test_a_forked_child_is_not_stuck_behind_a_lock_of_another_thread(self, script, tmp_path):
         """End to end: before the reset, the child waited for ever at its first lookup."""
-        script = tmp_path / "fork_with_a_held_lock.py"
-        script.write_text(_FORK_WITH_A_HELD_LOCK, encoding="utf-8")
+        path = tmp_path / "fork_with_a_held_lock.py"
+        path.write_text(script, encoding="utf-8")
         result = subprocess.run(  # nosec B603
-            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+            [sys.executable, str(path)], capture_output=True, text=True, timeout=60
         )
         assert result.stdout.strip() == "child 0", result.stderr
+
+
+# ── The C extension and the fork handler, on first use ─────────────
+# ``import tethered`` loads no C extension (on a free-threaded build, loading
+# it re-enables the GIL) and registers no fork handler.  activate(),
+# deactivate() and the startup bootstrap load the extension; they and the
+# first scope() register the fork handler.  conftest.py loads the extension
+# for the whole run, so what a process does on the way there is seen in
+# fresh processes, and the loader's own steps here, with its state reset.
+
+_FORK_HANDLER = (
+    ["tethered._core._reinit_locks_after_fork"] if hasattr(os, "register_at_fork") else []
+)
+
+# A fresh process records the at-fork handlers registered from tethered's
+# modules, imports tethered, takes the steps named in ``sys.argv`` and
+# reports what is loaded after each.
+_FIRST_USE = """
+import json, os, sys
+
+registered = []
+if hasattr(os, "register_at_fork"):
+    register = os.register_at_fork
+
+    def recording(**handlers):
+        for handler in handlers.values():
+            name = getattr(handler, "__module__", "") + "." + getattr(handler, "__qualname__", "")
+            registered.append(name)
+        register(**handlers)
+
+    os.register_at_fork = recording
+
+gil = getattr(sys, "_is_gil_enabled", lambda: None)
+report = {"gil before": gil()}
+
+
+def state():
+    core = sys.modules["tethered._core"]
+    guardian = sys.modules.get("tethered._guardian")
+    return {
+        "extension": guardian is not None,
+        "bound": guardian is not None
+        and core._c_guardian is guardian
+        and core._activation_claim is guardian.activation_claim,
+        "fork handlers": [name for name in registered if name.startswith("tethered.")],
+        "gil": gil(),
+    }
+
+
+import tethered
+
+report["import"] = state()
+report["steps"] = []
+for step in sys.argv[1:]:
+    if step == "scope":
+        with tethered.scope(allow=["a.test"]):
+            pass
+        tethered.scope(allow=["a.test"])(lambda: None)()
+    elif step == "activate":
+        tethered.activate(allow=["a.test"])
+    else:
+        tethered.deactivate()
+    report["steps"].append(state())
+print(json.dumps(report))
+"""
+
+
+def _first_use(*steps: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if k != POLICY_VAR}
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-c", _FIRST_USE, *steps],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.splitlines()[-1])
+
+
+class _Failing:
+    """A meta path finder for which importing the C extension fails with a RuntimeError."""
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name == "tethered._guardian":
+            raise RuntimeError("the extension failed to load")
+        return None
+
+
+class TestLoadingOnFirstUse:
+    def test_importing_tethered_loads_and_registers_nothing(self):
+        report = _first_use()
+        assert report["import"] == {
+            "extension": False,
+            "bound": False,
+            "fork handlers": [],
+            "gil": report["gil before"],  # on a free-threaded build: still off
+        }
+
+    @pytest.mark.parametrize(
+        "steps",
+        [
+            ["scope", "scope"],
+            ["activate"],
+            ["deactivate"],
+            ["scope", "activate", "deactivate", "scope"],
+        ],
+        ids=["scope", "activate", "deactivate", "scope-then-activate"],
+    )
+    def test_activate_and_deactivate_load_it_and_a_scope_does_not(self, steps):
+        report = _first_use(*steps)
+        loaded = False
+        for step, found in zip(steps, report["steps"], strict=True):
+            loaded = loaded or step != "scope"
+            assert found["extension"] is loaded, step
+            assert found["bound"] is loaded, step
+            # Registered by whichever came first, and once.
+            assert found["fork handlers"] == _FORK_HANDLER, step
+            if not loaded:
+                assert found["gil"] == report["gil before"]
+
+    @pytest.mark.parametrize(
+        ("payload", "loaded"),
+        [
+            (None, False),
+            ({"global": {"allow": ["a.test"]}, "scopes": []}, True),
+            ({"global": None, "scopes": [{"allow": ["a.test"]}]}, True),
+        ],
+        ids=["no-policy", "a-policy", "scopes-only"],
+    )
+    def test_the_bootstrap_of_a_child_loads_it(self, payload, loaded):
+        """The bootstrap takes the claim and asks about a lock, whatever the payload holds."""
+        env = {k: v for k, v in os.environ.items() if k != POLICY_VAR}
+        if payload is not None:
+            env[POLICY_VAR] = json.dumps(payload)
+        result = subprocess.run(  # nosec B603
+            [
+                sys.executable,
+                "-c",
+                "import json, sys; print(json.dumps('tethered._guardian' in sys.modules))",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) is loaded
+
+    # ── The same steps in this process, with the loader's state reset ──
+
+    @pytest.fixture
+    def unloaded(self, monkeypatch) -> list[dict]:
+        """tethered as importing it leaves it; returns the fork handlers registered from now on."""
+        registered: list[dict] = []
+        # What the loader imports: the instance the run started with.
+        monkeypatch.setitem(sys.modules, "tethered._guardian", guardian)
+        monkeypatch.setattr(tethered, "_guardian", guardian)
+        monkeypatch.setattr(_core, "_guardian_load_pending", True)
+        monkeypatch.setattr(_core, "_c_guardian", None)
+        monkeypatch.setattr(_core, "_activation_claim", _core._UnsharedClaim())
+        monkeypatch.setattr(_core, "_fork_handler_pending", True)
+        monkeypatch.setattr(_core, "_REGISTER_AT_FORK", lambda **kw: registered.append(kw))
+        if not hasattr(_core, "_reinit_locks_after_fork"):  # where a process cannot fork
+            monkeypatch.setattr(_core, "_reinit_locks_after_fork", lambda: None, raising=False)
+        return registered
+
+    @staticmethod
+    def _assert_loaded() -> None:
+        assert _core._c_guardian is guardian
+        assert _core._activation_claim is guardian.activation_claim
+        assert _core._guardian_load_pending is False
+
+    @staticmethod
+    def _assert_not_loaded(stand_in: object) -> None:
+        assert _core._c_guardian is None
+        assert _core._activation_claim is stand_in
+        assert _core._guardian_load_pending is True
+
+    def test_scope_here(self, unloaded):
+        stand_in = _core._activation_claim
+        with tethered.scope(allow=["a.test"]):
+            pass
+        tethered.scope(allow=["a.test"])(lambda: None)()
+        self._assert_not_loaded(stand_in)
+        assert unloaded == [{"after_in_child": _core._reinit_locks_after_fork}]
+        assert _core._fork_handler_pending is False
+
+    @pytest.mark.parametrize("call", ["activate", "deactivate"])
+    def test_activate_and_deactivate_here(self, call, unloaded):
+        if call == "activate":
+            tethered.activate(allow=["a.test"])
+            tethered.deactivate()
+        else:
+            tethered.deactivate()
+        self._assert_loaded()
+        assert unloaded == [{"after_in_child": _core._reinit_locks_after_fork}]
+        _assert_coherent()
+
+    def test_the_bootstrap_and_a_join_here(self, unloaded):
+        from tethered import _autoactivate
+
+        assert _autoactivate._claim_and_guardian() == (guardian.activation_claim, guardian)
+        self._assert_loaded()
+        _core._guardian_load_pending = True
+        _core._c_guardian = None
+        with pytest.raises(KeyError):
+            _core._join_locked("{}")  # loaded first, then the payload is read
+        self._assert_loaded()
+        assert len(unloaded) == 1
+
+    def test_a_stand_in_survives_the_loader(self, monkeypatch):
+        # (The egress guard in conftest.py asks whatever is there.)
+        stand_in = types.SimpleNamespace(is_active=lambda: False)
+        claim_stand_in = _core._UnsharedClaim()
+        monkeypatch.setattr(_core, "_guardian_load_pending", True)
+        monkeypatch.setattr(_core, "_c_guardian", stand_in)
+        monkeypatch.setattr(_core, "_activation_claim", claim_stand_in)
+        _core._load_guardian()
+        assert _core._c_guardian is stand_in
+        assert _core._activation_claim is claim_stand_in
+        assert _core._guardian_load_pending is False
+
+    def test_without_the_extension(self, unloaded, monkeypatch):
+        """As in a build without it: an unlocked policy works, a locked one is refused."""
+        monkeypatch.setitem(sys.modules, "tethered._guardian", None)
+        monkeypatch.delattr(tethered, "_guardian")
+        stand_in = _core._activation_claim
+
+        tethered.activate(allow=["a.test"])
+        assert _core._c_guardian is None
+        assert _core._activation_claim is stand_in
+        assert _core._guardian_load_pending is False
+        assert os.environ[POLICY_VAR] == _core._config._serialized_payload
+        with pytest.raises(RuntimeError, match="requires the C guardian extension"):
+            tethered.activate(allow=["a.test"], locked=True, lock_token=object())
+        tethered.deactivate()
+        assert _core._config is None
+        assert POLICY_VAR not in os.environ
+
+    def test_another_failure_is_raised_and_the_next_call_tries_again(self, unloaded, monkeypatch):
+        stand_in = _core._activation_claim
+        with monkeypatch.context() as patch:
+            patch.delitem(sys.modules, "tethered._guardian")
+            patch.delattr(tethered, "_guardian")
+            patch.setattr(sys, "meta_path", [_Failing(), *sys.meta_path])
+            with pytest.raises(RuntimeError, match="failed to load"):
+                tethered.activate(allow=["a.test"])
+            self._assert_not_loaded(stand_in)
+            assert _core._config is None
+        tethered.activate(allow=["a.test"])
+        tethered.deactivate()
+        self._assert_loaded()
+
+    def test_its_flags_set_again_under_a_lock_change_nothing(self, unloaded, capfd):
+        """They are unpinned runtime state: setting them again rebinds nothing the guardian pins."""
+        token = object()
+        tethered.activate(allow=["a.test"], locked=True, lock_token=token)
+        _core._guardian_load_pending = True
+        _core._fork_handler_pending = True
+        _core._load_guardian()
+        self._assert_loaded()
+        assert guardian.verify() is True
+        # The handler once more, which resets the locks once more in a child.
+        assert unloaded == [{"after_in_child": _core._reinit_locks_after_fork}] * 2
+        assert "TAMPER DETECTED" not in capfd.readouterr().err
+        tethered.deactivate(lock_token=token)
+        _assert_coherent()
+
+    def test_where_a_process_cannot_fork_nothing_is_registered(self, unloaded, monkeypatch):
+        monkeypatch.setattr(_core, "_REGISTER_AT_FORK", None)
+        _core._install_hook()
+        assert _core._fork_handler_pending is False
+        _core._load_guardian()
+        assert unloaded == []
+
+    def test_an_interrupted_registration_is_made_by_the_next_call(self, unloaded, monkeypatch):
+        def interrupted(**handlers):
+            monkeypatch.setattr(_core, "_REGISTER_AT_FORK", lambda **kw: unloaded.append(kw))
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(_core, "_REGISTER_AT_FORK", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            _core._install_hook()
+        assert _core._fork_handler_pending is True
+        _core._install_hook()
+        assert unloaded == [{"after_in_child": _core._reinit_locks_after_fork}]
+        assert _core._fork_handler_pending is False

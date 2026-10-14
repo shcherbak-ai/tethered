@@ -89,8 +89,10 @@ def _holds_lock() -> bool | None:
     """Whether this interpreter is the one that took the lock of the process.
 
     The C extension's own answer, which tells the holder from an interpreter
-    that joined: both have a locked policy.  ``None`` where tethered is not
-    imported.  Like ``whoami()["locked"]`` it reads tethered's internals.
+    that joined: both have a locked policy.  ``None`` where tethered has not
+    loaded the extension (it does at the first ``activate()``,
+    ``deactivate()`` or startup bootstrap, not when it is imported).  Like
+    ``whoami()["locked"]`` it reads tethered's internals.
     """
     core = sys.modules.get("tethered._core")
     guardian = getattr(core, "_c_guardian", None)

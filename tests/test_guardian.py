@@ -667,6 +667,8 @@ _UNPINNED_GLOBALS = {
         "_fork_server_warning_pending": "cleared once the fork-server warning has been logged",
         "_pth_path_cache": "bootstrap path cached for scope-only use (None until computed)",
         "_env_dirty": "set when the policy variable changed behind os.environ's back",
+        "_fork_handler_pending": "cleared once the fork handler is registered",
+        "_guardian_load_pending": "cleared once the C guardian has been loaded (or found missing)",
         **_MODULE_METADATA,
     },
     "tethered._policy": dict(_MODULE_METADATA),
@@ -2713,6 +2715,7 @@ import json, os, sys
 import tethered
 import tethered._core as core
 
+core._load_guardian()  # what activate() does first: import tethered loads no extension
 guardian = core._c_guardian
 PROBE = "tethered._guardian.probe"
 VARIABLE = "_TETHERED_CHILD_POLICY"
@@ -3107,11 +3110,14 @@ class TestModuleInstances:
         import importlib
 
         first = sys.modules["tethered._guardian"]
+        # Both names are given back as they are now, the first instance.
+        # (Importing a submodule also rebinds the package attribute, which
+        # the loader of tethered._core reads.)
+        monkeypatch.setattr(tethered, "_guardian", first)
         monkeypatch.delitem(sys.modules, "tethered._guardian")
         again = importlib.import_module("tethered._guardian")
-        monkeypatch.setitem(sys.modules, "tethered._guardian", first)
-        # (importing a submodule also rebinds the package attribute)
-        monkeypatch.setattr(tethered, "_guardian", first, raising=False)
+        sys.modules["tethered._guardian"] = first
+        tethered._guardian = first
         assert again is not first
         assert _core._c_guardian is first
         return again

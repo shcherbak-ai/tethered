@@ -38,6 +38,14 @@ from tethered._core import (
 )
 from tethered._policy import AllowPolicy
 
+# tethered loads its C extension at the first activate(), deactivate() or
+# startup bootstrap, not when it is imported.  The tests look for it before
+# that: at collection (the marks that skip without it) and in module-level
+# names.  It is loaded here, once for the run, so that every test starts with
+# it in place.  The loading itself is tested in fresh processes
+# (test_lifecycle.py, TestLoadingOnFirstUse).
+_core._load_guardian()
+
 # Destinations the test suite may reach; localhost is allowed by default
 _GUARD_POLICY = AllowPolicy(["dns.google"], allow_localhost=True)
 
