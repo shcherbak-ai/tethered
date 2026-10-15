@@ -132,7 +132,7 @@ Look at a change as GitHub will show it before pushing it. `uv run inv readme-pr
 - The look comes from github-markdown-css, in GitHub's colours, light or dark as the browser is set. The column is as wide as GitHub's at 1280 pixels and wider, and below 768.
 - A reload sends the README to GitHub again when it has changed. GitHub allows 60 of those an hour without a token.
 
-The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it as the game's share card from shcherbak.ai: the duck at work by a path in pixel art and a gate shut across it, and on paper the mark, the README's heading, the tagline's claims and the company's name. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
+The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it as the game's share card from shcherbak.ai: the duck at work by a path in pixel art and a gate shut across it, and on paper the mark, the README's heading, the tagline's claims and the company's name. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium; it also writes `docs/assets/social-preview.png`, the picture a link to the documentation site shows) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
 
 The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
 
@@ -191,10 +191,11 @@ docs/                     # The pages of the documentation site
     migrating-to-v1.md    # The 1.0.0 migration guide: the changelog's breaking changes by what a deployment uses
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
-    assets/, stylesheets/ # The images of the site and the README, and the site's look
+    assets/, stylesheets/ # The images of the site and the README, the site's share image, and the site's look
 assets/                   # The README's own images: the pixel rule between its parts and the pixel names of the sibling projects
 social/                   # The repository's social preview: the SVG it is drawn in and the PNG that is uploaded to GitHub
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
+overrides/main.html       # The site's page template: the title, description and picture a link to a page shows on other sites
 tasks.py                  # Invoke tasks: docs, docs-live, readme-preview, social-preview
 package.json              # Development tools from npm, not part of the package: the agents' browser and the README preview's stylesheet
 .mcp.json                 # Starts the agents' browser (Playwright MCP)

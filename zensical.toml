@@ -43,6 +43,8 @@ nav = [
 
 [project.theme]
 language = "en"
+# The theme's page with a picture and a title for a link to it on other sites.
+custom_dir = "overrides"
 font = false
 logo = "assets/tethered-mark.svg"
 favicon = "assets/favicon.svg"
