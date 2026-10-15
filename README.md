@@ -39,6 +39,8 @@ urllib.request.urlopen("https://api.stripe.com/v1/charges")  # allowed: matches 
 urllib.request.urlopen("https://evil.test/exfil")            # raises tethered.EgressBlocked
 ```
 
+<p align="center"><img src="assets/tethered-separator.svg" alt="" width="444" height="28"></p>
+
 ## Why
 
 Your code, your dependencies and AI-generated code share one Python process, and any of them can open a connection you never intended. Firewalls, network policies and proxies can stop that, but they take a platform team, a separate service or admin rights. tethered takes one line of Python. It complements those controls and does not replace them.
@@ -48,6 +50,8 @@ Your code, your dependencies and AI-generated code share one Python process, and
 | A dependency that phones home through Python's networking is stopped: the process reaches the hosts you listed and nothing else. | Code an agent wrote runs under the same allow list as the rest of the process, in production and in your test suite. | `scope()` holds a request handler, a background job or a library call to the destinations it needs. |
 
 The check adds about 25 µs to a connection ([measurements](https://tethered.shcherbak.ai/ARCHITECTURE/#performance)).
+
+<p align="center"><img src="assets/tethered-separator.svg" alt="" width="444" height="28"></p>
 
 ## Install
 
@@ -121,6 +125,8 @@ Under a lock, tampering with tethered's own code or with the active policy is de
 4. **Enforce** once the log shows nothing the application needs: drop `log_only`.
 5. **Lock it** ([above](#lock-it-down-in-production)).
 
+<p align="center"><img src="assets/tethered-separator.svg" alt="" width="444" height="28"></p>
+
 ## Allow list syntax
 
 | Rule | Matches |
@@ -160,6 +166,8 @@ The documentation is at [tethered.shcherbak.ai](https://tethered.shcherbak.ai/),
 ## License
 
 [MIT](LICENSE)
+
+<p align="center"><img src="assets/tethered-separator.svg" alt="" width="444" height="28"></p>
 
 ## More from shcherbak_ai
 

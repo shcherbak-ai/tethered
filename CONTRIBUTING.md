@@ -120,6 +120,8 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 `README.md` is what GitHub shows. Link to a page of the documentation at its address on the site (`https://tethered.shcherbak.ai/API/`); the site describes the last release, so a page or a heading that is new on `dev` is not there yet. Use relative paths for images and for other files of the repository (`docs/assets/tethered-mark.svg`, `examples/`): they work in a local preview and follow the branch being viewed. Badges, GitHub service pages such as Actions, and other sites keep absolute URLs.
 
+`assets/tethered-separator.svg` is the pixel rule between the README's main parts: the mark's kite at rest, with the first steps of its tether, between dashes in the mark's orange, shaded as the mark is. It is pixel art of 222 by 14 pixels, one path of rectangles per colour. Show it at twice that size (`width="444"`) with an empty `alt`, and keep section headings as text, so that their anchors, GitHub's outline and page search keep working. When the mark's kite changes, draw the rule again from it.
+
 The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
 
 Look at a change as GitHub will show it before pushing it. `uv run inv readme-preview` serves `README.md` at <http://127.0.0.1:9110/> (`--port N` for another port):
@@ -188,7 +190,7 @@ docs/                     # The pages of the documentation site
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
     assets/, stylesheets/ # The images of the site and the README, and the site's look
-assets/                   # The README's own images: the pixel names of the sibling projects
+assets/                   # The README's own images: the pixel rule between its parts and the pixel names of the sibling projects
 social/                   # The repository's social preview: the SVG it is drawn in and the PNG that is uploaded to GitHub
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
 tasks.py                  # Invoke tasks: docs, docs-live, readme-preview, social-preview
