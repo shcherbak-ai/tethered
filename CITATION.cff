@@ -3,8 +3,8 @@ message: "If you use this software, please cite it as below."
 type: software
 title: "Tethered"
 abstract: "Runtime network egress control for Python"
-version: 1.0.1
-date-released: 2026-10-14
+version: 1.1.0
+date-released: 2026-10-15
 license: MIT
 repository-code: "https://github.com/shcherbak-ai/tethered"
 url: "https://github.com/shcherbak-ai/tethered"
