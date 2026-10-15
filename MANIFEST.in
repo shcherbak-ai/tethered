@@ -1,1 +1,4 @@
 include src/tethered.pth
+# setuptools adds tests/test*.py to an sdist by default, without the
+# conftest.py they need; the tests are not distributed.
+prune tests
