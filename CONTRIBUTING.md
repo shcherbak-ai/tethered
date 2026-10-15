@@ -132,7 +132,7 @@ Look at a change as GitHub will show it before pushing it. `uv run inv readme-pr
 - The look comes from github-markdown-css, in GitHub's colours, light or dark as the browser is set. The column is as wide as GitHub's at 1280 pixels and wider, and below 768.
 - A reload sends the README to GitHub again when it has changed. GitHub allows 60 of those an hour without a token.
 
-The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it, from the mark, the README's heading and the README's figure. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
+The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it as the game's share card from shcherbak.ai: the duck at work by a path in pixel art and a gate shut across it, and on paper the mark, the README's heading, the tagline's claims and the company's name. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
 
 The package description on PyPI is [PYPI.md](PYPI.md) (`project.readme` in `pyproject.toml`). Keep it short and without images, use absolute HTTPS links, and update it when the summary, the install command or the limits change.
 
