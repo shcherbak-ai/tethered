@@ -95,8 +95,10 @@ node --test .claude/hooks/playwright-files.test.mjs  # the Claude Code hook that
 The licences of the package's dependencies are checked in CI (`.github/workflows/licenseal.yml`), with [licenseal](https://github.com/shcherbak-ai/licenseal). tethered has none, so the check passes with nothing to judge. To run it locally:
 
 ```bash
-uv run licenseal check --exclude-dirs tests_containers
+uv run licenseal check --exclude-dirs tests_containers,benchmarks/dns_lookups
 ```
+
+The two directories hold what the container suites and the DNS benchmark install into their Docker images, which tethered neither depends on nor ships.
 
 ## Documentation
 

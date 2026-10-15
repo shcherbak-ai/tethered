@@ -42,7 +42,9 @@ jobs:
         run: uv sync --locked
 
       # tests_containers/ holds the requirements of the servers and libraries
-      # the container suites install into their images.  tethered neither
-      # depends on them nor ships them, so they are left out of the scan.
+      # the container suites install into their images, and
+      # benchmarks/dns_lookups/ the pin the DNS benchmark installs into its
+      # own.  tethered neither depends on them nor ships them, so they are
+      # left out of the scan.
       - name: Check the licences of the dependencies
-        run: uv run licenseal check --exclude-dirs tests_containers
+        run: uv run licenseal check --exclude-dirs tests_containers,benchmarks/dns_lookups
