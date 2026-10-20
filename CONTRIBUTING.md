@@ -126,11 +126,11 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
 
-Look at a change as GitHub will show it before pushing it. `uv run inv readme-preview` serves `README.md` at <http://127.0.0.1:9110/> (`--port N` for another port):
+Look at a change as GitHub will show it before pushing it. `uv run inv readme-preview` serves `README.md` in GitHub's light theme at <http://127.0.0.1:9110/> and in its dark theme at <http://127.0.0.1:9111/> (`--port N` serves them at N and N+1):
 
 - The HTML is what GitHub's Markdown API returns for the file, so what GitHub removes from a README is removed here too.
-- The look comes from github-markdown-css, in GitHub's colours, light or dark as the browser is set. The column is as wide as GitHub's at 1280 pixels and wider, and below 768.
-- A reload sends the README to GitHub again when it has changed. GitHub allows 60 of those an hour without a token.
+- The look comes from github-markdown-css, in GitHub's colours, each page in its theme whatever the browser is set to. The column is as wide as GitHub's at 1280 pixels and wider, and below 768.
+- A reload sends the README to GitHub again when it has changed, once for both pages. GitHub allows 60 of those an hour without a token.
 
 The picture that a link to the repository is shown with on other sites is `social/github-social-preview.png`. It is drawn in the SVG beside it as the game's share card from shcherbak.ai: the duck at work by a path in pixel art and a gate shut across it, and on paper the mark, the README's heading, the tagline's claims and the company's name. When one of those changes, change the SVG with it, render the picture again with `uv run inv social-preview` (the task needs Chrome, Edge or Chromium; it also writes `docs/assets/social-preview.png`, the picture a link to the documentation site shows) and say so in the pull request: GitHub reads no file for the social preview, so a maintainer uploads the picture in the repository's settings.
 
