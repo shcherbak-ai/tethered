@@ -2,7 +2,7 @@
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), Docker (for the `cppcheck` pre-commit hook and for the container suites), and [Node.js](https://nodejs.org/) for the development tools that `package.json` lists: the stylesheet of the README preview and the agents' browser. None of them is part of the package.
+**Prerequisites:** Python 3.11+, a C compiler, [uv](https://docs.astral.sh/uv/), Docker (for the `cppcheck` pre-commit hook and for the container suites), and [Node.js](https://nodejs.org/) 22 or later for the development tools that `package.json` lists: the Markdown linter of the pre-commit hooks, the stylesheet of the README preview and the agents' browser. None of them is part of the package, and none runs a script when it is installed (`ignore-scripts` in `.npmrc`).
 
 ```bash
 git clone https://github.com/shcherbak-ai/tethered.git
@@ -68,11 +68,11 @@ uv run python tests_containers/run.py --suite gunicorn -k reload --verbose
 uv run python tests_containers/run.py --list
 ```
 
-**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly, on one Python version, against the latest release of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/AGENTS.md](tests_containers/AGENTS.md) explains how they work and how to add a suite.
+**Run the container suites before merging a change to `src/tethered/_core.py`, `src/tethered/_autoactivate.py`, `src/tethered/_guardian.c`, `src/tethered.pth` or `setup.py`.** The unit tests drive tethered from inside one pytest process; whether a policy survives a server's forks, reloads and choice of event loop only shows under the server. CI runs these suites on every pull request that touches `src/`, `setup.py`, `pyproject.toml` or `tests_containers/`, and weekly, on one Python version, against the latest release of a week ago of every server. They are not collected by `uv run pytest tests/` and are not part of the coverage figure. [tests_containers/AGENTS.md](tests_containers/AGENTS.md) explains how they work and how to add a suite.
 
 ## Linting and formatting
 
-Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, deptry, commitizen) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`:
+Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, deptry, commitizen, and the checks of whitespace, YAML and TOML) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`; markdownlint-cli2 runs in the version of `package-lock.json`, which `npm ci` installs. No hook is installed by pre-commit itself, which would resolve its dependencies afresh, past the cooldown described below:
 
 ```bash
 uv run pre-commit run --all-files
@@ -89,8 +89,11 @@ uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 uv run deptry .            # imports against declared dependencies
 uv lock --check            # uv.lock matches pyproject.toml
+uv run python scripts/check_advisories.py  # the one-week cooldown is set, and osv.dev has no advisory of a locked version
 node --test .claude/hooks/playwright-files.test.mjs  # the Claude Code hook that keeps the agents' browser files in one folder
 ```
+
+A release enters the lockfiles only a week after its upload, when a compromised one has been found and removed: `[tool.uv] exclude-newer = "7 days"` in `pyproject.toml` holds back `uv.lock` and the build requirements of `uv build`, and `min-release-age=7` in `.npmrc` holds back `package-lock.json`. The `advisories` hook checks both settings and asks [osv.dev](https://osv.dev) for the advisories of each version that `uv.lock`, `package-lock.json` and `.github/docs-constraints.txt` hold, and fails on a known vulnerability or a report of a malicious package, but for those listed with their reasons in `ACCEPTED_ADVISORIES` in [scripts/check_advisories.py](scripts/check_advisories.py). An advisory can come out at any time, so the hook can fail on a change that touches no dependency: commit with `SKIP=advisories` in front of the command, and the maintainer upgrades the dependency. CI skips it, as its result depends on the day.
 
 The licences of the package's dependencies are checked in CI (`.github/workflows/licenseal.yml`), with [licenseal](https://github.com/shcherbak-ai/licenseal). tethered has none, so the check passes with nothing to judge. To run it locally:
 
@@ -154,6 +157,7 @@ src/tethered.pth          # Auto-imported by site.py — runs _autoactivate in e
 setup.py                  # Build config: C extension + tethered.pth packaging (setuptools)
 scripts/
     cppcheck.sh           # Docker-based cppcheck runner for pre-commit
+    check_advisories.py   # Pre-commit check: the one-week cooldown, and the advisories of the locked versions
     wheel_smoke_test.py   # Post-build smoke test invoked by cibuildwheel
 tests/
     conftest.py           # Test-suite egress guard + .pth installer for editable installs
@@ -197,7 +201,8 @@ social/                   # The repository's social preview: the SVG it is drawn
 zensical.toml             # The documentation site: navigation, theme, the footer with the version, Markdown extensions, the llms.txt index
 overrides/main.html       # The site's page template: the title, description and picture a link to a page shows on other sites
 tasks.py                  # Invoke tasks: docs, docs-live, readme-preview, social-preview
-package.json              # Development tools from npm, not part of the package: the agents' browser and the README preview's stylesheet
+package.json              # Development tools from npm, not part of the package: the agents' browser, the README preview's stylesheet, the Markdown linter
+.npmrc                    # A release enters package-lock.json a week after its publication; no install scripts
 .mcp.json                 # Starts the agents' browser (Playwright MCP)
 .claude/                  # Claude Code's shared settings and the hook that keeps the browser's files in .playwright-mcp/
 .python-version           # The Python that uv builds the development environment on

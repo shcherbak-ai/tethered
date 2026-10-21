@@ -75,6 +75,13 @@ jobs:
           CIBW_BUILD: cp311-* cp312-* cp313-* cp314-* cp315-*
           CIBW_SKIP: "*-musllinux_i686"
           CIBW_ARCHS_LINUX: "auto"
+          # The build requirements (setuptools) as of a week ago, as
+          # [tool.uv] exclude-newer holds uv.lock: a release that is younger
+          # does not go into the published wheels.  cibuildwheel builds with
+          # pip, which does not read pyproject.toml's [tool.uv]; pip 26.1+
+          # takes a span, and cibuildwheel and its manylinux and musllinux
+          # images carry 26.2.1.
+          CIBW_ENVIRONMENT: PIP_UPLOADED_PRIOR_TO=P7D
           # Verifies the C extension imports, tethered.pth landed in
           # site-packages, and the auto-activation chain enforces
           # against a deny-all policy in a spawned child.
@@ -106,8 +113,19 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      # [tool.uv] exclude-newer (pyproject.toml) holds the build requirements
+      # to the releases of a week ago here too.
       - name: Build sdist
         run: uv build --sdist
+
+      # Uploaded before the check below installs anything, so that nothing it
+      # runs can change the file that is published.  A failed check still
+      # stops the release: the publish job needs this job.
+      - name: Upload sdist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sdist
+          path: dist/*.tar.gz
 
       # Mirror the wheel job's smoke test for the sdist path: build a wheel
       # from the published sdist, install it, and run the smoke test against
@@ -122,18 +140,17 @@ jobs:
       # ``wheel_smoke_test.py``) returns the *system* purelib, so the smoke
       # test would falsely report a missing ``.pth``.  A venv has a writable
       # purelib that ``sysconfig`` reports correctly.
+      #
+      # uv seeds the venv with the pip of a week ago ([tool.uv]), which keeps
+      # the build requirements to that week too (PIP_UPLOADED_PRIOR_TO).
       - name: Verify sdist roundtrip
+        env:
+          PIP_UPLOADED_PRIOR_TO: P7D
         run: |
           uv venv --seed /tmp/sdist-verify
           /tmp/sdist-verify/bin/python -m pip wheel dist/tethered-*.tar.gz -w wheelhouse-from-sdist/ --no-deps
           /tmp/sdist-verify/bin/python -m pip install wheelhouse-from-sdist/tethered-*.whl
           /tmp/sdist-verify/bin/python scripts/wheel_smoke_test.py
-
-      - name: Upload sdist
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
-        with:
-          name: sdist
-          path: dist/*.tar.gz
 
   publish:
     needs: [build-wheels, build-sdist]

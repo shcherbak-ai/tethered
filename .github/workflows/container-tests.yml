@@ -26,7 +26,7 @@ on:
         required: false
         default: ""
       unpinned:
-        description: "Install the latest release of every requirement"
+        description: "Install the latest release of a week ago of every requirement"
         type: boolean
         required: false
         default: false

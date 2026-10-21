@@ -11,7 +11,10 @@
 #
 #   echo "zensical==<version>" | uv pip compile - --universal --python-version 3.11 --no-header --no-annotate
 #
-# and look at the built site afterwards.
+# and look at the built site afterwards.  Run it at the root of the repository,
+# where it takes the releases of a week ago, as [tool.uv] exclude-newer of
+# pyproject.toml says: uvx does not read that setting, so these pins are what
+# holds the build to them.  scripts/check_advisories.py asks osv.dev about each.
 click==8.5.0
 deepmerge==3.0.1
 jinja2==3.1.6

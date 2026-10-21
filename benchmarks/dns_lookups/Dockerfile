@@ -13,7 +13,14 @@ ARG PYTHON_TAG=3.14
 
 # ── builder: a wheel of tethered from the working tree ─────────────────
 # The full image has the compiler the C extension needs.
+#
+# Every pip install takes the releases of a week ago, build requirements
+# included, as in the images of the container suites (see there): a build
+# argument, and pip 26.2.1 where the image's own cannot take the span.
 FROM python:${PYTHON_TAG} AS builder
+RUN python -c "import pip, sys; sys.exit(tuple(map(int, pip.__version__.split('.')[:2])) < (26, 1))" \
+ || pip install --no-cache-dir --disable-pip-version-check pip==26.2.1
+ARG PIP_UPLOADED_PRIOR_TO=P7D
 WORKDIR /src
 COPY pyproject.toml setup.py MANIFEST.in README.md LICENSE ./
 COPY src ./src
@@ -34,6 +41,11 @@ ENV PIP_NO_CACHE_DIR=1 \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd-resolved dnsmasq-base iproute2 \
  && rm -rf /var/lib/apt/lists/*
+
+# The releases of a week ago, as in the builder above.
+RUN python -c "import pip, sys; sys.exit(tuple(map(int, pip.__version__.split('.')[:2])) < (26, 1))" \
+ || pip install pip==26.2.1
+ARG PIP_UPLOADED_PRIOR_TO=P7D
 
 COPY benchmarks/dns_lookups/requirements.txt /bench/requirements.txt
 RUN pip install -r /bench/requirements.txt

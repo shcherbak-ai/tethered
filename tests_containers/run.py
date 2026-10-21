@@ -443,7 +443,7 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--unpinned",
         action="store_true",
-        help="install the latest release of every requirement, not the pinned one",
+        help="install the latest release of a week ago of every requirement, not the pinned one",
     )
     parser.add_argument("--list", action="store_true", help="list the suites and stop")
     parser.add_argument(
@@ -493,7 +493,11 @@ def main(arguments: list[str]) -> int:
         print(f"run.py: {error}", file=sys.stderr)
         return 2
 
-    pins = "the latest release of every requirement" if options.unpinned else "pinned requirements"
+    pins = (
+        "the latest release of a week ago of every requirement"
+        if options.unpinned
+        else "pinned requirements"
+    )
     print(f"{len(runs)} run(s), {options.jobs} at a time, {pins}", flush=True)
     started = time.monotonic()
     try:

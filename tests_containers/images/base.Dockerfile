@@ -12,7 +12,20 @@ ARG PYTHON_TAG=3.13
 
 # ── builder: a wheel of tethered from the working tree ─────────────────
 # The full image has the compiler the C extension needs.
+#
+# Every pip install of both stages takes the releases of a week ago, as the
+# lockfiles of the repository do: pinned or not, and the build requirements
+# of what is built from source (setuptools here), which pip installs in a
+# process of its own.  A pin younger than that fails the build.  The cutoff
+# is a build argument, so RUN sees it in its environment and the containers
+# that run the tests do not.  pip takes a span from 26.1, and ignores the
+# variable before: an image whose pip is older (24.0 on 3.11, 25.0.1 on
+# 3.12) first gets 26.2.1, a release older than the week, where a floor such
+# as "pip>=26.1" would take the newest pip.
 FROM python:${PYTHON_TAG} AS builder
+RUN python -c "import pip, sys; sys.exit(tuple(map(int, pip.__version__.split('.')[:2])) < (26, 1))" \
+ || pip install --no-cache-dir --disable-pip-version-check pip==26.2.1
+ARG PIP_UPLOADED_PRIOR_TO=P7D
 WORKDIR /src
 COPY pyproject.toml setup.py MANIFEST.in README.md LICENSE ./
 COPY src ./src
@@ -36,9 +49,14 @@ RUN apt-get update \
         $(if [ "${COMPILER}" = "1" ]; then echo gcc g++ make libc6-dev; fi) \
  && rm -rf /var/lib/apt/lists/*
 
+# The releases of a week ago, as in the builder above.
+RUN python -c "import pip, sys; sys.exit(tuple(map(int, pip.__version__.split('.')[:2])) < (26, 1))" \
+ || pip install pip==26.2.1
+ARG PIP_UPLOADED_PRIOR_TO=P7D
+
 # With UNPINNED=1 the "==version" of every requirement is dropped and pip takes
-# the latest release.  UNPINNED_STAMP is the date, so that this is done again
-# at most once a day and not served from the build cache for ever.
+# the latest release of a week ago.  UNPINNED_STAMP is the date, so that this
+# is done again at most once a day and not served from the build cache for ever.
 ARG UNPINNED=0
 ARG UNPINNED_STAMP=""
 COPY tests_containers/harness/requirements.txt /tc/requirements/harness.txt

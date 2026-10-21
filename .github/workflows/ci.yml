@@ -43,6 +43,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # The development tools of package-lock.json, for the markdownlint-cli2
+      # hook, with the Node of the runner (no install scripts: .npmrc).
+      - name: Install the development tools of package.json
+        run: npm ci --no-audit --no-fund
+
       # scripts/cppcheck.sh compiles cppcheck into a Docker image.  The image
       # is kept in the cache under the hash of that script, so it is built
       # once per cppcheck version and not once per run.  It is saved before
@@ -74,9 +79,13 @@ jobs:
 
       # Every checker runs from here in the version the repository pins: the
       # Python tools from uv.lock, the hook repositories by commit, and
-      # cppcheck from the image scripts/cppcheck.sh builds.
+      # cppcheck from the image scripts/cppcheck.sh builds.  The advisories
+      # hook is skipped: it asks osv.dev, so its result depends on the day
+      # and not on the commit.
       - name: Run pre-commit checks (includes ty and cppcheck)
         run: uv run pre-commit run --all-files
+        env:
+          SKIP: advisories
 
   test:
     runs-on: ${{ matrix.os }}

@@ -36,7 +36,7 @@ uv run python tests_containers/run.py --list
 | `--suite NAME` | A suite; repeatable. Default: every suite. |
 | `-k EXPR` | Passed to pytest in the container. A suite in which nothing matches counts as passed ("no tests"). |
 | `--jobs N` | How many suite and Python combinations build and run at once. Default: half the CPUs, at most 4. |
-| `--unpinned` | Install the latest release of every requirement instead of the pinned one. The images are tagged `...-unpinned` and are refreshed at most once a day; add `--no-cache` to force it. |
+| `--unpinned` | Install the latest release of a week ago of every requirement instead of the pinned one (see [Pins](#pins)). The images are tagged `...-unpinned` and are refreshed at most once a day; add `--no-cache` to force it. |
 | `--list` | List the suites and stop. With `--json`: the matrix CI uses. |
 | `--logs DIR` | Write the full output of every run (build and tests) to `DIR/<suite>-py<X.Y>.log`. |
 | `--no-cache` | Build the images without Docker's cache. |
@@ -73,7 +73,7 @@ container:  python -m harness                the entry point: runs pytest on /tc
 
 **The host runner** (`run.py`) finds the suites by listing `suites/`, builds one image per suite and Python version, runs each in a container and reads the result from the last lines of its output. It mounts nothing: the working tree reaches the image through the build context, which `images/base.Dockerfile.dockerignore` cuts down to `src/`, the packaging files and this directory. The mapping from a Python version to its base image is `PYTHON_IMAGE_TAGS` at the top of `run.py`, and nowhere else.
 
-**The image** (`images/base.Dockerfile`) has two stages. The builder, on the full `python:X.Y` image, builds a wheel of tethered from the working tree (`pip wheel . --no-deps`). The runtime stage, on `python:X.Y-slim`, installs pytest, the suite's requirements and then the wheel, as a regular install, so that `tethered.pth` is in site-packages as it is for a user. The build fails if `tethered.pth` is missing or `tethered._guardian` does not import (`images/verify_install.py`). `pip freeze` is saved as `/tc/pip-freeze.txt`. In the image, this directory is `/tc`: `/tc/harness` and `/tc/suites/<suite>`.
+**The image** (`images/base.Dockerfile`) has two stages. The builder, on the full `python:X.Y` image, builds a wheel of tethered from the working tree (`pip wheel . --no-deps`). The runtime stage, on `python:X.Y-slim`, installs pytest, the suite's requirements and then the wheel, as a regular install, so that `tethered.pth` is in site-packages as it is for a user. The build fails if `tethered.pth` is missing or `tethered._guardian` does not import (`images/verify_install.py`). `pip freeze` is saved as `/tc/pip-freeze.txt`. In the image, this directory is `/tc`: `/tc/harness` and `/tc/suites/<suite>`. Every pip install of both stages takes the releases of a week ago, as the lockfiles of the repository do, and so do the build requirements of what is built from source (setuptools for the wheel of tethered, uWSGI, mod_wsgi): `PIP_UPLOADED_PRIOR_TO=P7D` is a build argument, which RUN sees in its environment and the containers that run the tests do not. pip takes that span from 26.1, and an older pip ignores the variable without a word (pip 24.0 installed a certifi a day old with it), so an image whose pip is older (24.0 on 3.11, 25.0.1 on 3.12) first gets pip 26.2.1, a release older than the week; the Dockerfile names that version twice, and so does the DNS benchmark's.
 
 **pytest runs inside the container** and the tests are ordinary pytest tests. The pytest process never holds a tethered policy; the plugin refuses to start if it does. tethered is active only in the processes under test, which the helpers start with a clean environment.
 
@@ -266,7 +266,7 @@ A suite is a directory. Nothing else has to be edited: the runner and CI find it
 4. Say at the top of the test module what the suite covers and what it leaves out.
 5. Run it: `uv run python tests_containers/run.py --suite <name>`, then everything once.
 
-Set `compiler = true` only when a requirement has to be built from source; `apt` is for runtime packages such as `apache2`. If a suite needs an image that `base.Dockerfile` cannot give it, add `images/<other>.Dockerfile` with its own `<other>.Dockerfile.dockerignore` and name it in `image`; it receives the same build arguments (`PYTHON_TAG`, `SUITE`, `APT_PACKAGES`, `COMPILER`, `UNPINNED`, `UNPINNED_STAMP`) and must keep the layout under `/tc` and the entry point.
+Set `compiler = true` only when a requirement has to be built from source; `apt` is for runtime packages such as `apache2`. If a suite needs an image that `base.Dockerfile` cannot give it, add `images/<other>.Dockerfile` with its own `<other>.Dockerfile.dockerignore` and name it in `image`; it receives the same build arguments (`PYTHON_TAG`, `SUITE`, `APT_PACKAGES`, `COMPILER`, `UNPINNED`, `UNPINNED_STAMP`) and must keep the layout under `/tc` and the entry point, and hold its pip installs to the week as `base.Dockerfile` does.
 
 What makes a good test here:
 
@@ -281,6 +281,8 @@ What makes a good test here:
 Every requirement is pinned, so that a pull request is tested against the same servers as the one before it. The weekly CI run uses `--unpinned` and tells when the ecosystem has moved.
 
 To bump: run `uv run python tests_containers/run.py --suite <name> --unpinned --verbose`, read what was installed (the line that starts with `installed:` at the top of the container's output is the image's `pip freeze`), write the versions into the suite's `requirements.txt` and run the suite pinned. For pytest it is `harness/requirements.txt`, and then every suite. When a new version changes what tethered has to do, that is a finding: write it down where the behaviour is documented before changing the test. [`docs/COMPATIBILITY.md`](../docs/COMPATIBILITY.md) names the version each of its rows was measured with and the suite behind it, and [`docs/COOKBOOK.md`](../docs/COOKBOOK.md) says what each server needs: a bump that changes a result changes those two pages.
+
+Every pin is a release more than a week old, as in the lockfiles: the images install with that cutoff (see "The image" above), so a pin that is younger fails the build, and `--unpinned` installs the latest releases of a week ago, which a bump copies. pip has no exception for one package, so a newer release waits out its week here. The `advisories` pre-commit hook (`scripts/check_advisories.py`) also asks osv.dev about each pin at every commit and fails on a report of a malicious package. A known vulnerability does not count here: the images are built with a network, but run without one.
 
 A new Python version is one line in `PYTHON_IMAGE_TAGS` in `run.py`. Before it is released, its tag is that of the pre-release image (`3.16-rc`); change it to the version alone when the release is out.
 
@@ -316,7 +318,7 @@ On top of that, the first build for a Python version downloads its two base imag
 
 - **`run.py: Docker is not available`** (exit status 2): Docker is not installed or its daemon is not running.
 - **A build fails in `pip wheel`**: the C extension did not compile on that Python version. That is a finding about tethered, not about the harness.
-- **A build fails in `pip install -r`**: a pinned version does not exist for that Python version, or two pins disagree. For a new Python version without wheels, add it to `[unsupported_python]` in the suite's `suite.toml` with the reason.
+- **A build fails in `pip install -r`**: a pinned version does not exist for that Python version, two pins disagree, or a pin is younger than a week (pip then finds no version that matches it). For a new Python version without wheels, add it to `[unsupported_python]` in the suite's `suite.toml` with the reason.
 - **`... failed: the container needs --cap-add NET_ADMIN`**: the image was started by hand without the options `run.py` passes.
 - **The container suites run inside their image**: someone ran pytest on this directory on the host. Use `run.py`.
 - **Looking around in an image**: `docker run --rm -it --network none --cap-add NET_ADMIN --entrypoint bash tethered-ct/<suite>:py3.13`, then `python -m harness -x -k <expression>` in `/tc`. Server logs of the run are in `/tmp/tc-logs`. In Git Bash on Windows prefix the command with `MSYS_NO_PATHCONV=1`.
