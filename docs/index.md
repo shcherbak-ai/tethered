@@ -1,5 +1,5 @@
 ---
-title: "tethered"
+title: "tethered: runtime network egress control for Python"
 description: "Runtime network egress control for Python. One function call, zero dependencies, no infrastructure changes."
 hide:
   - navigation

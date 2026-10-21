@@ -195,6 +195,7 @@ docs/                     # The pages of the documentation site
     migrating-to-v1.md    # The 1.0.0 migration guide: the changelog's breaking changes by what a deployment uses
     security.md           # The security model (SECURITY.md at the root says how to report a vulnerability)
     changelog.md          # CHANGELOG.md, included as a page of the site
+    robots.txt            # Points search engines to the site's sitemap
     assets/, stylesheets/ # The images of the site and the README, the site's share image, and the site's look
 assets/                   # The README's own images: the pixel rule between its parts and the pixel names of the sibling projects
 social/                   # The repository's social preview: the SVG it is drawn in and the PNG that is uploaded to GitHub
