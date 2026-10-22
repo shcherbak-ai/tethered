@@ -57,6 +57,12 @@ _MARKDOWNLINT_CLI2_0_24 = (
     "2026-10-28; at worst a slow lint of a Markdown file"
 )
 
+_VIRTUALENV_21_14_9 = (
+    "virtualenv 21.14.7, of pre-commit: fixed in 21.14.9, uploaded on 2026-10-17, which "
+    "the cooldown admits from 2026-10-24; every hook is a `language: system` one, for "
+    "which pre-commit creates no virtualenv"
+)
+
 # The advisories that the check accepts, by their IDs at osv.dev: the reason, and the
 # time (UTC) from which the acceptance runs out, or None.  A vulnerability that no
 # version the ranges admit fixes, or whose fix is younger than the cooldown: then the
@@ -70,6 +76,14 @@ ACCEPTED_ADVISORIES: dict[str, tuple[str, str | None]] = {
             "GHSA-r4xh-jqrq-34v2",
             "GHSA-r7fv-28h4-cvq7",
             "GHSA-vfgh-jcmw-g37q",
+        )
+    },
+    **{
+        advisory: (_VIRTUALENV_21_14_9, "2026-10-24T16:10:00Z")
+        for advisory in (
+            "GHSA-43mp-35q3-x3fq",
+            "GHSA-c978-59m8-c77v",
+            "GHSA-cw65-gx24-rc82",
         )
     },
     "GHSA-238p-pmpm-9mq7": (
