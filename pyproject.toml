@@ -32,6 +32,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/shcherbak-ai/tethered"
+Documentation = "https://tethered.shcherbak.ai/"
 Repository = "https://github.com/shcherbak-ai/tethered"
 Issues = "https://github.com/shcherbak-ai/tethered/issues"
 

