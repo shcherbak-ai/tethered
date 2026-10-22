@@ -283,10 +283,11 @@ Measured with Flask 3.1.3 (Werkzeug 3.1.9) and Django 6.1.2 (5.2.18 on Python 3.
 | `[sys.executable, "-S", ...]` | Warned about; the child has no policy. Refused under `"block"`. |
 | `["bash", ...]` or any other program | Warned about; the program can reach anything. Refused under `"block"`. |
 
-**`external_subprocess_policy="block"` refuses what libraries launch, too.** On Linux, `ctypes.util.find_library()` runs `ldconfig`, and `platform.platform()` runs `uname`. Under `"block"`:
+**`external_subprocess_policy="block"` refuses what libraries launch, too.** On Linux, `ctypes.util.find_library()` runs `ldconfig`. `platform.platform()` runs `uname -p` outside Windows, and `cmd.exe /c ver` on Windows with Python 3.11 (measured once). Under `"block"`:
 
 - `ctypes.util.find_library()` raises `SubprocessBlocked` (suite `clients`), and with it the import of trio (suite `hypercorn`). asyncssh and psycopg 3 in its Python implementation make the same call while they are imported. Import such libraries before `activate()`.
 - `celery worker` does not start: its banner calls `platform.platform()`, which catches only `OSError` (suite `celery`). Call `platform.platform()` once before `activate()`; it caches the answer.
+- `platform.architecture()` outside Windows (`file -b`) and `platform.win32_ver()` on Windows with Python 3.11 run their program at every call: they raise `SubprocessBlocked` each time, whether or not they were called before `activate()` (measured once).
 
 Under the default `"warn"` these launches are logged as external launches and carried out, under a locked policy as well.
 

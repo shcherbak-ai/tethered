@@ -67,7 +67,7 @@ tethered.activate(
 
 Under a lock, tampering with tethered's own code or with the active policy is detected and fails closed, and a Python child that cannot establish the locked policy refuses to start. Activate before importing third-party code: whatever runs earlier is not covered.
 
-`"block"` also stops the helper programs some libraries launch when they are imported, so import those first ([details](SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](security.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
+`"block"` also stops the helper programs the standard library runs, such as `uname` for `platform.platform()` and `ldconfig` when some libraries are imported, so call `platform.platform()` and import those libraries before `activate()` ([details](SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](security.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
 ## Roll it out
 

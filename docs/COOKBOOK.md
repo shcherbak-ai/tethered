@@ -678,3 +678,5 @@ def egress_policy():
 ```
 
 `locked=True` keeps a test from switching the policy off. With `allow=[]` the same fixture keeps the test suite off the network altogether, loopback aside.
+
+With `external_subprocess_policy="block"` as well, call `platform.platform()` in the fixture before `activate()`, and import there the libraries that run a program while they are imported. The standard library runs one for each the first time it is needed (`uname -p`, `ldconfig`), and `"block"` refuses it: the first test to get there fails, on some platforms only ([what "block" also refuses](SUBPROCESS.md#what-block-also-refuses)).
