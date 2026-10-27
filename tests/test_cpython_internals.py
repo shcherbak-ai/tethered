@@ -605,6 +605,30 @@ def test_the_fork_server_keeps_its_pid_where_tethered_reads_it():
     )
 
 
+def test_the_platform_module_keeps_what_it_learns_about_the_machine():
+    """``_warm_platform_cache`` asks ``platform.platform()`` once, before a "block" policy."""
+    row = _row("the platform module's answer")
+    script = (
+        "import json, platform, sys\n"
+        "launched = []\n"
+        "sys.addaudithook(lambda event, args: event == 'subprocess.Popen' and launched.append(1))\n"
+        "platform.platform()\n"
+        "first = len(launched)\n"
+        "platform.platform(), platform.processor(), tuple(platform.uname())\n"
+        "platform.system(), platform.machine(), platform.node(), platform.release()\n"
+        "print(json.dumps([first, len(launched) - first]))\n"
+    )
+    # -S: nothing of site-packages (tethered.pth, coverage) asks it first.
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-S", "-c", script], capture_output=True, text=True, timeout=60, check=True
+    )
+    first, later = json.loads(result.stdout)
+    assert (first > 0) is _core._PLATFORM_RUNS_A_PROGRAM, (
+        "the first call runs a program where _PLATFORM_RUNS_A_PROGRAM says so, and only there" + row
+    )
+    assert later == 0, "the calls that share its answer run nothing afterwards" + row
+
+
 @pytest.mark.skipif(_interps is None, reason="this Python has no subinterpreter module")
 class TestInterpreters:
     """The private interpreter module, and interpreter IDs."""

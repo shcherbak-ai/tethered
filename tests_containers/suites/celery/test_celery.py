@@ -473,31 +473,18 @@ class TestWorkerStartSignals:
 
 
 class TestBlockingExternalLaunches:
-    def test_the_worker_does_not_start(self) -> None:
-        """Limit: ``celery worker`` cannot start under ``external_subprocess_policy="block"``.
+    def test_the_worker_starts(self) -> None:
+        # Its startup banner calls platform.platform(), which runs `uname -p`
+        # the first time and catches only OSError: refused, the launch ended
+        # the worker.  Under "block" activate() asks platform first, before
+        # the policy is in place, and platform keeps the answer.
+        stack = start_stack("--pool", "solo", env={"TETH_ESP": "block"})
+        report = stack.probe("main")
+        assert_policy(report, "locked")
+        assert report["external_subprocess_policy"] == "block", report
 
-        Its startup banner calls ``platform.platform()``, which launches
-        ``uname -p`` and catches only ``OSError``; the ``SubprocessBlocked``
-        of the refused launch ends the worker.
-        """
-        redis = start_redis()
-        started: list[Server] = []
-
-        def ready(server: Server) -> bool:
-            started.append(server)
-            return worker_ready(server)
-
-        env = {**broker_settings(redis), "TETH_ACTIVATE": "locked", "TETH_ESP": "block"}
-        with pytest.raises(AssertionError, match="exited with status 1 while starting"):
-            start_server([*WORKER, "--pool", "solo"], env=env, ready=ready)
-        log = started[0].log
-        assert "platform.py" in log
-        assert f"{SUBPROCESS_BLOCKED}: Blocked by tethered: subprocess.Popen(uname)" in log
-
-    def test_it_starts_when_platform_was_asked_before_the_policy(self) -> None:
-        # platform caches the answer: asked once before activate(), it launches
-        # nothing afterwards.  Then only what tasks launch is refused.
-        stack = prefork("--concurrency", "2", env={"TETH_ESP": "block", "PLATFORM_FIRST": "1"})
+    def test_what_tasks_launch_is_refused(self) -> None:
+        stack = prefork("--concurrency", "2", env={"TETH_ESP": "block"})
 
         path = probe_path("child", FORBIDDEN_NAME, OTHER_PORT)
         for report in stack.each_process(path, 2).values():

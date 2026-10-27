@@ -286,6 +286,10 @@ Each entry says what tethered does, and then:
     - Relies on: that attribute being `None` until the fork server runs and its process ID after. POSIX only.
     - Needed by: pools of the `forkserver` start method, the default on Linux from Python 3.14 (`tests_containers/suites/stdlib_pools`; changelog 1.0.0, Added).
     - Pinned by: `test_the_fork_server_keeps_its_pid_where_tethered_reads_it`.
+- **The platform module's answer.** Under `external_subprocess_policy="block"`, `activate()` calls `platform.platform()` before the policy is in place (`_warm_platform_cache`), so that the program it runs the first time is not refused later.
+    - Relies on: the module keeping what it learns for the process, which nothing documents: `uname()` with its `processor`, shared by `processor()`, `system()`, `machine()` and the other functions that describe the machine, and the answer of `platform()`. And on which first calls run a program, which `_PLATFORM_RUNS_A_PROGRAM` says: `uname -p` outside Windows, `cmd.exe /c ver` on Windows with Python 3.11, and nothing on Windows from 3.12, which asks WMI. `platform.architecture()` and, on Windows with 3.11, `platform.win32_ver()` run their program at every call and stay refused. A subinterpreter has a module of its own, asked only where it calls `activate()`.
+    - Needed by: Celery, whose worker calls `platform.platform()` in its startup banner and did not start under `"block"` (`tests_containers/suites/celery`).
+    - Pinned by: `test_the_platform_module_keeps_what_it_learns_about_the_machine`; `TestPlatformAskedBeforeBlock` in `tests/test_subprocess.py`.
 - **The running Proactor loop.** For its warning, `_proactor_loop_running` asks `asyncio._get_running_loop()` whether the loop that runs is an `asyncio.proactor_events.BaseProactorEventLoop`.
     - Relies on: those two names, and on the Proactor loop raising no `socket.connect` / `socket.sendto` event. Windows only.
     - Needed by: asyncio on Windows, whose default loop is the Proactor loop (changelog 1.0.0, Added).

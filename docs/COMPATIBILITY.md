@@ -286,8 +286,8 @@ Measured with Flask 3.1.3 (Werkzeug 3.1.9) and Django 6.1.2 (5.2.18 on Python 3.
 **`external_subprocess_policy="block"` refuses what libraries launch, too.** On Linux, `ctypes.util.find_library()` runs `ldconfig`. `platform.platform()` runs `uname -p` outside Windows, and `cmd.exe /c ver` on Windows with Python 3.11 (measured once). Under `"block"`:
 
 - `ctypes.util.find_library()` raises `SubprocessBlocked` (suite `clients`), and with it the import of trio (suite `hypercorn`). asyncssh and psycopg 3 in its Python implementation make the same call while they are imported. Import such libraries before `activate()`.
-- `celery worker` does not start: its banner calls `platform.platform()`, which catches only `OSError` (suite `celery`). Call `platform.platform()` once before `activate()`; it caches the answer.
-- `platform.architecture()` outside Windows (`file -b`) and `platform.win32_ver()` on Windows with Python 3.11 run their program at every call: they raise `SubprocessBlocked` each time, whether or not they were called before `activate()` (measured once).
+- `platform.platform()` and the calls that share its answer launch nothing: `activate()` calls it before the policy is in place, and it keeps the answer. `celery worker` starts, although its banner calls it and catches only `OSError` (suite `celery`).
+- `platform.architecture()` outside Windows (`file -b`) and `platform.win32_ver()` on Windows with Python 3.11 run their program at every call: they raise `SubprocessBlocked` each time (measured once).
 
 Under the default `"warn"` these launches are logged as external launches and carried out, under a locked policy as well.
 
@@ -312,7 +312,7 @@ In every system below, each process that runs task code held the policy, plain a
 | Celery | `activate()` in a `worker_init` handler | Enforced in every pool. | `celery` |
 | Celery | `activate()` only in a `worker_process_init` handler | Enforced in the prefork pool's children (recycled ones too) and in the solo pool. **No policy at all** with `--pool threads` and `--pool gevent`: Celery never sends that signal there. | `celery` |
 | Celery | eventlet pool | Allowed host refused; enforced with `EVENTLET_NO_GREENDNS=yes`, or with a rule for the address. | `celery` (eventlet 0.41.2) |
-| Celery | `external_subprocess_policy="block"` | `celery worker` does not start, unless `platform.platform()` was called before `activate()`. | `celery` |
+| Celery | `external_subprocess_policy="block"` | Enforced: the worker starts, and what a task launches outside Python is refused. | `celery` |
 | RQ | `Worker` (a work horse forked per job), `SimpleWorker`, `SpawnWorker`, `rq worker-pool`, the scheduler | Enforced. With `activate()` in the jobs module every job is covered and the worker process itself holds no policy; with `rq worker -c settings` and `activate()` in the settings module both are. | `rq` (rq 2.12.0) |
 | Dramatiq | Worker processes forked, from a fork server, or spawned (`--use-spawn`); a reload; `activate()` at import or in an `after_process_boot` middleware hook | Enforced in every worker process. The parent never imports the application and holds no policy. | `dramatiq` (dramatiq 2.2.1) |
 | Huey | Thread and process workers; `--max-tasks`, a replacement for a killed worker, a `SIGHUP` restart; `activate()` at import or in an `on_startup` hook | Enforced. | `huey` (huey 3.4.0) |

@@ -4123,7 +4123,10 @@ def activate(
             (the dep-shells-out-to-curl signal you'd want for supply-chain
             visibility).  ``"allow"`` — silent (set this if your workload
             legitimately shells out frequently and the warnings are noise).
-            ``"block"`` — refuse all external launches.
+            ``"block"`` — refuse all external launches.  ``activate()`` first
+            calls ``platform.platform()``, whose first call runs ``uname -p``
+            (``cmd.exe /c ver`` on Windows with Python 3.11), so that later
+            calls, which use its answer, launch nothing.
 
     Raises:
         RuntimeError: If ``locked=True`` but the C guardian extension is
@@ -4259,6 +4262,13 @@ def activate(
                     raise _locked_refusal("activate()", activate_locked_msg)
                 if not _c_guardian.verify():
                     raise TetheredLocked(_TAMPERED_POLICY_MSG)
+
+            # Under "block", the program the platform module runs the first
+            # time it is asked about the machine would be refused for the
+            # life of the process: it runs now, before the policy is in place
+            # (see _warm_platform_cache).  A log-only policy refuses nothing.
+            if external_subprocess_policy == "block" and not log_only and _PLATFORM_RUNS_A_PROGRAM:
+                _warm_platform_cache()
 
             # Everything that can fail comes before anything is committed.
             _install_hook()
@@ -4900,6 +4910,33 @@ def _capture_local_hostname() -> str:
     if not isinstance(raw, str) or not raw:  # pragma: no cover — defensive
         return ""
     return _normalize_host(raw)
+
+
+# Whether the platform module runs a program the first time it is asked about
+# the machine: ``uname -p`` outside Windows, ``cmd.exe /c ver`` on Windows with
+# Python 3.11.  From 3.12 Windows is asked through WMI, which launches nothing
+# and takes a tenth of a second, so it is not asked there.  Tests flip it.
+_PLATFORM_RUNS_A_PROGRAM = sys.platform != "win32" or sys.version_info < (3, 12)
+
+
+def _warm_platform_cache() -> None:
+    """Ask the platform module about the machine before a "block" policy is in place.
+
+    ``platform.platform()`` runs ``uname -p`` the first time it is called, and
+    so do ``processor()`` and unpacking ``uname()``, which share its answer;
+    on Windows with Python 3.11 they run ``cmd.exe /c ver``.  It catches only
+    ``OSError``, so the ``SubprocessBlocked`` of a refused launch ends the
+    caller: ``celery worker`` at its startup banner.  It keeps the answer for
+    the process, so asked here it launches nothing later.  A policy that is
+    already in place judges this launch like any other, and whatever goes
+    wrong leaves the module as it was without this call.
+    """
+    import platform  # imported here: only a "block" policy needs it
+
+    try:
+        platform.platform()
+    except Exception as exc:
+        logger.debug("tethered: platform.platform() was not answered before the policy: %r", exc)
 
 
 def _propagate_policy_to_env(cfg: _Config) -> None:

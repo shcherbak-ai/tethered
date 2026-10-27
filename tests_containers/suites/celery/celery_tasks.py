@@ -17,8 +17,7 @@ which policy, see ``probe_common``):
 Other settings from the environment: ``BROKER_URL`` (broker and result
 backend), ``RESULT_SERIALIZER`` (``json``, the default, or ``pickle``),
 ``BEAT_TARGET`` (``host:port``: a beat schedule with one task that connects
-there every half second) and ``PLATFORM_FIRST`` (call ``platform.platform()``
-before the policy is activated).
+there every half second).
 
 The front end imports this module too, as any producer of tasks does.
 """
@@ -26,7 +25,6 @@ The front end imports this module too, as any producer of tasks does.
 from __future__ import annotations
 
 import os
-import platform
 from typing import Any
 
 import probe_common
@@ -35,9 +33,6 @@ from celery import Celery, signals
 from celery.worker.control import inspect_command
 
 WHERE = os.environ.get("TETH_WHERE", "import")
-if os.environ.get("PLATFORM_FIRST"):
-    # platform caches what it found out; later calls launch nothing.
-    platform.platform()
 if WHERE == "import":
     probe_common.activate_from_env()
 elif WHERE not in ("worker_process_init", "worker_init"):

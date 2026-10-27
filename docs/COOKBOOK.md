@@ -485,7 +485,6 @@ def activate_tethered(**kwargs):
 
 - **Do not rely on `worker_process_init` alone.** Celery sends it in the children of the prefork pool and in the solo pool. With `--pool threads` or `--pool gevent` it is never sent, the handler never runs, and the worker has no policy at all.
 - **The broker has to be allowed.** Loopback is allowed by default. A broker addressed by name has to be in the allow list, otherwise the worker ends at start-up with `EgressBlocked` for the broker's address.
-- **`external_subprocess_policy="block"` stops `celery worker` from starting**: its banner calls `platform.platform()`, which launches `uname` and catches only `OSError`. Call `platform.platform()` once before `activate()`; it caches the answer.
 - **The eventlet pool** resolves names with its own resolver, which tethered does not see: a host the allow list names is refused. Set `EVENTLET_NO_GREENDNS=yes`, or allow the address.
 - **What the producer sees.** `result.get()` for a refused task raises `tethered.EgressBlocked` in a producer that has tethered loaded, with Celery's default JSON result serializer and with `result_serializer="pickle"`. With JSON, Celery rebuilds the exception from its message, and `host`, `port` and the other attributes are read back out of it. A producer that has not imported tethered gets a class of Celery's own that is named `EgressBlocked`; with pickle, reading the result imports tethered.
 
@@ -679,4 +678,4 @@ def egress_policy():
 
 `locked=True` keeps a test from switching the policy off. With `allow=[]` the same fixture keeps the test suite off the network altogether, loopback aside.
 
-With `external_subprocess_policy="block"` as well, call `platform.platform()` in the fixture before `activate()`, and import there the libraries that run a program while they are imported. The standard library runs one for each the first time it is needed (`uname -p`, `ldconfig`), and `"block"` refuses it: the first test to get there fails, on some platforms only ([what "block" also refuses](SUBPROCESS.md#what-block-also-refuses)).
+With `external_subprocess_policy="block"` as well, import in the fixture, before `activate()`, the libraries that run a program while they are imported. The standard library runs one for each the first time it is needed (`ldconfig`), and `"block"` refuses it: the first test to get there fails, on some platforms only. `activate()` asks `platform.platform()` itself, so the `uname -p` it runs is not refused ([what "block" also refuses](SUBPROCESS.md#what-block-also-refuses)).

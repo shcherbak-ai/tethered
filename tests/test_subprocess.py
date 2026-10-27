@@ -9,6 +9,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -5696,6 +5697,107 @@ class TestSysExecutableThatIsNotPython:
         with caplog.at_level(logging.WARNING, logger="tethered"):
             tethered.activate(allow=["*.example.com"])
         assert not [r for r in caplog.records if "embeds Python here" in r.getMessage()]
+
+
+@pytest.fixture
+def cold_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The platform module as in a process that has not asked it anything yet."""
+    monkeypatch.setattr(platform, "_uname_cache", None)
+    monkeypatch.setattr(platform, "_platform_cache", {})
+
+
+_platform_launches_a_program = pytest.mark.skipif(
+    not _core._PLATFORM_RUNS_A_PROGRAM,
+    reason="the platform module launches nothing here (Windows, Python 3.12 and later)",
+)
+
+
+class TestPlatformAskedBeforeBlock:
+    """Under ``"block"``, ``activate()`` asks ``platform.platform()`` before the policy is in place.
+
+    The platform module runs a program the first time it is asked about the
+    machine (``uname -p``; ``cmd.exe /c ver`` on Windows with Python 3.11) and
+    catches only ``OSError``: refused, the launch ended the caller, and
+    ``celery worker`` did not start.  It keeps the answer, so asked first it
+    launches nothing later.
+    """
+
+    @pytest.fixture
+    def asked(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+        """The calls of a stand-in for ``platform.platform()``, where it would run a program."""
+        calls: list[tuple] = []
+        monkeypatch.setattr(_core, "_PLATFORM_RUNS_A_PROGRAM", True)
+        monkeypatch.setattr(platform, "platform", lambda *args: calls.append(args) or "Stand-in")
+        return calls
+
+    def test_block_asks_it_once(self, asked):
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        assert asked == [()]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"external_subprocess_policy": "warn"},
+            {"external_subprocess_policy": "allow"},
+            {"external_subprocess_policy": "block", "log_only": True},
+        ],
+        ids=["warn", "allow", "block-log-only"],
+    )
+    def test_a_policy_that_lets_the_launch_through_does_not(self, asked, kwargs):
+        tethered.activate(allow=[], **kwargs)
+        assert asked == []
+
+    def test_nor_where_the_platform_module_launches_nothing(self, asked, monkeypatch):
+        monkeypatch.setattr(_core, "_PLATFORM_RUNS_A_PROGRAM", False)
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        assert asked == []
+
+    @pytest.mark.skipif(_core._c_guardian is None, reason="C guardian extension not available")
+    def test_an_activate_that_is_refused_asks_nothing(self, asked):
+        tethered.activate(allow=[], locked=True, lock_token=object())
+        with pytest.raises(tethered.TetheredLocked):
+            tethered.activate(allow=[], external_subprocess_policy="block")
+        assert asked == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [tethered.SubprocessBlocked("subprocess.Popen", "uname"), RuntimeError("another hook")],
+        ids=["refused", "another-error"],
+    )
+    def test_a_failure_leaves_activate_alone(self, monkeypatch, caplog, error):
+        def fails(*_args: object) -> str:
+            raise error
+
+        monkeypatch.setattr(_core, "_PLATFORM_RUNS_A_PROGRAM", True)
+        monkeypatch.setattr(platform, "platform", fails)
+        with caplog.at_level(logging.DEBUG, logger="tethered"):
+            tethered.activate(allow=[], external_subprocess_policy="block")
+        assert _core._config is not None
+        assert _core._config.external_subprocess_policy == "block"
+        assert "platform.platform() was not answered before the policy" in caplog.text
+
+    @_platform_launches_a_program
+    def test_afterwards_the_platform_module_launches_nothing(self, cold_platform):
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        assert platform.platform()
+        assert isinstance(platform.processor(), str)
+        assert len(tuple(platform.uname())) == 6
+
+    @_platform_launches_a_program
+    def test_a_policy_already_in_place_judges_the_launch(self, cold_platform, caplog):
+        # The cache was emptied under a "block" policy: the next activate()
+        # asks under that policy, which refuses the launch, as it refuses
+        # the caller's own.
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        platform._uname_cache = None
+        platform._platform_cache.clear()
+        with caplog.at_level(logging.DEBUG, logger="tethered"):
+            tethered.activate(allow=["*.example.com"], external_subprocess_policy="block")
+        assert "platform.platform() was not answered before the policy" in caplog.text
+        assert _core._config is not None
+        assert _core._config.policy.is_allowed("api.example.com")
+        with pytest.raises(tethered.SubprocessBlocked):
+            platform.platform()
 
 
 class _Replaced(Exception):
