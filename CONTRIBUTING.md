@@ -88,6 +88,7 @@ uv run ty check src/ examples/   # type check
 uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
 uv run deptry .            # imports against declared dependencies
+uv run zizmor --offline .github/workflows  # the security of the GitHub workflows
 uv lock --check            # uv.lock matches pyproject.toml
 uv run python scripts/check_advisories.py  # the one-week cooldown is set, and osv.dev has no advisory of a locked version
 node --test .claude/hooks/playwright-files.test.mjs  # the Claude Code hook that keeps the agents' browser files in one folder

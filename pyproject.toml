@@ -55,6 +55,7 @@ dev = [
     "pyyaml>=6.0.3",
     "deptry>=0.25.1",
     "licenseal>=0.4.2",
+    "zizmor>=1.31",
     # The hooks for whitespace, the ends of files, YAML and TOML, from uv.lock
     # rather than installed by pre-commit
     "pre-commit-hooks>=6.0",
