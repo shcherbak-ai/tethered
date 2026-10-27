@@ -27,7 +27,7 @@ from myapp import create_app  # import the application afterwards
 app = create_app()
 ```
 
-Activate first, before your application and its dependencies are imported. Connections that are already open keep working, and worker processes that already exist are not reached.
+Activate first, before your application and its dependencies are imported. Connections that are already open keep working, and processes started earlier are not reached, multiprocessing's fork server included: the workers it forks afterwards hold no policy either.
 
 A connection that the policy does not allow raises `tethered.EgressBlocked`. The [cookbook](COOKBOOK.md#handling-blocked-connections) shows how to handle it in Django, FastAPI and Celery, and what [each server](COOKBOOK.md#servers-and-interpreter-pools) needs.
 
@@ -65,7 +65,7 @@ tethered.activate(
 )
 ```
 
-Under a lock, tampering with tethered's own code or with the active policy is detected and fails closed, and a Python child that cannot establish the locked policy refuses to start. Activate before importing third-party code: whatever runs earlier is not covered.
+Under a lock, monkey-patching tethered's functions or classes, or swapping its active policy, is detected and fails closed, and a Python child that cannot establish the locked policy refuses to start. Activate before importing third-party code: whatever runs earlier is not covered.
 
 `"block"` also stops the helper programs libraries run, such as `file` for `platform.architecture()`, and code that expects `OSError` there fails ([details](SUBPROCESS.md#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](security.md#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
@@ -94,6 +94,6 @@ Wildcards follow Python's `fnmatch` and match text, not address ranges: `10.*` a
 
 - **A guardrail, not a sandbox.** tethered works at Python's audit-event layer. Code that goes below it (`ctypes`, `cffi`, a C extension making its own system calls) is not stopped, with or without locked mode. Where you need a guarantee, combine tethered with a control below Python: an egress proxy or a network policy that names the allowed hosts, containers, seccomp, network namespaces. The [security model](security.md) has the full threat model.
 - **Libraries that connect in C are not seen.** tethered sees what goes through Python's `socket` module: requests, httpx, urllib3, aiohttp and the pure-Python database and broker clients. A library that resolves and connects inside its own C code (psycopg2, pycurl, grpcio) is not checked. The [compatibility page](COMPATIBILITY.md) says what was measured, server by server and library by library.
-- **Under asyncio, the standard event loop only.** A uvloop event loop raises no audit events, so tethered refuses to enforce a policy next to it, and uvicorn picks uvloop whenever it is installed. Name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](COOKBOOK.md#servers-and-interpreter-pools)).
+- **Under asyncio, the selector event loop only.** A uvloop event loop raises no audit events, so tethered refuses to enforce a policy next to it, and uvicorn picks uvloop whenever it is installed. Name the loop (`uvicorn main:app --loop asyncio`) or activate in a launcher script before the server is imported ([server setup](COOKBOOK.md#servers-and-interpreter-pools)).
 - **On Windows, run asyncio on `asyncio.SelectorEventLoop`.** The default `ProactorEventLoop` connects through calls that raise no audit event, so only DNS-time hostname checks apply there.
 - **Free-threaded Python runs with the GIL once a policy is active.** tethered's C extension does not declare free-threading support, so Python turns the GIL back on when it is loaded: by `activate()`, and in a child process that inherits a policy or a scope. Importing tethered and entering a `scope()` do not load it.

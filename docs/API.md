@@ -27,14 +27,14 @@ tethered.activate(
 | `log_only` | Log what would be blocked instead of raising `EgressBlocked`. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors, instead of failing open. Default `False`. |
 | `allow_localhost` | Allow loopback addresses (`127.0.0.0/8`, `::1`). Default `True`. |
-| `on_blocked` | Callback `(host, port) -> None` invoked on every blocked connection, including in log-only mode. |
-| `locked` | Enable tamper-resistant enforcement via C extension. Replacing or deactivating the policy then requires the `lock_token`, and a C-level integrity verifier refuses ALL socket operations, process launches, and the guarded `tethered.pth` / policy-variable operations while it detects tampering with tethered's own code or the active policy. Default `False`. See [Locked mode](#locked-mode). |
+| `on_blocked` | Callback `(host, port) -> None` invoked for every refused connection, datagram and lookup (`port` is `None` for a lookup), also when `log_only` lets it through. |
+| `locked` | Lock the policy: replacing or deactivating it takes the `lock_token`, and monkey-patching tethered's functions or classes, or swapping its active policy, is detected and fails closed. Requires the C extension. Default `False`. See [Locked mode](#locked-mode). |
 | `lock_token` | Opaque token required when `locked=True` (`None` counts as missing: `ValueError`). Must be an instance like `object()` — singletons and values of immutable built-in types (`str`, `int`, `float`, `complex`, `bytes`, `bool`, `tuple`, `frozenset`, `Ellipsis`, `NotImplemented`) are rejected with `TypeError`, because an equal value created elsewhere can be the very same object. Compared by identity (`is`), not equality. tethered keeps no copy of the token outside the C extension; keep your own reference if you intend to unlock. |
-| `external_subprocess_policy` | Parent-side enforcement for *external* process launches: programs that are not Python, other Python interpreters, `sys.executable` launched with `-S` (which disables `site.py`), and Python launches that cannot be shown to inherit the policy. Values: `"warn"` (default — supply-chain visibility), `"allow"`, `"block"`. With `"block"`, `activate()` first calls `platform.platform()`, which runs `uname -p` the first time (on Windows with Python 3.11, `cmd.exe /c ver`) and keeps the answer, so that later calls launch nothing ([what "block" also refuses](SUBPROCESS.md#what-block-also-refuses)). The `/sbin/ldconfig -p` with which `ctypes.util.find_library()` reads the linker cache on Linux is not an external launch: no value refuses it or warns about it. A Python child of `sys.executable` auto-inherits the policy and is unaffected by this setting. [The subprocess page](SUBPROCESS.md#parent-side-enforcement-of-external-subprocess-launches) has the table of what counts as external. |
+| `external_subprocess_policy` | Parent-side enforcement for *external* process launches: programs that are not Python, other Python interpreters, `sys.executable` launched with `-S` (which disables `site.py`), and Python launches that cannot be shown to inherit the policy. Values: `"warn"` (default — supply-chain visibility), `"allow"`, `"block"`. A Python child of `sys.executable` auto-inherits the policy and is unaffected by this setting. With `"block"`, `activate()` has the `platform` module run its one-time program before the policy is in place, and on Linux the `/sbin/ldconfig -p` of `ctypes.util.find_library()` is not an external launch under any value ([what "block" also refuses](SUBPROCESS.md#what-block-also-refuses)). [The subprocess page](SUBPROCESS.md#parent-side-enforcement-of-external-subprocess-launches) has the table of what counts as external. |
 
 ### Replacing the active policy
 
-`activate()` can be called multiple times to replace the active policy — calling it again does not require `deactivate()` first. If the current policy is locked, the correct `lock_token` must be provided. Each call creates a completely new policy; no parameters carry over from previous calls. The addresses recorded for hostnames are dropped when the policy changes. A call that puts the same policy in place again (the same rules and settings) keeps them, so that a thread which has just looked a name up is not refused the connection that follows.
+`activate()` can be called multiple times to replace the active policy — calling it again does not require `deactivate()` first. If the current policy is locked, the correct `lock_token` must be provided (see [Locked mode](#locked-mode)). Each call creates a completely new policy; no parameters carry over from previous calls. The addresses recorded for hostnames are dropped when the policy changes. A call that puts the same policy in place again (the same rules and settings) keeps them, so that a thread which has just looked a name up is not refused the connection that follows.
 
 The call is all-or-nothing, and calls are serialized, across threads and across the interpreters of the process: a call waits while another thread or interpreter is in the middle of an `activate()` or `deactivate()`, and when it gets its turn it sees the result (an interpreter that waited for a lock being taken elsewhere gets `TetheredLocked`). Whenever it raises, the previously active policy (or none), the lock, and the policy published to child processes are exactly as they were. Two of the cases in which it raises are not about its arguments:
 
@@ -57,6 +57,7 @@ The same import refusal applies to pycares, the c-ares binding under aiodns: whi
 
 - One info line on success (`tethered: activated with N rules (log_only=...)`).
 - A warning when no `tethered.pth` is in a directory this interpreter's `site.py` processes (Python children will not inherit), or when the file that is there is not the one tethered installs (`tethered: ... is not the file tethered installs under that name ...`): another distribution that ships a `tethered.pth` replaces tethered's when it is installed. From Python 3.15 also when a `tethered.start` file lies beside the hook, which switches it off (`tethered: ... is switched off by the tethered.start file beside it ...`).
+- A warning when `sys.executable` is a program that embeds Python, not an interpreter (`tethered: sys.executable is ..., the program that embeds Python here ...`), as under uWSGI without `--py-sys-executable`: no Python child is recognized, so every launch counts as external ([the subprocess page](SUBPROCESS.md#when-sysexecutable-is-not-python)).
 - One warning per process when multiprocessing's fork server was started before the policy: its workers are copies of the fork server and are not restricted, under a locked policy either (see [the security model](security.md#what-tethered-does-not-protect-against)).
 - Later, one warning per process the first time the policy refuses (or, under `log_only`, reports) a connection to an IP address that no hostname is known for while the policy has hostname rules (`tethered: no hostname is known for the refused address ...`). Usually that is an address nothing allows, but it is also what a library that resolves names outside Python's `socket` module produces for a host the allow list names.
 
@@ -99,7 +100,7 @@ tethered.scope(
 | `allow_localhost` | Allow loopback addresses. Default `True`. |
 | `log_only` | Log what would be blocked instead of raising. Default `False`. |
 | `fail_closed` | Block when the policy check itself errors. Default `False`. |
-| `on_blocked` | Callback `(host, port) -> None` on every blocked connection. |
+| `on_blocked` | Callback `(host, port) -> None` for every connection, datagram and lookup this scope refuses (`port` is `None` for a lookup), also when `log_only` lets it through. |
 | `label` | Human-readable name for this scope. Appears in log messages and as `EgressBlocked.scope_label` when this scope produces a block. Use it to name the call site, e.g. `label="PaymentService.charge"`. Defaults to an auto-derived `"scope(<first 3 allow rules>)"` summary. |
 | `hint` | Actionable guidance attached to any `EgressBlocked` raised while this scope is the deepest hinted scope on the stack — e.g. `hint="Payment flow: only api.stripe.com:443 is reachable here"`. Surfaces as `EgressBlocked.scope_hint` and as a trailing `Hint: …` line on the message. Runs of whitespace, embedded newlines included, collapse to a single space; `None`, an empty string and whitespace alone mean no hint. The hint travels with the scope into child processes. |
 
@@ -125,9 +126,9 @@ Scopes can only **restrict**, never widen. If the app also called `activate()`, 
 tethered.deactivate(*, lock_token: object | None = None)
 ```
 
-Disable enforcement. All connections are allowed again. Internal state (IP-to-hostname mappings, callback references) is fully cleared — a subsequent `activate()` starts fresh.
+Remove the global policy. Scopes that are open still apply. Internal state (IP-to-hostname mappings, callback references) is fully cleared — a subsequent `activate()` starts fresh.
 
-If activated with `locked=True`, the matching `lock_token` must be provided or `TetheredLocked` is raised. `TetheredLocked` is also raised, even with the right token, when the locked policy has failed its integrity check (the message says so). The process then has to be restarted, or the original objects restored.
+A locked policy is deactivated only with its `lock_token`, and not at all while it fails its integrity check; otherwise `TetheredLocked` is raised (see [Locked mode](#locked-mode)).
 
 Like `activate()`, the call is serialized with other `activate()` / `deactivate()` calls, in this interpreter and in the others, and leaves everything as it was if it raises. Both raise `RuntimeError` in the two cases where waiting could never end: when the call is made from inside another interpreter's `activate()` / `deactivate()` on the same thread, and when Python is shutting down while another thread holds its turn.
 
@@ -188,9 +189,7 @@ Like `EgressBlocked`, it can be pickled and copied with its attributes, and rebu
 
 ## `tethered.TetheredLocked`
 
-Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token — except when `activate()` re-requests a policy identical to the active one, which is an idempotent no-op (see [Locked mode](#locked-mode)). Also raised, even with the correct token, when the locked policy has failed its integrity check. Subclass of `RuntimeError`.
-
-Only the interpreter that took the lock can present its token, so in every other interpreter of the process `deactivate()` raises it while the lock is held, and so does `activate()` unless it is that no-op. The no-op exists where the interpreter has a locked policy of its own to compare with: in the lock holder and in an interpreter that joined the lock. The message says which situation the caller is in:
+Raised when `deactivate()` or `activate()` is called on a locked policy without the correct token, and even with it while the locked policy fails its integrity check. An `activate()` of the identical policy is a no-op instead, where the interpreter holds a locked policy of its own to compare with: in the lock holder and in an interpreter that joined the lock ([Locked mode](#locked-mode)). Subclass of `RuntimeError`. The message says which situation the caller is in:
 
 | Caller | Message |
 |---|---|
@@ -222,7 +221,9 @@ A joined interpreter is told to pass the token although it has none: the token n
 
 **Localhost** (`127.0.0.0/8`, `::1`) is allowed by default; pass `allow_localhost=False` to change that. The addresses `0.0.0.0` and `::` (INADDR_ANY) are treated as localhost. With localhost off, one loopback connection still passes: the one with which `socket.socketpair()` joins its own two sockets on Windows, which every asyncio event loop makes when it is created ([the security model](security.md#what-tethered-protects-against) says how it is recognised).
 
-**Malformed rules raise `ValueError`** at `activate()` / `scope()`; [Rule validation](#rule-validation) lists what is rejected. Hostnames containing whitespace, control characters, or invisible Unicode are rejected and never matched by wildcard rules.
+**The machine's own name.** While an `activate()` policy is in place, a lookup of the name `socket.gethostname()` returned when the policy was activated, through `socket.getaddrinfo`, `gethostbyname`, `gethostbyname_ex` or `gethostbyaddr` (which `socket.getfqdn()` calls), is checked by neither the policy nor any scope, so that code which asks for the machine's own name keeps working. The connection that follows is checked by its address, since that lookup records no hostname for it; a scope used without `activate()` makes no such exception.
+
+**Malformed rules raise `ValueError`** at `activate()` / `scope()`; [Rule validation](#rule-validation) lists what is rejected. A destination hostname that contains whitespace, a control character or invisible Unicode is allowed by no rule.
 
 ## Locked mode
 
@@ -265,7 +266,7 @@ tethered.activate(
 )
 ```
 
-tethered logs to the `"tethered"` logger via stdlib `logging`. To see log-only warnings, ensure your application has logging configured (e.g., `logging.basicConfig()`). What a log-only policy or scope lets through is logged as `tethered: would block ...` (`would block connect to evil.test:443`); an enforcing one logs `tethered: blocked ...` for what it refuses.
+tethered logs to the `"tethered"` logger via stdlib `logging` and adds no handler of its own. Its warnings reach standard error even where logging is not configured; configure it (e.g., `logging.basicConfig(level=logging.INFO)`) to route them and to see the info lines. What a log-only policy or scope lets through is logged as `tethered: would block ...` (`would block connect to evil.test:443`); an enforcing one logs `tethered: blocked ...` for what it refuses.
 
 A log-only policy refuses nothing, and it still acts on the process. tethered's audit hook is installed for the life of the process. Each host name the policy allows is looked up a second time, by tethered, to record its addresses ([measured cost](ARCHITECTURE.md#performance)). Python child processes inherit the policy. No import is refused, so uvloop and pycares load under it. What tethered does not see is not reported either: a library that connects in C, everything on a uvloop event loop, and connections on Windows' default `ProactorEventLoop` ([what "not seen" means](COMPATIBILITY.md#what-not-seen-means)). A quiet log therefore says that nothing tethered sees would be blocked.
 
@@ -273,7 +274,7 @@ A log-only policy refuses nothing, and it still acts on the process. tethered's 
 
 ## Intersection semantics — `activate()` + `scope()`
 
-- `activate()` sets a **process-wide ceiling**. No code anywhere in the process can reach destinations outside it.
+- `activate()` sets a **process-wide ceiling**. No connection made through Python's `socket` module, in any thread or task, reaches a destination outside it ([what tethered does not see](security.md#what-tethered-does-not-protect-against)).
 - `scope()` creates a **temporary restriction** within the current context. It can only narrow the effective policy, never widen it.
 - When both are active, the effective policy is the **intersection** — a connection must be allowed by both the global policy and every active scope.
 - At connect time a destination can be known by several names: the hostnames remembered for its address (up to 8, most recent first) and the raw IP. Each layer — the global policy and each scope — is satisfied if it allows any one of them, and then every layer must be satisfied. Lookups are checked by name only, so a scope that allows only IP addresses still refuses a hostname lookup made inside it.
@@ -314,7 +315,7 @@ with tethered.scope(allow=["*.stripe.com:443", "*.twilio.com:443"]):
 uv run python -m tethered check
 ```
 
-Or `python -m tethered check` with the interpreter the application runs on. Run in the environment where the application will run, before a policy is put in place there, the command reports which rows of [the compatibility page](COMPATIBILITY.md) apply to that environment: what tethered would refuse, what it would not see, and what needs configuration. Each finding says what is there, what it means and what to do, with a link to the page that has the details:
+Or `python -m tethered check` with the interpreter the application runs on. Run it in the environment where the application will run, before a policy is in place there. It reports which rows of [the compatibility page](COMPATIBILITY.md) apply to that environment: what tethered would refuse, what it would not see, and what needs configuration. Each finding says what is there, what it means and what to do, with a link to the page that has the details:
 
 ```text
 Client libraries

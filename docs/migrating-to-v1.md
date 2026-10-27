@@ -138,7 +138,7 @@ tethered.scope(allow=["*.stripe.com:443", "db.internal:5432"])  # ValueError for
 
 **Install tethered into site-packages.** A Python child inherits the policy through `tethered.pth`, which `site.py` runs only from a site directory. An editable install (`-e`) and a `--target` install used through `PYTHONPATH` put no such file there. 0.5.3 took the file next to the package for the bootstrap and trusted children that never ran it. 1.0.0 logs `tethered: tethered.pth not found at ...` at `activate()` and treats every launch of `sys.executable` as external. What to do: a regular install (`uv add tethered`, `pip install tethered`) in every environment that should pass the policy on.
 
-**More launches count as external.** They are logged under the default `external_subprocess_policy="warn"` and refused with `SubprocessBlocked` under `"block"`. The log line and `SubprocessBlocked.description` end with the reason.
+**More launches count as external.** They are logged under the default `external_subprocess_policy="warn"` and refused with `SubprocessBlocked` under `"block"`. For a launch of `sys.executable`, the log line and `SubprocessBlocked.description` end with the reason.
 
 | Launch | Why it is external | What to do |
 |---|---|---|

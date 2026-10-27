@@ -103,7 +103,7 @@ except* tethered.EgressBlocked as group:
 
 One refusal raises nothing where the call is made: `transport.sendto(data, addr)` on an unconnected asyncio datagram transport. The datagram is not sent; asyncio logs "Fatal write error on datagram transport", closes the transport and hands the `EgressBlocked` to the protocol's `connection_lost()`. A connected endpoint (`remote_addr=`) raises `EgressBlocked` from `create_datagram_endpoint()`.
 
-All of this is on the standard asyncio event loop, which is the only one tethered enforces on. uvicorn prefers uvloop when it is installed; with a policy active it falls back to the standard loop or does not start, depending on how it is started: see [uvicorn and FastAPI](#uvicorn-and-fastapi).
+All of this is on asyncio's own selector event loop. tethered does not run next to uvloop, which uvicorn prefers when it is installed: with a policy active, uvicorn falls back to asyncio's loop or does not start, depending on how it is started; see [uvicorn and FastAPI](#uvicorn-and-fastapi).
 
 ### Celery tasks
 
@@ -139,17 +139,23 @@ def retry_with_backoff(fn, attempts=3):
             time.sleep(2**attempt)
 ```
 
-With a retry library, pass the exception types to retry explicitly (for example `ConnectionError`, `TimeoutError`) instead of retrying on every exception. `EgressBlocked` is a `RuntimeError`, so a policy limited to network errors never retries it.
+With a retry library, pass the exception types to retry explicitly (for example `ConnectionError`, `TimeoutError`) instead of retrying on every exception. `EgressBlocked` is a `RuntimeError`, so a policy limited to network errors never retries it. `requests` passes `EgressBlocked` through unwrapped, and an adapter configured to retry (`max_retries=3`) makes one attempt.
 
 ## Servers and interpreter pools
 
-What a deployment has to get right so that the policy is enforced in every process and interpreter that serves requests. This section is written from container suites that run the real servers on Linux (x86-64, glibc) with Python 3.11 to 3.15. [The compatibility page](COMPATIBILITY.md) has the full tables, the version each row was measured with and the suite behind it, and what was not tested. A statement that no suite asserts says "measured once"; the notes on `InterpreterPoolExecutor` that go beyond joining a lock, and the one on interpreter pools under gunicorn's `--preload`, come from earlier container runs on Python 3.14 and are not part of a suite either. The limits behind this guidance are stated in [the security model](security.md#what-tethered-does-not-protect-against).
+What a deployment has to get right so that the policy is enforced in every process and interpreter that serves requests. This section is written from container suites that run the real servers on Linux (x86-64, glibc) with Python 3.11 to 3.15. [The compatibility page](COMPATIBILITY.md) has the full tables, the version each row was measured with and the suite behind it, and what was not tested. A statement that no suite asserts says "measured once". The limits behind this guidance are stated in [the security model](security.md#what-tethered-does-not-protect-against).
 
 Three rules cover most of it:
 
 - **Activate before the server, where you can.** A policy that is active when the server is imported is inherited by every worker it starts, and keeps uvloop from being loaded. The [launcher pattern](#the-launcher-pattern) does that for any server.
-- **On asyncio, tethered runs on the standard event loop only.** With a policy active, `import uvloop` raises `ImportError`; with uvloop already loaded, `activate()` raises `RuntimeError`. A server that picks uvloop on its own either falls back to the standard loop or does not start. It never serves without the policy, with the exceptions listed under [uvicorn and FastAPI](#uvicorn-and-fastapi).
+- **On asyncio, tethered does not run on uvloop.** With a policy active, `import uvloop` raises `ImportError`; with uvloop already loaded, `activate()` raises `RuntimeError`. A server that picks uvloop on its own either falls back to asyncio's own loop or does not start. It never serves without the policy, with the exceptions listed under [uvicorn and FastAPI](#uvicorn-and-fastapi). An interpreter outside a lock holds no policy and can load uvloop all the same ([mod_wsgi](#mod_wsgi)).
 - **A locked policy is one per process, and it survives a re-execution.** Take the lock before other interpreters of the process exist, and stop and start the server to change it ([changing a locked policy](#changing-a-locked-policy)).
+
+### Under every server
+
+**An uncaught `EgressBlocked` does not take a worker down.** The request fails as any uncaught exception does on that server: a 500, with the traceback in the server's log, on most of them (uvicorn logs "Exception in ASGI application"), and no response at all under gunicorn's tornado worker and under uWSGI, with or without tethered. [The compatibility page](COMPATIBILITY.md#what-holds-under-every-server) lists them. To answer with a response of your own, see [handling blocked connections](#handling-blocked-connections).
+
+**Launch Python children with `sys.executable`.** Such a child inherits the policy, a locked one included, also when it is given an `env=` that lacks `_TETHERED_CHILD_POLICY`. `["python3", ...]` is warned about as external although that child does inherit; `[sys.executable, "-S", ...]` and any other program are warned about and run without a policy. All three are refused under `external_subprocess_policy="block"`. [The compatibility page](COMPATIBILITY.md#what-holds-under-every-server) has the table. Under uWSGI this needs [`--py-sys-executable`](#uwsgi).
 
 ### The launcher pattern
 
@@ -176,9 +182,9 @@ if __name__ == "__main__":
     main()
 ```
 
-Run it with `python serve.py`. The workers are new Python processes: each inherits the locked policy as it starts, before it imports anything of the server or the application, and a worker that replaces a dead one does too. If `main.py` calls `activate()` with the same policy, that call is a no-op in the workers. The activation is under the `__main__` guard because a worker runs this file again, as multiprocessing's `__mp_main__`; without the guard the call is repeated there, which is the same no-op.
+Run it with `python serve.py`. The workers are new Python processes: each inherits the locked policy as it starts, before it imports anything of the server or the application, and a worker that replaces a dead one does too. If `main.py` calls `activate()` with the same policy, that call is a no-op in the workers. `main()` is called under the `__main__` guard because each worker runs this file again, as multiprocessing's `__mp_main__`, and must not start a server of its own there.
 
-The same shape works for granian (`from granian import Granian`), sanic, waitress (`from waitress import serve`), daphne, and for a container entry point that ends by executing a server that is not Python, such as Apache or supervisord: the policy travels in the environment of the process. Executing a program that is not Python is an external launch, so such an entry point is logged under the default `external_subprocess_policy="warn"` and cannot use `"block"`.
+The same shape works for granian (`from granian import Granian`), sanic, waitress (`from waitress import serve`), daphne, and for a container entry point that ends by executing another program, such as Apache or supervisord: the policy travels in the environment, to every Python process and interpreter started under it, restarts included. A program whose environment is wiped on the way (`env -i`) starts without it; activate in the program itself where that matters. Executing a program other than `sys.executable` is an external launch, so such an entry point is logged under the default `external_subprocess_policy="warn"` and cannot use `"block"`.
 
 ### uvicorn and FastAPI
 
@@ -192,39 +198,27 @@ uvicorn main:app --loop asyncio --reload
 
 `UVICORN_LOOP=asyncio` in the environment does the same for the `uvicorn` command, and only for the command: `uvicorn.run()` and `fastapi run` do not read it. In a script, pass the argument: `uvicorn.run("main:app", loop="asyncio")`, with `workers=N` if you want workers.
 
-Without the loop named, with uvloop installed and an application that calls `activate()` when it is imported:
+Without the loop named, with uvloop installed and an application that calls `activate()` when it is imported, the outcome depends on the uvicorn release and on how uvicorn is started. It falls back to asyncio's loop, logging `tethered: refused to load uvloop while a policy is active`. Or it does not start (`RuntimeError` from `activate()`). Or it never serves: every worker dies at `activate()` and the supervisor keeps starting new ones. [The compatibility page](COMPATIBILITY.md#uvicorn) has the outcome by release and way of starting. The [launcher pattern](#the-launcher-pattern) works with both releases measured, with or without workers.
 
-| How it is started | uvicorn 0.54 | uvicorn 0.46 |
-|---|---|---|
-| `uvicorn main:app` | Works: the import of uvloop is refused and uvicorn falls back to the standard loop. One warning is logged (`tethered: refused to load uvloop while a policy is active`). | Does not start: `RuntimeError` from `activate()`. |
-| `uvicorn main:app --workers N` or `--reload` | Never serves: every worker dies at `activate()` and the supervisor keeps starting new ones. | Never serves. |
-| `uvicorn.run("main:app")` | Works. | Does not start. |
-| `uvicorn.run("main:app", workers=N)` | Never serves. | Not tested. |
-| The [launcher pattern](#the-launcher-pattern), with or without workers | Works. | Works. |
-
-uvicorn 0.47.0 is the first release that imports the application before it chooses the loop, and from 0.50.0 its worker and reload processes choose the loop first again (measured once per release, not part of a suite).
-
-**`fastapi run`** has no option for the event loop. `fastapi run main.py`, or `fastapi run` finding `main.py` on its own, imports the application itself, so the policy is active before uvicorn starts: it works, with `--workers` too, and so does `fastapi dev`. With `--entrypoint main:app` (or the entry point in `pyproject.toml`) the import is left to uvicorn: that works in one process with uvicorn 0.54, does not start with uvicorn 0.46, and never serves with `--workers`. Give `fastapi run` the path, or serve with `uvicorn main:app --loop asyncio --workers N`.
+**`fastapi run`** has no option for the event loop. Give it the path: `fastapi run main.py`, or `fastapi run` finding `main.py` on its own, imports the application itself, so the policy is active before uvicorn starts; that works with `--workers` too, and so does `fastapi dev`. With `--entrypoint main:app` (or the entry point in `pyproject.toml`) the import is left to uvicorn, the outcome depends on its release, and with `--workers` it never serves ([the compatibility page](COMPATIBILITY.md#fastapi)). Otherwise serve with `uvicorn main:app --loop asyncio --workers N`.
 
 **Activate at import, not in a lifespan handler.** By the time a lifespan handler runs, uvicorn has chosen its loop. With FastAPI or Starlette the server then exits ("Application startup failed. Exiting."), which is at least loud. With a hand-written ASGI lifespan handler, uvicorn's default `--lifespan auto` takes the `RuntimeError` for "this application does not support lifespan" and serves on uvloop **with no policy**; the only trace is the error line `tethered: activate() refused — uvloop is loaded in this process.` in the log. With the loop named, activation in a lifespan handler works.
 
-**Where uvloop still ends up in the process.** A `log_only` policy refuses nothing, uvloop included: the server runs on uvloop and nothing that goes through the loop is reported, so a log-only rollout of an asyncio application tells you nothing about its asynchronous calls unless the loop is named. A `scope()` with no `activate()` under it does not keep uvloop out either, and on uvloop it is not applied to `asyncio.open_connection` or `loop.create_connection`. In both cases tethered logs one warning that starts with `tethered: uvloop is loaded in this process.`
+**Where uvloop still ends up in the process.** A `log_only` policy refuses nothing, uvloop included: the server runs on uvloop and nothing that goes through the loop is reported, so a log-only rollout of an asyncio application tells you nothing about its asynchronous calls unless the loop is named. A `scope()` with no `activate()` under it does not keep uvloop out either, and is not applied to what the loop does ([scopes under asyncio](#scope-in-generators-and-under-asyncio)). In both cases tethered logs one warning that starts with `tethered: uvloop is loaded in this process.`
 
 **Two ways to check a running server.** Inside the application, `type(asyncio.get_running_loop()).__module__` is `uvloop` on a uvloop loop and, on Linux, `asyncio.unix_events` on the standard one. And the log: `tethered: refused to load uvloop while a policy is active` means that the server asked for uvloop and fell back; with the loop named, nothing is logged.
 
 **Workers.** With the loop named, each worker activates when it imports the application, and the supervisor process holds no policy. A worker that replaces a killed one enforces as well. With the launcher pattern the supervisor holds the policy and the workers inherit it at start-up, locked if it is locked and also under `external_subprocess_policy="block"`.
 
-**An uncaught `EgressBlocked`** in an endpoint ends the request with a 500 and "Exception in ASGI application" in the log. The worker keeps serving.
-
 ### gunicorn
 
-**With sync and gthread workers** every worker enforces the policy, with and without `--preload`. That includes the workers that replace others under `--max-requests` and the workers started by a `SIGHUP` reload. An uncaught `EgressBlocked` ends the request with a 500 and a traceback in the error log; the worker survives.
+**With sync and gthread workers** every worker enforces the policy, with and without `--preload`. That includes the workers that replace others under `--max-requests` and the workers started by a `SIGHUP` reload.
 
-**`-k uvicorn.workers.UvicornWorker`** and the `uvicorn-worker` package's `-k uvicorn_worker.UvicornWorker` work as they are, with uvloop installed, with and without `--preload`: the worker imports the application before it asks uvicorn for its loop, the import of uvloop is refused, and the worker runs on the standard loop. Replaced workers do the same. This holds for uvicorn 0.54 and 0.46; with uvicorn 0.35 the worker set its loop up first and did not boot without `--preload` (measured once). gunicorn's own `-k asgi` worker sets its loop up first: use it with `--preload` or `--asgi-loop asyncio`, otherwise gunicorn exits with "Worker failed to boot."
+**`-k uvicorn.workers.UvicornWorker`** and the `uvicorn-worker` package's `-k uvicorn_worker.UvicornWorker` work as they are, with uvloop installed, with and without `--preload`: the worker imports the application before it asks uvicorn for its loop, the import of uvloop is refused, and the worker runs on the standard loop. Replaced workers do the same. This holds for uvicorn 0.54 and 0.46. gunicorn's own `-k asgi` worker sets its loop up first: use it with `--preload` or `--asgi-loop asyncio`, otherwise gunicorn exits with "Worker failed to boot."
 
 **`-k gevent`** and `-k gevent_pywsgi`: connections are enforced, in every worker and for greenlets that overlap. Three things are particular to gevent.
 
-- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken. The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). A plain audit hook that logs and raises did the same with no tethered in the process. One mitigation was measured: with `logging.getLogger("tethered").setLevel(logging.ERROR)`, tethered writes no warning for a refusal, and no process had a stuck greenlet. Take it for what it is: a measurement, at the price of tethered's own log line for each refusal (the exception is still raised, so log refusals where you catch them). A shorter `--graceful-timeout` limits how long a stuck request can hold a worker. [The compatibility page](COMPATIBILITY.md#gunicorn) has the numbers.
+- A refused name lookup now and then never returns. tethered logs the refusal from one of gevent's resolver threads, and after monkey-patching the lock of a logging handler is gevent's: when several of those threads log at the same moment, one of them is sometimes never woken (an audit hook that logs and raises does the same without tethered). The request hangs, and a worker that is told to restart or stop waits for it until `--graceful-timeout` (30 seconds by default). With `logging.getLogger("tethered").setLevel(logging.ERROR)` tethered logs no warning for a refusal, and in the measurements no process then had a stuck greenlet; the exception is still raised, so log the refusal where you catch it. A shorter `--graceful-timeout` limits how long a stuck request can hold a worker. [The compatibility page](COMPATIBILITY.md#gunicorn) has the figures.
 - gevent's hub prints a traceback for every refused lookup, in addition to tethered's warning. Telling the hub that `EgressBlocked` is not its error silences that:
 
     ```python
@@ -244,13 +238,11 @@ uvicorn 0.47.0 is the first release that imports the application before it choos
 
 With `GEVENT_RESOLVER=ares` lookups are made by c-ares, which tethered does not see: hosts the allow list names are refused, and names are sent to the DNS server unchecked. Use gevent's default resolver.
 
-**`-k tornado`**: enforced. An exception the application lets out gets no response at all; tornado logs it and leaves the connection open, with or without tethered. Catch `EgressBlocked` in the application.
+**`-k tornado`**: enforced. Catch `EgressBlocked` in the application: an exception it lets out gets no response at all, and tornado leaves the connection open, with or without tethered.
 
-**Launching processes from a request handler.** Launch Python children with `sys.executable`. Such a child inherits the policy, a locked one included, also when it is given an `env=` that lacks `_TETHERED_CHILD_POLICY`. `["python3", ...]` is warned about as external although that child does inherit; `[sys.executable, "-S", ...]` and any other program are warned about and run without a policy. All three are refused under `external_subprocess_policy="block"`. [The compatibility page](COMPATIBILITY.md#what-holds-under-every-server) has the table.
+**Binary upgrade (`SIGUSR2`).** It works as it is, with no `pre_exec` hook, locked or not, with and without `--preload`, and a client that kept requesting during the upgrade saw no failed request. Under `--preload` gunicorn re-executes itself with the environment it saved before the application activated; tethered adds the policy to that exec, and under a lock it logs `tethered: os.exec*(...) was given an environment without _TETHERED_CHILD_POLICY; carried out with the locked policy added`. Under `--preload`, a new release that asks for a different locked policy does not start: see [changing a locked policy](#changing-a-locked-policy).
 
-**Binary upgrade (`SIGUSR2`).** It works as it is, with a locked policy too, with and without `--preload`. gunicorn re-executes itself with the environment it saved when it started, which under `--preload` lacks the policy variable; tethered carries that exec out with the variable added and logs `tethered: os.exec*(...) was given an environment without _TETHERED_CHILD_POLICY; carried out with the locked policy added`. The new master starts under the policy, its own `activate()` is the idempotent no-op, and a client that kept requesting during the upgrade saw no failed request.
-
-**Interpreter pools under `--preload`.** Do not start an `InterpreterPoolExecutor` worker at import time, which under `--preload` is in the master process: every worker process forked afterwards died with `SIGSEGV`, with or without tethered. Create the pool in the worker process, when it is first needed.
+**Interpreter pools under `--preload`.** Do not start an `InterpreterPoolExecutor` worker at import time, which under `--preload` is in the master process: every worker process forked afterwards died with `SIGSEGV`, with or without tethered (measured once, on Python 3.14). Create the pool in the worker process, when it is first needed.
 
 ### hypercorn and Quart
 
@@ -265,28 +257,7 @@ hypercorn's master never imports the application; every worker is a new Python p
 granian imports every event-loop package it finds as soon as granian itself is imported, in the main process and in every worker, whichever `--loop` is asked for. So:
 
 - **uvloop not installed** (plain `granian`, or `granian[rloop]`): `granian --interface asgi main:app` with `activate()` at the top of `main.py` is enforced, for ASGI, RSGI and WSGI, with `--workers`, and in workers started later.
-- **uvloop installed** (`granian[uvloop]`): the server does not start under a policy, with `--loop asyncio` or `--loop rloop` either, because uvloop is loaded all the same. Uninstall uvloop, or use the launcher pattern, with which uvloop is not loaded and `auto` goes on to rloop or asyncio:
-
-```python
-# serve.py
-import tethered
-
-
-def main():
-    tethered.activate(
-        allow=["api.stripe.com:443", "db.internal:5432"],
-        locked=True,
-        lock_token=object(),
-    )
-
-    from granian import Granian
-
-    Granian("main:app", address="0.0.0.0", port=8000, interface="asgi", workers=2).serve()
-
-
-if __name__ == "__main__":
-    main()
-```
+- **uvloop installed** (`granian[uvloop]`): the server does not start under a policy, with `--loop asyncio` or `--loop rloop` either, because uvloop is loaded all the same. Uninstall uvloop, or use [the launcher pattern](#the-launcher-pattern) with granian in place of uvicorn: `from granian import Granian`, then `Granian("main:app", address="0.0.0.0", port=8000, interface="asgi", workers=2).serve()`. uvloop is then not loaded, and `auto` goes on to rloop or asyncio.
 
 On rloop one way out is not seen: `transport.sendto(data, addr)` on an unconnected datagram endpoint is sent below Python. Connections, lookups, connected datagram endpoints and launches are enforced there.
 
@@ -365,7 +336,7 @@ The plain deployment works as it is: with `activate()` at the top of the WSGI fi
 uwsgi --http :8000 --wsgi-file app.py --master --processes 2
 ```
 
-**Add `--py-sys-executable` if the application launches Python children.** Under uWSGI `sys.executable` is the uwsgi binary, so `subprocess.run([sys.executable, "script.py"])` starts uWSGI, not Python. tethered says so when the policy is activated (`tethered: sys.executable is /usr/local/bin/uwsgi, the program that embeds Python here, not a Python interpreter. ...`) and counts every launch as external: warned about, and refused under `"block"`, a launch of the real interpreter included, although that child does inherit the policy. Naming the interpreter puts it right:
+**Add `--py-sys-executable` if the application launches Python children.** Under uWSGI `sys.executable` is the uwsgi binary, not Python, so tethered counts every launch as external, a launch of the real interpreter included: warned about, and refused under `"block"`. It says so when the policy is activated (`tethered: sys.executable is /usr/local/bin/uwsgi, the program that embeds Python here, not a Python interpreter. ...`); [the subprocess page](SUBPROCESS.md#when-sysexecutable-is-not-python) explains why. Naming the interpreter puts it right:
 
 ```bash
 uwsgi --http :8000 --wsgi-file app.py --master --processes 2 --py-sys-executable /usr/local/bin/python
@@ -375,9 +346,7 @@ With a virtualenv (`-H /opt/venv`), name the virtualenv's interpreter (`--py-sys
 
 **A reload does not change a locked policy.** `SIGHUP`, `--py-autoreload` and, without `--die-on-term`, `SIGTERM` re-execute the uwsgi binary, and the new process inherits the locked policy before it loads the application. See [changing a locked policy](#changing-a-locked-policy).
 
-**Several applications with `--mount`** share one process, the first in the main interpreter and each later one in an interpreter of its own, and a locked policy is one per process. Lock the same policy in every application, or in the first one only: later applications join the lock as they are loaded. An application that is loaded before another one locks is outside that lock and has no network at all. Applications that need different policies need different uWSGI instances.
-
-An exception the application lets out makes uWSGI close the connection without a response, with or without tethered.
+**Several applications with `--mount`** share one process, the first in the main interpreter and each later one in an interpreter of its own, and a locked policy is one per process. Lock the same policy in every application, or in the first one only: later applications join the lock as they are loaded. An application that is loaded before another one locks is outside that lock and has no network through Python's sockets, loopback included (see [mod_wsgi](#mod_wsgi) for the one way out). Applications that need different policies need different uWSGI instances.
 
 ### waitress
 
@@ -385,7 +354,7 @@ waitress is one process with a pool of threads. `waitress-serve main:application
 
 ### mod_wsgi
 
-mod_wsgi runs each application group in an interpreter of its own, and by default creates that interpreter when the group gets its first request. A locked tethered policy belongs to the process, not to the application group: one interpreter takes the lock, and the others either join it as they start or are left outside it with no network. The guidance below follows from that.
+mod_wsgi runs each application group in an interpreter of its own, and by default creates that interpreter when the group gets its first request. A locked tethered policy belongs to the process, not to the application group: one interpreter takes the lock, and the others either join it as they start or are left outside it with no network through Python's sockets. The guidance below follows from that.
 
 **One application per process works.** It works in the default application group, where the application runs in a subinterpreter and takes the lock there, and in `%{GLOBAL}`; in daemon mode and in embedded mode; and through stop, graceful restart, and `maximum-requests` and `inactivity-timeout` recycling. `mod_wsgi-express` with its defaults (main interpreter, preloaded) works as it is. Give each application a daemon process group of its own:
 
@@ -432,7 +401,7 @@ WSGIImportScript /srv/policy/lock.wsgi process-group=apps application-group=%{GL
 
 The applications stay lazy, their order does not matter, and they need not import tethered at all; one that calls `activate(locked=True)` with the same policy gets the no-op. No request is routed to `%{GLOBAL}`. In embedded mode the line is `WSGIImportScript /srv/policy/lock.wsgi process-group=%{GLOBAL} application-group=%{GLOBAL}`. A container entry point that activates and then executes Apache has the same effect for every process of the server.
 
-**What happens without it.** With lazy loading, which is the default, the first requests of two applications can overlap. The interpreter of the second then already exists at the moment the first application takes the lock. It is outside the lock: its `activate()` raises `TetheredLocked`, also for the identical policy, and it has no network at all, loopback included. If the application lets that exception out of its WSGI script, mod_wsgi tries the import again on every request, and every request is a 500. Which application loses is open. Embedded mode and `WSGIPerInterpreterGIL On` make no difference. Nothing forbidden is reached in any of this; what breaks is the application.
+**What happens without it.** With lazy loading, which is the default, the first requests of two applications can overlap. The interpreter of the second then already exists at the moment the first application takes the lock. It is outside the lock: its `activate()` raises `TetheredLocked`, also for the identical policy, and it has no network through Python's sockets, loopback included. If the application lets that exception out of its WSGI script, mod_wsgi tries the import again on every request, and every request is a 500. Which application loses is open. Embedded mode and `WSGIPerInterpreterGIL On` make no difference. Nothing forbidden is reached through Python's sockets; what breaks is the application. The one way out is an event loop that does its networking in C: an interpreter outside the lock holds no policy of its own, so nothing keeps it from importing uvloop, and a connection on a uvloop loop there reaches any destination, with no exception and no log line ([the security model](security.md#locked-mode--what-it-does-and-does-not-do)).
 
 Two other arrangements avoid the race: one `WSGIDaemonProcess` per application, as above, or loading every script of the process at process start with `WSGIImportScript`, the script that takes the lock first. In the other order the application that is imported before the lock is taken is locked out every time.
 
@@ -442,15 +411,13 @@ Two other arrangements avoid the race: one `WSGIDaemonProcess` per application, 
 
 **Reloading a WSGI script.** In embedded mode a script that is reloaded with a changed locked policy gets `TetheredLocked`, and requests are answered with a 500 until Apache is restarted; reloaded with the same policy, its `activate()` is a no-op. In daemon mode touching the script restarts the process, and the new policy is in place.
 
-**Subprocesses from a handler** under a lock are handled as under [gunicorn](#gunicorn), in the lock holder and in an interpreter that joined. An interpreter outside the lock launches nothing.
+**Subprocesses from a handler** under a lock are handled as [under every server](#under-every-server), in the lock holder and in an interpreter that joined. An interpreter outside the lock launches nothing.
 
 ### Flask and Django
 
-**Flask**: call `activate()` in the application factory, before the application is built. It is then in force in every gunicorn worker, in `flask` commands, and in both processes of `flask run` with its reloader. An error handler registered with `@app.errorhandler(tethered.EgressBlocked)` is reached for a refused lookup and for a refused connection.
+**Flask**: call `activate()` in the application factory, before the application is built. It is then in force in every gunicorn worker, in `flask` commands, and in both processes of `flask run` with its reloader. The error handler that turns a refusal into a response is under [Django / FastAPI middleware](#django--fastapi-middleware).
 
 **Django**: call `activate()` in `settings.py`. Every entry point of a project imports the settings first: the WSGI application under gunicorn, with and without `--preload`, every management command, and both processes of `runserver` with its autoreloader. The middleware that turns a refusal into a 503 is under [Django / FastAPI middleware](#django--fastapi-middleware).
-
-`requests` passes `EgressBlocked` through unwrapped, and an adapter configured to retry makes one attempt.
 
 ### Changing a locked policy
 
@@ -468,7 +435,7 @@ Upgrade tethered itself the same way: from the deployment, with the server stopp
 
 What matters is where `activate()` is called: it has to run in every process that runs task code, before the first task.
 
-**Celery.** Call `activate()` when the application module is imported. That is in the worker's main process, before Celery creates its pool, and it covers every pool: prefork (also processes started later by `--max-tasks-per-child`, `--autoscale`, or after one was killed), threads, solo and gevent, and beat inside the worker or as a process of its own. If the module is also imported by processes that should not get this policy (a web application that only sends tasks), use the `worker_init` signal, which Celery sends in the worker's main process whatever the pool:
+**Celery.** Call `activate()` when the application module is imported. That is in the worker's main process, before Celery creates its pool, and it covers every pool: prefork (also processes started later by `--max-tasks-per-child`, `--autoscale`, or after one was killed), threads, solo and gevent, and beat inside the worker or as a process of its own. If the module is also imported by processes that should not get this policy (a web application that only sends tasks), activate in a handler of the `worker_init` signal, which Celery sends in the worker's main process. That arrangement was measured with `--pool threads` only, where the main process and its tasks hold the policy ([the compatibility page](COMPATIBILITY.md#task-queues-and-process-pools)):
 
 ```python
 # tasks.py
@@ -483,7 +450,7 @@ def activate_tethered(**kwargs):
     tethered.activate(allow=["api.stripe.com:443"])
 ```
 
-- **Do not rely on `worker_process_init` alone.** Celery sends it in the children of the prefork pool and in the solo pool. With `--pool threads` or `--pool gevent` it is never sent, the handler never runs, and the worker has no policy at all.
+- **Do not rely on `worker_process_init` alone.** In the prefork pool it covers the children, recycled ones too, but not the worker's main process. With `--pool threads` or `--pool gevent` it is never sent, the handler never runs, and the worker has no policy at all.
 - **The broker has to be allowed.** Loopback is allowed by default. A broker addressed by name has to be in the allow list, otherwise the worker ends at start-up with `EgressBlocked` for the broker's address.
 - **The eventlet pool** resolves names with its own resolver, which tethered does not see: a host the allow list names is refused. Set `EVENTLET_NO_GREENDNS=yes`, or allow the address.
 - **What the producer sees.** `result.get()` for a refused task raises `tethered.EgressBlocked` in a producer that has tethered loaded, with Celery's default JSON result serializer and with `result_serializer="pickle"`. With JSON, Celery rebuilds the exception from its message, and `host`, `port` and the other attributes are read back out of it. A producer that has not imported tethered gets a class of Celery's own that is named `EgressBlocked`; with pickle, reading the result imports tethered.
@@ -496,8 +463,6 @@ def activate_tethered(**kwargs):
 
 **arq.** Call `activate()` when the module with `WorkerSettings` is imported, or in `on_startup`. The worker runs on asyncio's own event loop.
 
-**Under supervisord**, or any process manager, a policy activated by the entry point reaches a Python program through the environment, and its restarts too. A program whose environment is wiped on the way (`env -i`) starts without it. Activate in the program itself where that matters.
-
 In all of these a refused task fails like any task that raises: the workers keep running, and whether it is retried depends on the retry settings ([Celery tasks](#celery-tasks), [Retry decorators](#retry-decorators)).
 
 ### Process pools and the fork server
@@ -507,16 +472,16 @@ In all of these a refused task fails like any task that raises: the workers keep
 **Call `activate()` before the first pool or process is started.** A policy reaches a process when it starts:
 
 - Worker processes that were started before `activate()` hold no policy until they are replaced.
-- **A fork server that was started before `activate()` keeps producing workers without a policy**, under a locked policy too. A forkserver worker is a copy of the fork server process, not of the process that asks for it, and asking for one raises no audit event, so tethered can neither refuse nor repair it. forkserver is the default start method on Linux from Python 3.14. `activate()` logs one warning when it finds a fork server already running (`tethered: multiprocessing's fork server was started before this policy.`).
+- **A fork server that was started before `activate()` keeps producing workers without a policy**, under a locked policy too, and tethered can neither refuse nor repair them ([the security model](security.md#child-processes) says why). forkserver is the default start method on Linux from Python 3.14. `activate()` logs one warning when it finds a fork server already running (`tethered: multiprocessing's fork server was started before this policy.`).
 
 ### Interpreter pools
 
 `concurrent.futures.InterpreterPoolExecutor` (Python 3.14 and later) under a locked policy:
 
-- **A worker joins the lock if its interpreter starts under it.** What counts is when the interpreter starts, not when the executor object is created: an executor built before the lock and first used after it joins. Workers are started on demand, so a pool can end up mixed. With `max_workers=2`, one worker warmed up before the lock and one started afterwards gave both outcomes within one request. Take the lock first and submit the first task afterwards.
+- **A worker joins the lock if its interpreter starts under it.** What counts is when the interpreter starts, not when the executor object is created. Workers are started on demand: an executor built before the lock and first used after it joins, and a pool can end up mixed, one worker started before the lock and one after giving both outcomes within one request (measured once, on Python 3.14). Take the lock before the first task is submitted.
 - **A joined worker** reaches what the policy allows, loopback included, and gets the ordinary `EgressBlocked` for the rest. `deactivate()` and an `activate()` with a different policy raise `TetheredLocked` there, and the identical `activate()` is a no-op. A Python child launched from a task inherits the locked policy. An uncaught `EgressBlocked` reaches the submitter as `tethered.EgressBlocked`, chained from the interpreter's `ExecutionFailed`, so `except tethered.EgressBlocked` around `future.result()` works.
-- **A worker outside the lock** is refused everything, the allowed hosts and loopback included, and nothing is logged. The exception is `RuntimeError` until tethered has been imported in that interpreter and `EgressBlocked` afterwards; process launches raise `SubprocessBlocked`.
-- **Task functions that live in the application module** make the worker import that module, which runs its `activate()` again. In a joined worker that is the no-op. In a worker outside the lock, the submitter gets `concurrent.interpreters.NotShareableError`, caused by the `TetheredLocked` raised there.
+- **A worker outside the lock** is refused every connection, lookup and process launch, the allowed hosts and loopback included, and nothing is logged. The exception is `RuntimeError` until tethered has been imported in that interpreter, and afterwards `EgressBlocked` (`SubprocessBlocked` for a launch).
+- **Task functions that live in the application module** make the worker import that module, which runs its `activate()` again. In a joined worker that is the no-op. In a worker outside the lock, the submitter gets `concurrent.interpreters.NotShareableError`, caused by the `TetheredLocked` raised there (measured once, on Python 3.14).
 - **Logging is configured per interpreter.** Until it is configured in a worker, tethered's refusals there appear as bare `tethered: blocked ...` lines.
 
 Under an unlocked policy a worker interpreter that starts after `activate()` activates the same policy for itself; one that already existed holds none.
@@ -558,7 +523,7 @@ Under asyncio:
 
 - **Lookups run in an executor thread.** asyncio resolves names with `loop.getaddrinfo`, which runs in a thread that does not carry the scope. The scope's DNS-time check does not apply to that lookup; the connection that follows is checked against the scope. If the application has called `activate()`, its policy does apply to the lookup.
 - **Await tasks inside the block.** A task created inside a `with tethered.scope(...)` block keeps the scope after the block exits. If the application has not called `activate()`, a hostname such a task looks up after the block has exited is no longer recorded, and its connection is blocked.
-- **uvloop.** On a uvloop event loop, nothing that goes through the loop raises an audit event: connections, lookups, datagrams and `asyncio.create_subprocess_exec` launches are not checked against the scope at all, and nothing is logged for them. An `activate()` policy that enforces keeps uvloop out of the process. A `scope()` used on its own does not: it neither refuses the import of uvloop nor refuses to be entered over a loaded one, and logs a one-time warning when it is entered with uvloop loaded. uvicorn uses uvloop by default when it is installed.
+- **uvloop.** What a uvloop event loop does itself raises no audit event: connections made with `asyncio.open_connection` or `loop.create_connection`, lookups, datagrams and `asyncio.create_subprocess_exec` launches are not checked against the scope and not logged; `loop.sock_connect` and blocking calls still are. An `activate()` policy that enforces keeps uvloop out of the process. A `scope()` used on its own does not: it neither refuses the import of uvloop nor refuses to be entered over a loaded one, and logs a one-time warning when it is entered with uvloop loaded.
 - **Windows.** On the default `ProactorEventLoop`, connections raise no audit event, so the scope's connect-time check does not run. tethered logs a one-time warning.
 - **Run asyncio's own selector event loop:** not uvloop, and on Windows `asyncio.SelectorEventLoop` in place of the default `ProactorEventLoop`.
 - **`httpx.AsyncClient` wraps connect-time refusals.** A refused connection reaches your code inside an `ExceptionGroup`, which `except tethered.EgressBlocked` does not catch; use `except*` (see [Django / FastAPI middleware](#django--fastapi-middleware)).
@@ -598,7 +563,7 @@ The hint travels with the scope through subprocess auto-propagation, so a child 
 
 #### A note on Unicode in hints (and labels)
 
-`hint=` and `label=` cross the subprocess boundary unchanged: they travel as JSON, with non-ASCII characters as `\uXXXX` escapes that the child decodes. Whether such a character *renders* correctly in a traceback or log output depends on the stdio / log-handler encoding of the process, not on tethered. Where UTF-8 stdio cannot be assumed, prefer ASCII for hints and labels.
+`hint=` and `label=` reach a child process unchanged, non-ASCII characters included. How such a character shows in a traceback or a log depends on the encoding of the process's output, not on tethered; where UTF-8 output cannot be assumed, use ASCII.
 
 ### Report blocks under your own logger
 

@@ -16,6 +16,6 @@ The model is described in the documentation, on the [security model](https://tet
 
 - [Threat model](https://tethered.shcherbak.ai/security/#threat-model): what the protections are scoped to, and what they are not a defense against
 - [What tethered protects against](https://tethered.shcherbak.ai/security/#what-tethered-protects-against)
-- [What tethered does NOT protect against](https://tethered.shcherbak.ai/security/#what-tethered-does-not-protect-against): native code, event loops other than asyncio's own, what the socket events do not cover, child processes, code in the same process
+- [What tethered does NOT protect against](https://tethered.shcherbak.ai/security/#what-tethered-does-not-protect-against): native code, uvloop and Windows' `ProactorEventLoop`, what the socket events do not cover, child processes, code in the same process
 - [Locked mode — what it does and does not do](https://tethered.shcherbak.ai/security/#locked-mode--what-it-does-and-does-not-do)
 - [Recommendations](https://tethered.shcherbak.ai/security/#recommendations)

