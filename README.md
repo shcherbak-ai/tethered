@@ -175,7 +175,7 @@ The documentation is at [tethered.shcherbak.ai](https://tethered.shcherbak.ai/),
 <table>
   <tr>
     <td width="36%" align="center"><a href="https://github.com/shcherbak-ai/contextgem"><img src="assets/contextgem-wordmark.svg" alt="ContextGem" width="252"></a></td>
-    <td>Structured extraction from documents with LLMs.</td>
+    <td>Structured extraction from documents with LLMs and decision models.</td>
   </tr>
   <tr>
     <td width="36%" align="center"><a href="https://github.com/shcherbak-ai/licenseal"><img src="assets/licenseal-wordmark.svg" alt="licenseal" width="252"></a></td>
