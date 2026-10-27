@@ -13,9 +13,14 @@ permissions:
   contents: read
 
 # The uv every job installs.  Without it a new uv release would change what
-# CI runs without a commit.
+# CI runs without a commit.  The SHA-256 of its Linux archive
+# (uv-x86_64-unknown-linux-gnu.tar.gz.sha256 on the release page) changes
+# with it: setup-uv holds the checksums of the uv releases before its own
+# only, and checks a newer one against a list it fetches from uv's publisher
+# at run time, which is not enough for the job that builds the sdist.
 env:
-  UV_VERSION: "0.13.0"
+  UV_VERSION: "0.13.5"
+  UV_SHA256: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
 
 jobs:
   publish-gate:
@@ -70,7 +75,7 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
+        uses: pypa/cibuildwheel@8c2dcd2e96041a619f5ff03c9638d7941e2553a4  # v4.3.3
         env:
           CIBW_BUILD: cp311-* cp312-* cp313-* cp314-* cp315-*
           CIBW_SKIP: "*-musllinux_i686"
@@ -80,7 +85,7 @@ jobs:
           # does not go into the published wheels.  cibuildwheel builds with
           # pip, which does not read pyproject.toml's [tool.uv]; pip 26.1+
           # takes a span, and cibuildwheel and its manylinux and musllinux
-          # images carry 26.2.1.
+          # images carry 26.2.2.
           CIBW_ENVIRONMENT: PIP_UPLOADED_PRIOR_TO=P7D
           # Verifies the C extension imports, tethered.pth landed in
           # site-packages, and the auto-activation chain enforces
@@ -108,6 +113,7 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
+          checksum: ${{ env.UV_SHA256 }}
 
       # The version .python-version names.
       - name: Set up Python
@@ -169,7 +175,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           # A tag push and a push to main at the same commit give two CI
           # runs, and so two runs of this workflow.  The concurrency group

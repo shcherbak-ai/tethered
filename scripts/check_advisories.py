@@ -16,7 +16,8 @@ the entry would hold the package back from then on: the check then fails until i
 removed, and warns of it until then.
 
 It asks osv.dev for the advisories of each version that ``uv.lock``,
-``package-lock.json`` and ``.github/docs-constraints.txt`` hold, and fails on a known
+``package-lock.json`` and ``.github/docs-constraints.txt`` hold, and of the uv that the
+workflows install (their ``UV_VERSION``, as PyPI's ``uv``), and fails on a known
 vulnerability or a report of a malicious package, but for the advisories of
 ``ACCEPTED_ADVISORIES``, with their reasons.  An advisory whose fix is younger than the
 cooldown is accepted until the cooldown admits the fix, as tethered has no check that
@@ -57,10 +58,11 @@ _MARKDOWNLINT_CLI2_0_24 = (
     "2026-10-28; at worst a slow lint of a Markdown file"
 )
 
-_VIRTUALENV_21_14_9 = (
-    "virtualenv 21.14.7, of pre-commit: fixed in 21.14.9, uploaded on 2026-10-17, which "
-    "the cooldown admits from 2026-10-24; every hook is a `language: system` one, for "
-    "which pre-commit creates no virtualenv"
+_VIRTUALENV_21_14_13 = (
+    "virtualenv 21.14.11, of pre-commit: a regression of 21.14.9 in the bash activator's "
+    "prompt, fixed in 21.14.13, uploaded on 2026-10-22, which the cooldown admits from "
+    "2026-10-29; every hook is a `language: system` one, for which pre-commit creates no "
+    "virtualenv"
 )
 
 # The advisories that the check accepts, by their IDs at osv.dev: the reason, and the
@@ -78,28 +80,22 @@ ACCEPTED_ADVISORIES: dict[str, tuple[str, str | None]] = {
             "GHSA-vfgh-jcmw-g37q",
         )
     },
-    **{
-        advisory: (_VIRTUALENV_21_14_9, "2026-10-24T16:10:00Z")
-        for advisory in (
-            "GHSA-43mp-35q3-x3fq",
-            "GHSA-c978-59m8-c77v",
-            "GHSA-cw65-gx24-rc82",
-        )
-    },
+    "GHSA-cx6f-vjhg-g3cc": (_VIRTUALENV_21_14_13, "2026-10-29T20:20:00Z"),
     "GHSA-238p-pmpm-9mq7": (
         "katex 0.16, which markdownlint's math parser allows (^0.16): fixed in 0.18 only; "
         "markdownlint parses math and renders none",
-        None,
-    ),
-    "GHSA-vfj7-8cjw-p6xm": (
-        "braces 3.0.3, of micromatch, of markdownlint-cli2: no release fixes it; a stack "
-        "overflow on a deeply nested glob, and the globs are the project's own",
         None,
     ),
 }
 
 # The pins that tethered installs on its own machines and in CI, all advisories counted
 PINNED = (".github/docs-constraints.txt",)
+
+# The workflows, whose `UV_VERSION` is the uv that CI installs: all advisories counted
+WORKFLOWS = ".github/workflows"
+
+# The version of `UV_VERSION: "0.13.5"` in a workflow's `env`
+_UV_VERSION = re.compile(r"""^\s*UV_VERSION:\s*["']?([^\s"'#]+)""", re.MULTILINE)
 
 # The pins of the images, below these directories: reports of malicious packages only
 IMAGE_REQUIREMENTS = ("tests_containers", "benchmarks/dns_lookups")
@@ -194,6 +190,11 @@ def _versions(lock: dict) -> tuple[set[_Version], set[_Version]]:
         }
     for name in PINNED:
         versions |= _pins(ROOT / name)
+    for path in sorted((ROOT / WORKFLOWS).glob("*.yml")):
+        versions |= {
+            ("PyPI", "uv", match[1])
+            for match in _UV_VERSION.finditer(path.read_text(encoding="utf-8"))
+        }
     images = set()
     for directory in IMAGE_REQUIREMENTS:
         for path in sorted((ROOT / directory).rglob("requirements.txt")):

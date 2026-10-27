@@ -66,11 +66,6 @@ dev = [
 # for two hours on 2026-10-21.  scripts/check_advisories.py fails without it.
 [tool.uv]
 exclude-newer = "7 days"
-# A security fix younger than the week, taken by decision of the maintainer:
-# up to just after its upload, never `false`.  The check fails once the week
-# has passed, when the entry is to be removed.  certifi 2026.10.19 removes the
-# emSign roots whose intermediates' keys were compromised (GHSA-6q48-6c7w-9gw2).
-exclude-newer-package = { certifi = "2026-10-20T02:25:00Z" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

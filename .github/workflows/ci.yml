@@ -19,7 +19,7 @@ permissions:
 # The uv every job installs.  Without it a new uv release would change what
 # CI runs without a commit.
 env:
-  UV_VERSION: "0.13.0"
+  UV_VERSION: "0.13.5"
 
 jobs:
   lint:
