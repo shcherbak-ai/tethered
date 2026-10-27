@@ -724,6 +724,20 @@ _TYPE_MANAGED_ATTRIBUTES = frozenset(
 codecs.lookup("idna")
 
 
+class _Stranger:
+    """What a rebound module global becomes: a new object, which holds nothing.
+
+    The Python hook asks ``event in`` three of them for every event it does
+    not handle.  A bare ``object()`` there raised ``TypeError`` from such an
+    event before the guarded one the test waits for: from Python 3.14,
+    coverage measures through ``sys.monitoring``, whose callback calls
+    ``id()`` (an audit event) when a function runs for the first time.
+    """
+
+    def __contains__(self, item: object) -> bool:
+        return False
+
+
 def _activate_locked(**kwargs: object) -> None:
     kwargs.setdefault("allow", ["*.example.com"])
     tethered.activate(locked=True, lock_token=object(), **kwargs)
@@ -918,7 +932,7 @@ class TestSnapshotTamperDetection:
         # Undo inside the test: fixture teardown fires audit events of its own,
         # and tethered's hook must be whole again by then.
         with monkeypatch.context() as patch:
-            patch.setattr(module, name, object())
+            patch.setattr(module, name, _Stranger())
             _assert_tamper_response(capfd)
         _assert_intact(capfd)
 
