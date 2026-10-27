@@ -1,5 +1,10 @@
 name: Publish
 
+# Runs after every CI run, one of a pull request from a fork included, with
+# the workflow and the context of the default branch (main).  Nothing is
+# checked out from the run or published unless the gate finds a v* tag of
+# this repository on its commit and that commit on main, and the pypi
+# environment accepts deployments from main only.
 on:
   workflow_run:
     workflows: [CI]
@@ -32,13 +37,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Verify v* tag on main
         id: check
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          SHA="${{ github.event.workflow_run.head_sha }}"
-
           # Check for an actual v* tag pointing at this commit
           TAG=$(git tag --points-at "$SHA" | grep '^v' | head -n1)
           if [ -z "$TAG" ]; then
@@ -72,6 +78,7 @@ jobs:
       # push brought, so no allow-unsafe-pr-checkout is needed here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Build wheels
@@ -107,6 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Install uv
