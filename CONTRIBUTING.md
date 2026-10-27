@@ -159,6 +159,8 @@ setup.py                  # Build config: C extension + tethered.pth packaging (
 scripts/
     cppcheck.sh           # Docker-based cppcheck runner for pre-commit
     check_advisories.py   # Pre-commit check: the one-week cooldown, and the advisories of the locked versions
+    date_release.py       # Run by cz bump: names and dates the [Unreleased] section of the changelog, dates CITATION.cff
+    release_notes.py      # Run by the publish workflow: a version's section of the changelog, the notes of its GitHub release
     wheel_smoke_test.py   # Post-build smoke test invoked by cibuildwheel
 tests/
     conftest.py           # Test-suite egress guard + .pth installer for editable installs
@@ -174,7 +176,7 @@ tests/
     test_docs_recipes.py  # The recipes docs/COOKBOOK.md prints against the copies the container suites run
     test_docs_site.py     # The version in the site's footer against the package version
     test_llms_index.py    # The llms.txt index against nav and the description each page gives itself
-    test_changelog.py     # The compare link of every changelog version, and the version and date in CITATION.cff
+    test_changelog.py     # The compare link of every changelog version, the version and date in CITATION.cff, date_release.py and release_notes.py
 tests_examples/
     conftest.py           # .pth installer for editable installs (same as tests/)
     test_examples.py      # Runs each example/ script as a subprocess (requires network)
