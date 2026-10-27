@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `python -m tethered check` no longer creates files in the temporary directory. On Linux with Python 3.14.9 and later and 3.15.1 and later, asking multiprocessing for its default start method creates two short-lived files in `$TMPDIR` (`/tmp` by default) and removes them at once, to find out whether the forkserver start method can work there ([CPython issue 155717](https://github.com/python/cpython/issues/155717)). The check asked, so it created them too. It now applies the rule from multiprocessing's documentation instead (forkserver where that start method is available, macOS excepted) and writes nothing but its report. Where the temporary directory is not writable, it reports forkserver although multiprocessing would then use spawn.
+
 ## [1.1.0] — 2026-10-15
 
 ### Added
@@ -268,6 +274,7 @@ The security fixes that can stop a setup that ran on 0.5.3 are under Breaking ch
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
+[Unreleased]: https://github.com/shcherbak-ai/tethered/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/shcherbak-ai/tethered/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/shcherbak-ai/tethered/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shcherbak-ai/tethered/compare/v0.5.3...v1.0.0

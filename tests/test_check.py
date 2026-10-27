@@ -424,13 +424,52 @@ class TestMultiprocessing:
         fixed = multiprocessing.get_start_method(allow_none=True)
         method = _check._default_start_method()
         assert multiprocessing.get_start_method(allow_none=True) == fixed
-        if sys.platform == "win32":
+        if sys.platform in ("win32", "darwin"):
             assert method == "spawn"
         elif sys.platform.startswith("linux"):
             assert method == ("forkserver" if sys.version_info >= (3, 14) else "fork")
+        # multiprocessing's own answer (which may create a file in a test).
+        assert method == multiprocessing.get_all_start_methods()[0]
+
+    @staticmethod
+    def platform(monkeypatch, *, posix=True, macos=False, python=(3, 14)):
+        monkeypatch.setattr(_check, "_POSIX", posix)
+        monkeypatch.setattr(_check, "_MACOS", macos)
+        monkeypatch.setattr(_check, "_PYTHON", python)
+
+    @staticmethod
+    def creates_a_file():
+        pytest.fail("from Python 3.14.9 this creates a file in the temporary directory here")
+
+    @pytest.mark.parametrize("python", [(3, 14), (3, 15)])
+    def test_forkserver_from_3_14(self, monkeypatch, python):
+        self.platform(monkeypatch, python=python)
+        monkeypatch.setattr(multiprocessing, "get_context", lambda method: method)
+        monkeypatch.setattr(multiprocessing, "get_all_start_methods", self.creates_a_file)
+        assert _check._default_start_method() == "forkserver"
+
+    def test_spawn_where_forkserver_is_not_available(self, monkeypatch):
+        def get_context(method):
+            raise ValueError(f"{method} start method not available")
+
+        self.platform(monkeypatch)
+        monkeypatch.setattr(multiprocessing, "get_context", get_context)
+        monkeypatch.setattr(multiprocessing, "get_all_start_methods", self.creates_a_file)
+        assert _check._default_start_method() == "spawn"
+
+    @pytest.mark.parametrize(
+        ("posix", "macos", "python"),
+        [(False, False, (3, 14)), (True, True, (3, 14)), (True, False, (3, 13))],
+        ids=["windows", "macos", "posix-3.13"],
+    )
+    def test_elsewhere_multiprocessing_is_asked(self, monkeypatch, posix, macos, python):
+        self.platform(monkeypatch, posix=posix, macos=macos, python=python)
+        monkeypatch.setattr(multiprocessing, "get_all_start_methods", lambda: ["fork", "spawn"])
+        assert _check._default_start_method() == "fork"
 
     def test_the_constants_are_this_interpreter(self):
         assert _check._POSIX is (os.name == "posix")
+        assert _check._MACOS is (sys.platform == "darwin")
         assert sys.version_info[:2] == _check._PYTHON
 
 

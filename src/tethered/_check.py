@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 # Facts about this interpreter, read once.  Tests flip them, so that every
 # branch runs on every platform.
 _WINDOWS = sys.platform == "win32"
+_MACOS = sys.platform == "darwin"
 _POSIX = os.name == "posix"
 _PYTHON = sys.version_info[:2]
 _FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
@@ -212,12 +213,24 @@ def _importable(name: str) -> bool:
 
 
 def _default_start_method() -> str:
-    """multiprocessing's default start method here, without fixing the start method.
+    """multiprocessing's default start method here, without fixing it or writing a file.
 
-    ``get_all_start_methods()`` lists it first.  ``get_start_method()`` would
-    fix the context of this process, and ``allow_none=True`` only says that
-    none was fixed.
+    From Python 3.14 it is forkserver on POSIX where that start method is
+    available, macOS excepted, as multiprocessing's documentation says.  From
+    3.14.9 and 3.15.1 multiprocessing makes sure of it by creating a file in
+    the temporary directory and removing it, and takes spawn where it cannot
+    (gh-155717), so the check does not ask it there: it says forkserver even
+    where the temporary directory is not writable.  Elsewhere
+    ``get_all_start_methods()`` lists the default first and writes nothing.
+    ``get_start_method()`` would fix the context of this process, and
+    ``allow_none=True`` only says that none was fixed.
     """
+    if _POSIX and not _MACOS and _PYTHON >= (3, 14):
+        try:
+            multiprocessing.get_context("forkserver")
+        except ValueError:  # no passing of file descriptors over Unix pipes here
+            return "spawn"
+        return "forkserver"
     return multiprocessing.get_all_start_methods()[0]
 
 
