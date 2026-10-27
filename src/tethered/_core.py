@@ -3899,6 +3899,8 @@ class scope:
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 _install_hook()
+                if _uvloop_warning_pending:
+                    _warn_if_uvloop()
                 _push_scope(scope_cfg)
                 logger.debug("tethered: entered %s", scope_cfg.label)
                 try:
@@ -3912,6 +3914,8 @@ class scope:
         @functools.wraps(fn)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             _install_hook()
+            if _uvloop_warning_pending:
+                _warn_if_uvloop()
             _push_scope(scope_cfg)
             logger.debug("tethered: entered %s", scope_cfg.label)
             try:

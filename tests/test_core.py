@@ -4254,6 +4254,25 @@ class TestUvloopWarning:
             pass
         assert len(_uvloop_warnings(caplog)) == 1
 
+    def test_a_decorated_function_warns_when_it_is_called(self, uvloop_loaded, caplog):
+        @tethered.scope(allow=[])
+        def decorated():
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert _uvloop_warnings(caplog) == []  # decorating is not entering
+            decorated()
+        assert len(_uvloop_warnings(caplog)) == 1
+
+    async def test_a_decorated_coroutine_warns_when_it_is_awaited(self, uvloop_loaded, caplog):
+        @tethered.scope(allow=[])
+        async def decorated():
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            await decorated()
+        assert len(_uvloop_warnings(caplog)) == 1
+
     def test_a_new_socket_warns_when_uvloop_was_loaded_after_activation(self, monkeypatch, caplog):
         monkeypatch.setattr(_core, "_uvloop_warning_pending", True)
         monkeypatch.delitem(sys.modules, "uvloop", raising=False)
@@ -4286,6 +4305,13 @@ class TestUvloopWarning:
         _audit_hook(*_NEW_SOCKET_EVENT)
         with tethered.scope(allow=[]):
             pass
+        tethered.scope(allow=[])(lambda: None)()
+
+        async def nothing():
+            pass
+
+        with pytest.raises(StopIteration):
+            tethered.scope(allow=[])(nothing)().send(None)
 
     def test_flag_starts_clear_only_on_windows(self):
         """uvloop is not available on Windows."""
