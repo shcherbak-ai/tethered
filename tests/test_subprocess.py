@@ -10,6 +10,7 @@ import logging
 import multiprocessing as mp
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import threading
@@ -5798,6 +5799,155 @@ class TestPlatformAskedBeforeBlock:
         assert _core._config.policy.is_allowed("api.example.com")
         with pytest.raises(tethered.SubprocessBlocked):
             platform.platform()
+
+
+def _ldconfig_args(**changes: object) -> tuple:
+    """The ``subprocess.Popen`` audit args of ``find_library()``'s look-up, ``changes`` made."""
+    launch = {
+        "executable": "/sbin/ldconfig",
+        "argv": ["/sbin/ldconfig", "-p"],
+        "env": {"LC_ALL": "C", "LANG": "C"},
+        **changes,
+    }
+    return (launch["executable"], launch["argv"], None, launch["env"])
+
+
+class _Agreeable(str):
+    """A ``str`` that says it equals whatever it is compared with; a launch uses its text."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+class TestLdconfigLookupIsNotExternal:
+    """``find_library()``'s look-up in the linker cache is not an external launch.
+
+    On Linux ``ctypes.util.find_library()`` runs ``/sbin/ldconfig -p`` with an
+    environment of its own at every call, and catches only ``OSError``: under
+    ``"block"`` the refusal ended ``import trio`` and the import of every
+    other library that looks a shared object up while it is imported, and
+    nothing done before ``activate()`` helped.  That program, with that
+    option and that environment, reaches nothing: it is let through, and not
+    warned about.  A launch that differs in anything is judged as before.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _where_find_library_runs_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_core, "_FIND_LIBRARY_RUNS_LDCONFIG", True)
+
+    @staticmethod
+    def _launch(policy: str, args: tuple, *, locked: bool = False, event: str = "subprocess.Popen"):
+        cfg = _launch_cfg(locked=locked, external_subprocess_policy=policy)
+        return _call_in_execute_child(lambda: _handle_subprocess(cfg, event, args), args[3])
+
+    @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+    @pytest.mark.parametrize("policy", ["warn", "block"])
+    def test_it_is_let_through_without_a_word(self, policy, locked, caplog):
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            env = self._launch(policy, _ldconfig_args(), locked=locked)
+        assert caplog.records == []
+        # Under a lock it is given the policy, as every program launched there is.
+        assert (_CHILD_POLICY_ENV in env) is locked
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            pytest.param({"executable": "ldconfig", "argv": ["ldconfig", "-p"]}, id="on-path"),
+            pytest.param({"executable": "/bin/sh", "argv": ["/bin/sh", "-p"]}, id="other-program"),
+            pytest.param({"executable": "/bin/sh"}, id="another-executable"),
+            pytest.param({"argv": ["/sbin/ldconfig"]}, id="no-option"),
+            pytest.param({"argv": ["/sbin/ldconfig", "-p", "-v"]}, id="another-option"),
+            pytest.param({"argv": ["/sbin/ldconfig", "-r", "/tmp"]}, id="other-options"),
+            pytest.param({"argv": ("/sbin/ldconfig", "-p")}, id="argv-not-a-list"),
+            pytest.param({"env": None}, id="inherited-env"),
+            pytest.param({"env": {"LC_ALL": "C"}}, id="env-without-lang"),
+            pytest.param({"env": {"LC_ALL": "C", "LANG": "C.UTF-8"}}, id="env-another-value"),
+            pytest.param(
+                {"env": {"LC_ALL": "C", "LANG": "C", "LD_PRELOAD": "/tmp/x.so"}}, id="env-more"
+            ),
+            pytest.param(
+                {"env": _as_mapping("UserDict", {"LC_ALL": "C", "LANG": "C"})}, id="env-UserDict"
+            ),
+            pytest.param(
+                {"env": _as_mapping("MappingProxyType", {"LC_ALL": "C", "LANG": "C"})},
+                id="env-MappingProxyType",
+            ),
+            pytest.param({"executable": _Agreeable("/bin/sh")}, id="executable-str-subclass"),
+            pytest.param({"argv": ["/sbin/ldconfig", _Agreeable("-v")]}, id="argv-str-subclass"),
+            pytest.param(
+                {"env": {"LC_ALL": "C", _Agreeable("LD_PRELOAD"): "/tmp/x.so"}},
+                id="env-key-str-subclass",
+            ),
+            pytest.param(
+                {"env": {"LC_ALL": "C", "LANG": _Agreeable("/tmp/x.so")}},
+                id="env-value-str-subclass",
+            ),
+        ],
+    )
+    def test_a_launch_that_differs_is_judged_as_before(self, changes):
+        with pytest.raises(tethered.SubprocessBlocked):
+            self._launch("block", _ldconfig_args(**changes))
+
+    @pytest.mark.parametrize("event", ["os.exec", "os.posix_spawn"])
+    def test_only_as_find_library_launches_it(self, event):
+        """Through ``subprocess.Popen``: the other routes carry no ``_execute_child`` frame."""
+        executable, argv, _cwd, env = _ldconfig_args()
+        cfg = _launch_cfg(external_subprocess_policy="block")
+        with pytest.raises(tethered.SubprocessBlocked):
+            _handle_subprocess(cfg, event, (executable, argv, env))
+
+    def test_nor_where_find_library_does_not_run_it(self, monkeypatch):
+        monkeypatch.setattr(_core, "_FIND_LIBRARY_RUNS_LDCONFIG", False)
+        with pytest.raises(tethered.SubprocessBlocked):
+            self._launch("block", _ldconfig_args())
+
+    def test_a_short_event_is_judged_as_before(self):
+        assert not _core._is_ldconfig_lookup("subprocess.Popen", _ldconfig_args()[:3])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="find_library runs ldconfig on Linux only")
+class TestFindLibraryUnderBlock:
+    """``ctypes.util.find_library()`` itself, under ``"block"``."""
+
+    @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+    def test_it_finds_a_library_in_the_cache(self, locked, caplog):
+        import ctypes.util
+
+        if locked and _core._c_guardian is None:
+            pytest.skip("C guardian extension not available")
+        lock = {"locked": True, "lock_token": object()} if locked else {}
+        tethered.activate(allow=[], external_subprocess_policy="block", **lock)
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert ctypes.util.find_library("c")
+        assert caplog.records == []
+
+    def test_it_warns_of_nothing_under_warn(self, caplog):
+        import ctypes.util
+
+        tethered.activate(allow=[])
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            assert ctypes.util.find_library("c")
+        assert caplog.records == []
+
+    def test_a_library_that_is_not_in_the_cache_meets_the_compiler(self, caplog):
+        """Limit: then it runs ``gcc`` or ``cc`` and ``ld`` from ``PATH``, which stay refused.
+
+        ctypes passes the refusal of ``gcc`` on and swallows that of ``ld``.
+        """
+        import ctypes.util
+
+        tethered.activate(allow=[], external_subprocess_policy="block")
+        name = "tethered-no-such-library"
+        with caplog.at_level(logging.WARNING, logger="tethered"):
+            if shutil.which("gcc") or shutil.which("cc"):
+                with pytest.raises(tethered.SubprocessBlocked):
+                    ctypes.util.find_library(name)
+            else:
+                assert ctypes.util.find_library(name) is None
+        assert "ldconfig" not in caplog.text
+        assert "blocked external subprocess launch" in caplog.text
 
 
 class _Replaced(Exception):

@@ -10,9 +10,9 @@ policy.  What the three worker classes come to:
   ``socket`` module and its launches through ``subprocess``, so everything is
   seen and enforced.  ``probe_trio.py`` is the probe application for it.
   Importing trio launches ``ldconfig``; a locked policy used to refuse that
-  launch and now gives it the policy variable
-  (``TestImportingTrioUnderAPolicy``), so the lock can be taken before trio
-  is imported, in the master too.
+  launch and now gives it the policy variable, and ``"block"`` used to
+  refuse it and now lets it through (``TestImportingTrioUnderAPolicy``), so
+  the policy can be put in place before trio is imported, in the master too.
 * ``uvloop``: the worker imports uvloop before it imports the application, so
   ``activate()`` refuses and the server does not start.  When the master holds
   the policy the worker cannot import uvloop and does not start either.  Only
@@ -339,35 +339,18 @@ class TestImportingTrioUnderAPolicy:
     policy variable), so trio could only be imported before the lock: with
     the policy locked in hypercorn's master, or inherited by a child
     process, ``import trio`` raised ``SubprocessBlocked``.  The launch is now
-    given the variable, and is judged like any other external launch.
+    given the variable.  ``external_subprocess_policy="block"`` refused it
+    too, as an external launch, and ``"warn"`` warned of it in every process
+    that imported trio.  That program, with that option and that
+    environment, reaches nothing: it is now let through, without a word.
     """
 
-    def test_under_a_plain_policy_the_import_is_warned_about(self) -> None:
-        done = run_python(IMPORT_TRIO, activate="plain")
-        assert "imported" in done.json(), done.stderr
-        assert "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)" in (
-            done.stderr
-        )
-
-    @pytest.mark.parametrize("esp", ["warn", "allow"])
-    def test_under_a_locked_policy_the_import_works(self, esp: str) -> None:
-        done = run_python(IMPORT_TRIO, activate="locked", esp=esp)
-        assert "imported" in done.json(), done.stderr
-        assert "strips" not in done.stderr, done.stderr
-        warned = "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)"
-        assert (warned in done.stderr) is (esp == "warn"), done.stderr
-
+    @pytest.mark.parametrize("esp", ["warn", "allow", "block"])
     @pytest.mark.parametrize("activate", ["plain", "locked"])
-    def test_under_block_the_import_fails(self, activate: str) -> None:
-        """Limit: ``external_subprocess_policy="block"`` refuses ldconfig like any external tool.
-
-        Import trio before ``activate()`` where external launches are blocked.
-        """
-        done = run_python(IMPORT_TRIO, activate=activate, esp="block")
-        report = done.json()
-        assert report.get("exception") == SUBPROCESS_BLOCKED, report
-        assert "subprocess.Popen(/sbin/ldconfig)" in report["message"], report
-        assert "strips" not in report["message"], report
+    def test_the_import_works_without_a_word(self, activate: str, esp: str) -> None:
+        done = run_python(IMPORT_TRIO, activate=activate, esp=esp)
+        assert "imported" in done.json(), done.stderr
+        assert "subprocess launch" not in done.stderr, done.stderr
 
     def test_hypercorn_starts_its_trio_worker_when_the_master_locked_the_policy(self) -> None:
         command = hypercorn("trio", "-c", "file:locking_conf.py")

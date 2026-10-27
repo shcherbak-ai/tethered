@@ -122,7 +122,8 @@ class Variant:
     missing_on: dict[str, str] = field(default_factory=dict)
     #: The module whose import calls ``ctypes.util.find_library``, if one does.
     #: On Linux that launches ``/sbin/ldconfig`` with an environment of its own,
-    #: which a locked policy used to refuse: the library could not be imported.
+    #: which a locked policy and ``"block"`` used to refuse: the library could
+    #: not be imported.
     calls_find_library_in: str = ""
 
 

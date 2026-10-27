@@ -15,7 +15,8 @@ is not "enforced" is a limit: it is asserted as what happens today.
 
 Covered besides the table: every row again under a locked policy, the
 libraries that call ``ctypes.util.find_library`` when they are imported
-included (a locked policy used to refuse the launch that makes); a
+included (a locked policy used to refuse the launch that makes, and
+``"block"`` too, which ``find_library()`` itself is checked under); a
 fail-closed policy; what a log-only policy reports; what makes a refused
 allowed host reachable; what a library does when its C module cannot be
 imported; how Twisted delivers a refusal; and a DNS query sent straight to a
@@ -53,8 +54,6 @@ REPRESENTATIVES = [
     "psycopg-binary-sync",
     "aiohttp-aiodns-imported-first",
 ]
-#: The warning for the launch ``ctypes.util.find_library`` makes on Linux.
-LDCONFIG_WARNING = "external subprocess launch detected: subprocess.Popen(/sbin/ldconfig)"
 
 
 def rows(verdict: str) -> list[object]:
@@ -225,25 +224,18 @@ print(json.dumps(report))
 """
 
 
+@pytest.mark.parametrize("esp", ["warn", "allow", "block"])
 @pytest.mark.parametrize("activate", ["plain", "locked"])
-def test_ctypes_find_library_works_under_a_policy_with_a_warning(activate: str) -> None:
-    """``ldconfig`` is an external program, launched with an environment of its own."""
+def test_ctypes_find_library_works_under_a_policy_without_a_word(activate: str, esp: str) -> None:
+    """``/sbin/ldconfig -p`` with an environment of its own is not an external launch.
+
+    It reads the linker cache and reaches nothing, so no policy refuses it
+    or warns about it, ``"block"`` included, which used to refuse it.
+    """
     assert run_python(FIND_LIBRARY, activate="none").json() == {"found": "libc.so.6"}
-    done = run_python(FIND_LIBRARY, activate=activate)
+    done = run_python(FIND_LIBRARY, activate=activate, esp=esp)
     assert done.json() == {"found": "libc.so.6"}
-    assert LDCONFIG_WARNING in done.stderr
-    assert "strips" not in done.stderr, done.stderr
-    # Allowed external launches are not mentioned at all.
-    done = run_python(FIND_LIBRARY, activate=activate, esp="allow")
-    assert done.json() == {"found": "libc.so.6"}
-    assert "ldconfig" not in done.stderr, done.stderr
-
-
-def test_limit_ctypes_find_library_is_refused_when_external_launches_are_blocked() -> None:
-    """Limit: ``external_subprocess_policy="block"`` refuses the launch of ``/sbin/ldconfig``."""
-    refused = run_python(FIND_LIBRARY, esp="block").json()
-    assert refused["exception"] == "SubprocessBlocked", refused
-    assert "subprocess.Popen(/sbin/ldconfig)" in refused["message"]
+    assert "subprocess launch" not in done.stderr, done.stderr
 
 
 def test_a_log_only_policy_reports_the_client_it_sees() -> None:

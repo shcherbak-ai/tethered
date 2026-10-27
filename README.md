@@ -115,7 +115,7 @@ tethered.activate(
 
 Under a lock, tampering with tethered's own code or with the active policy is detected and fails closed, and a Python child that cannot establish the locked policy refuses to start. Activate before importing third-party code: whatever runs earlier is not covered.
 
-`"block"` also stops the helper programs the standard library runs, such as `ldconfig` when some libraries are imported, so import those libraries before `activate()`, which asks `platform.platform()` itself for the same reason ([details](https://tethered.shcherbak.ai/SUBPROCESS/#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](https://tethered.shcherbak.ai/security/#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
+`"block"` also stops the helper programs libraries run, such as `file` for `platform.architecture()`, and code that expects `OSError` there fails ([details](https://tethered.shcherbak.ai/SUBPROCESS/#what-block-also-refuses)). Locked mode is not a sandbox: the [security model](https://tethered.shcherbak.ai/security/#locked-mode--what-it-does-and-does-not-do) lists what it checks and what it does not stop.
 
 ### Roll it out
 

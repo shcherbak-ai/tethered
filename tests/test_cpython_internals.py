@@ -629,6 +629,41 @@ def test_the_platform_module_keeps_what_it_learns_about_the_machine():
     assert later == 0, "the calls that share its answer run nothing afterwards" + row
 
 
+@pytest.mark.skipif(
+    not _core._FIND_LIBRARY_RUNS_LDCONFIG, reason="find_library runs ldconfig on Linux only"
+)
+def test_find_library_reads_the_linker_cache_with_ldconfig_at_every_call():
+    """``_is_ldconfig_lookup`` lets through the launch ``ctypes.util.find_library()`` makes."""
+    row = _row("find_library's look-up")
+    script = (
+        "import ctypes.util, json, sys\n"
+        "launched = []\n"
+        "def watch(event, args):\n"
+        "    if event == 'subprocess.Popen':\n"
+        "        executable, argv, _cwd, env = args\n"
+        "        launched.append([type(executable).__name__, executable, type(argv).__name__,\n"
+        "                         argv, type(env).__name__, sorted(env.items())])\n"
+        "sys.addaudithook(watch)\n"
+        "ctypes.util.find_library('c')\n"
+        "ctypes.util.find_library('c')\n"
+        "print(json.dumps(launched))\n"
+    )
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-S", "-c", script], capture_output=True, text=True, timeout=60, check=True
+    )
+    expected = [
+        "str",
+        _core._LDCONFIG_ARGV[0],
+        "list",
+        list(_core._LDCONFIG_ARGV),
+        "dict",
+        [list(pair) for pair in _core._LDCONFIG_ENV],
+    ]
+    assert json.loads(result.stdout) == [expected, expected], (
+        "each call runs /sbin/ldconfig -p with LC_ALL=C and LANG=C only, and nothing else" + row
+    )
+
+
 @pytest.mark.skipif(_interps is None, reason="this Python has no subinterpreter module")
 class TestInterpreters:
     """The private interpreter module, and interpreter IDs."""

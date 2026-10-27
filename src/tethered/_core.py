@@ -3128,6 +3128,53 @@ def _describe_launch(event: str, args: tuple[Any, ...], launch_args: tuple[Any, 
     return _describe_subprocess_launch(event, args)
 
 
+# What ``ctypes.util.find_library()`` runs on Linux, at every call, to read the
+# dynamic linker's cache: a program named by its absolute path, one option and
+# an environment of its own.  Tests flip the switch.
+_FIND_LIBRARY_RUNS_LDCONFIG = sys.platform == "linux"
+_LDCONFIG_ARGV = ("/sbin/ldconfig", "-p")
+_LDCONFIG_ENV = (("LANG", "C"), ("LC_ALL", "C"))
+
+
+def _is_ldconfig_lookup(event: str, args: tuple[Any, ...]) -> bool:
+    """Return True for the launch with which ``find_library()`` reads the linker cache.
+
+    ``ctypes.util.find_library()`` runs ``/sbin/ldconfig -p`` with
+    ``env={"LC_ALL": "C", "LANG": "C"}`` and catches only ``OSError``.
+    Refused, the launch ended the import of every library that looks a
+    shared object up while it is imported (trio, asyncssh, psycopg 3), and
+    nothing can be done about it before the policy: the call keeps no
+    answer.  That program, with that option and that environment, reads a
+    file and starts nothing, so it is not an external launch.
+
+    The launch is compared exactly, types included: a ``str`` subclass can
+    answer ``==`` as it likes while the launch uses its text, and a mapping
+    other than a ``dict`` can show one environment here and give another to
+    the launch.  Each is copied once, in C, so no other thread changes it
+    while it is compared.  What is changed once the hook has returned, by
+    another thread or by an audit hook that runs after this one (the
+    caller's ``dict``, ``_execute_child``'s locals), still reaches the
+    launch, as it does for every launch the hook lets through, and what runs
+    is read from disk when it starts: code that can write ``/sbin/ldconfig``,
+    or what it loads, or from Python 3.13 add an audit hook of its own, can
+    run any program this way (``docs/security.md``).
+    """
+    if not _FIND_LIBRARY_RUNS_LDCONFIG or event != "subprocess.Popen" or len(args) < 4:
+        return False
+    executable, argv, _cwd, env = args[:4]
+    if type(executable) is not str or type(argv) is not list or type(env) is not dict:
+        return False
+    argv = tuple(argv)
+    pairs = list(env.items())
+    return (
+        all(type(item) is str for item in argv)
+        and all(type(key) is str and type(value) is str for key, value in pairs)
+        and executable == _LDCONFIG_ARGV[0]
+        and argv == _LDCONFIG_ARGV
+        and sorted(pairs) == list(_LDCONFIG_ENV)
+    )
+
+
 def _handle_subprocess(
     cfg: _Config | None,
     event: str,
@@ -3344,9 +3391,10 @@ def _handle_subprocess(
 
     # ── External launches ──────────────────────────────────────────────
     # os.system, an external executable, Python with ``-S``, or a Python
-    # child that cannot be given the policy.
+    # child that cannot be given the policy.  The linker-cache lookup of
+    # ``find_library()`` is none of these: it reaches nothing.
     sp = cfg.external_subprocess_policy
-    if sp == "allow":
+    if sp == "allow" or _is_ldconfig_lookup(event, args):
         return
 
     desc = _describe_launch(event, args, launch_args) + reason

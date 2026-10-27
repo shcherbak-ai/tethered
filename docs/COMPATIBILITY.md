@@ -145,7 +145,7 @@ Measured with hypercorn 0.18.0, trio 0.34.0, uvloop 0.23.0; Quart 0.23.1 (0.22.0
 | Arrangement | Result | Pinned by |
 |---|---|---|
 | The asyncio worker (the default), `--workers`, workers started after `--max-requests`, `SIGHUP` and `--reload`, `serve()` in a script, a WSGI application | Enforced. | `hypercorn` |
-| `-k trio` | Enforced. Importing trio launches `ldconfig`: see [what holds under every server](#what-holds-under-every-server). | `hypercorn` |
+| `-k trio` | Enforced. Importing trio launches `ldconfig`, which no policy refuses or warns about: see [what holds under every server](#what-holds-under-every-server). | `hypercorn` |
 | `-k uvloop` | Refused at start-up: the worker imports uvloop before the application. When the master holds the policy the worker's import is refused and hypercorn reports "uvloop is not installed". There is no fallback: this worker class asked for uvloop. | `hypercorn` |
 | A configuration file that locks the policy in the master (`-c file:conf.py`) | Enforced: the workers inherit the locked policy at start-up, replaced ones too. | `hypercorn` |
 | Quart under hypercorn, `quart run`, `quart run --reload`, `app.run()` | Enforced. | `quart` |
@@ -285,11 +285,11 @@ Measured with Flask 3.1.3 (Werkzeug 3.1.9) and Django 6.1.2 (5.2.18 on Python 3.
 
 **`external_subprocess_policy="block"` refuses what libraries launch, too.** On Linux, `ctypes.util.find_library()` runs `ldconfig`. `platform.platform()` runs `uname -p` outside Windows, and `cmd.exe /c ver` on Windows with Python 3.11 (measured once). Under `"block"`:
 
-- `ctypes.util.find_library()` raises `SubprocessBlocked` (suite `clients`), and with it the import of trio (suite `hypercorn`). asyncssh and psycopg 3 in its Python implementation make the same call while they are imported. Import such libraries before `activate()`.
+- `ctypes.util.find_library()` finds a library in the linker cache, without a word: its `/sbin/ldconfig -p`, with an environment of its own, reaches nothing and is not an external launch, under any setting and under a lock (suite `clients`). trio imports (suite `hypercorn`); asyncssh and psycopg 3 in its Python implementation make the same call while they are imported. For a library that is not in the cache it goes on to `gcc` or `cc` and `ld`, found on `PATH`, and where a compiler is installed it raises `SubprocessBlocked` (measured once).
 - `platform.platform()` and the calls that share its answer launch nothing: `activate()` calls it before the policy is in place, and it keeps the answer. `celery worker` starts, although its banner calls it and catches only `OSError` (suite `celery`).
 - `platform.architecture()` outside Windows (`file -b`) and `platform.win32_ver()` on Windows with Python 3.11 run their program at every call: they raise `SubprocessBlocked` each time (measured once).
 
-Under the default `"warn"` these launches are logged as external launches and carried out, under a locked policy as well.
+Under the default `"warn"` the launches that are refused here are logged as external launches and carried out, under a locked policy as well.
 
 **A locked policy survives whatever re-executes the server.** The new process image inherits the locked policy from its environment before the application is imported, and a locked policy cannot be changed without its token. So an application that asks for a different locked policy after a re-execution gets `TetheredLocked`:
 
