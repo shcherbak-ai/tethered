@@ -174,14 +174,16 @@ The documentation is at [tethered.shcherbak.ai](https://tethered.shcherbak.ai/),
 <!-- markdownlint-disable MD033 -->
 <table>
   <tr>
-    <td width="50%" align="center" valign="top">
-      <a href="https://github.com/shcherbak-ai/contextgem"><img src="assets/contextgem-wordmark.svg" alt="ContextGem" width="336"></a><br>
-      Structured extraction from documents with LLMs.
-    </td>
-    <td width="50%" align="center" valign="top">
-      <a href="https://github.com/shcherbak-ai/licenseal"><img src="assets/licenseal-wordmark.svg" alt="licenseal" width="336"></a><br>
-      License compatibility checks for dependency trees, fast enough for CI.
-    </td>
+    <td width="36%" align="center"><a href="https://github.com/shcherbak-ai/contextgem"><img src="assets/contextgem-wordmark.svg" alt="ContextGem" width="252"></a></td>
+    <td>Structured extraction from documents with LLMs.</td>
+  </tr>
+  <tr>
+    <td width="36%" align="center"><a href="https://github.com/shcherbak-ai/licenseal"><img src="assets/licenseal-wordmark.svg" alt="licenseal" width="252"></a></td>
+    <td>License compatibility checks for dependency trees, fast enough for CI.</td>
+  </tr>
+  <tr>
+    <td width="36%" align="center"><a href="https://github.com/shcherbak-ai/omerta"><img src="assets/omerta-wordmark.svg" alt="omerta" width="252"></a></td>
+    <td>Catches .env secrets leaking into git: your own values, not lookalikes.</td>
   </tr>
 </table>
 <!-- markdownlint-enable MD033 -->

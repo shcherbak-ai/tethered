@@ -72,7 +72,7 @@ uv run python tests_containers/run.py --list
 
 ## Linting and formatting
 
-Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, ty, interrogate, deptry, commitizen, and the checks of whitespace, YAML and TOML) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`; markdownlint-cli2 runs in the version of `package-lock.json`, which `npm ci` installs. No hook is installed by pre-commit itself, which would resolve its dependencies afresh, past the cooldown described below:
+Pre-commit hooks run all checks automatically on every commit, but you can also run them manually. The Python tools (ruff, bandit, omerta, ty, interrogate, deptry, commitizen, and the checks of whitespace, YAML and TOML) run from the project environment, so a hook and the matching command below always use the same version, the one pinned in `uv.lock`; markdownlint-cli2 runs in the version of `package-lock.json`, which `npm ci` installs. No hook is installed by pre-commit itself, which would resolve its dependencies afresh, past the cooldown described below:
 
 ```bash
 uv run pre-commit run --all-files
@@ -87,6 +87,7 @@ uv run ruff format .       # format
 uv run ty check src/ examples/   # type check
 uv run interrogate src/ -v # docstring coverage
 uv run bandit -c pyproject.toml -r src/  # security scan
+uv run omerta check --all  # no value of your .env in a tracked file
 uv run deptry .            # imports against declared dependencies
 uv run zizmor --offline .github/workflows  # the security of the GitHub workflows
 uv lock --check            # uv.lock matches pyproject.toml
@@ -95,6 +96,8 @@ node --test .claude/hooks/playwright-files.test.mjs  # the Claude Code hook that
 ```
 
 A release enters the lockfiles only a week after its upload, when a compromised one has been found and removed: `[tool.uv] exclude-newer = "7 days"` in `pyproject.toml` holds back `uv.lock` and the build requirements of `uv build`, and `min-release-age=7` in `.npmrc` holds back `package-lock.json`. The `advisories` hook checks both settings and asks [osv.dev](https://osv.dev) for the advisories of each version that `uv.lock`, `package-lock.json` and `.github/docs-constraints.txt` hold, and of the uv the workflows install (`UV_VERSION`), and fails on a known vulnerability or a report of a malicious package, but for those listed with their reasons in `ACCEPTED_ADVISORIES` in [scripts/check_advisories.py](scripts/check_advisories.py). An advisory can come out at any time, so the hook can fail on a change that touches no dependency: commit with `SKIP=advisories` in front of the command, and the maintainer upgrades the dependency. CI skips it, as its result depends on the day.
+
+The `omerta` hook keeps the values of your `.env` file out of git, with [omerta](https://github.com/shcherbak-ai/omerta): at a commit it searches the staged files, and with `--all-files` all the tracked files, for each value of `.env`, as written and encoded in a URL, JSON or base64, file names included. It reports the variable and the line, never the value. Without a `.env` file, as in CI, it fails on a tracked env file only. `uv run omerta history` searches every commit too.
 
 The licences of the package's dependencies are checked in CI (`.github/workflows/licenseal.yml`), with [licenseal](https://github.com/shcherbak-ai/licenseal). tethered has none, so the check passes with nothing to judge. To run it locally:
 
@@ -128,7 +131,7 @@ Both are [Invoke](https://www.pyinvoke.org/) tasks in `tasks.py`; `uv run inv --
 
 `assets/tethered-separator.svg` is the pixel rule between the README's main parts: the mark's kite at rest, with the first steps of its tether, between dashes in the mark's orange, shaded as the mark is. It is pixel art of 222 by 14 pixels, one path of rectangles per colour. Show it at twice that size (`width="444"`) with an empty `alt`, and keep section headings as text, so that their anchors, GitHub's outline and page search keep working. When the mark's kite changes, draw the rule again from it.
 
-The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg` and `assets/licenseal-wordmark.svg` are the README's own images, not part of the site: each is the name drawn at twice its size in a transparent image of one size (336 by 80), so that the two share a baseline. Show them at that width. They are copies of the files licenseal and ContextGem keep under the same names.
+The README's last section shows the pixel names of the sibling projects. `assets/contextgem-wordmark.svg`, `assets/licenseal-wordmark.svg` and `assets/omerta-wordmark.svg` are the README's own images, not part of the site: each is the name, at rest and without animation, drawn at twice its size in a transparent image of one size (336 by 80), so that they share a baseline. The table shows them at three quarters of that width (`width="252"`), one project to a row, as the siblings' READMEs do. They are copies of the files licenseal and ContextGem keep under the same names.
 
 Look at a change as GitHub will show it before pushing it. `uv run inv readme-preview` serves `README.md` in GitHub's light theme at <http://127.0.0.1:9110/> and in its dark theme at <http://127.0.0.1:9111/> (`--port N` serves them at N and N+1):
 

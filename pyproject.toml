@@ -56,6 +56,9 @@ dev = [
     "deptry>=0.25.1",
     "licenseal>=0.4.2",
     "zizmor>=1.31",
+    # The omerta hook: no value of .env in a tracked file.  hyperscan, which it
+    # pins, has no wheel for Python 3.16 yet, and the job that tests 3.16 runs no hook.
+    "omerta>=0.1.2; python_version < '3.16'",
     # The hooks for whitespace, the ends of files, YAML and TOML, from uv.lock
     # rather than installed by pre-commit
     "pre-commit-hooks>=6.0",
@@ -67,6 +70,13 @@ dev = [
 # for two hours on 2026-10-21.  scripts/check_advisories.py fails without it.
 [tool.uv]
 exclude-newer = "7 days"
+
+# Releases taken inside the cooldown, by decision of the maintainer, each up to its
+# upload: a security fix, or a release of the maintainer's own whose wheel matches its
+# tag.  The advisories hook says when an entry is no longer needed.
+[tool.uv.exclude-newer-package]
+# omerta 0.1.2, which the omerta hook runs: its wheel is the v0.1.2 tag
+omerta = "2026-10-27T03:36:00Z"
 
 [tool.setuptools.packages.find]
 where = ["src"]

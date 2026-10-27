@@ -9,9 +9,10 @@ build requirements of ``uv build`` and ``uv sync`` as well; npm takes it from
 ``min-release-age`` of ``.npmrc``.  The check fails when either is missing or is another
 span.
 
-``[tool.uv] exclude-newer-package`` lets a security fix in before its week is up, by
-decision of the maintainer.  Each entry is a date, just after the upload of the fix, and
-names a package of ``uv.lock``.  Once the week has passed the span admits the same, and
+``[tool.uv] exclude-newer-package`` lets a security fix, or a release of the maintainer's
+own whose wheel matches its tag, in before its week is up, by decision of the
+maintainer.  Each entry is a date, just after the upload of the release, and names a
+package of ``uv.lock``.  Once the week has passed the span admits the same, and
 the entry would hold the package back from then on: the check then fails until it is
 removed, and warns of it until then.
 
@@ -148,7 +149,9 @@ def _cooldown(
         entry = f"pyproject.toml: [tool.uv] exclude-newer-package {name} = {json.dumps(value)}"
         until = _date(value)
         if until is None:
-            findings.append(f"{entry}: an exception is a date, just after the upload of the fix")
+            findings.append(
+                f"{entry}: an exception is a date, just after the upload of the release"
+            )
         elif _normalize(name) not in locked:
             findings.append(f"{entry}: names no package of uv.lock, remove it")
         elif now - week >= until:
