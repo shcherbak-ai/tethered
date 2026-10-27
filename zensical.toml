@@ -18,7 +18,7 @@ site_url = "https://tethered.shcherbak.ai/"
 site_description = "Runtime network egress control for Python. One function call, zero dependencies, no infrastructure changes."
 site_author = "Sergii Shcherbak"
 # The version is rewritten by `cz bump` (version_files in pyproject.toml).
-copyright = "tethered 1.1.0 &middot; Copyright &copy; 2026 Sergii Shcherbak. MIT License."
+copyright = "tethered 1.1.1 &middot; Copyright &copy; 2026 Sergii Shcherbak. MIT License."
 docs_dir = "docs"
 site_dir = "site"
 extra_css = ["stylesheets/extra.css"]

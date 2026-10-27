@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file. Each versio
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.1] — 2026-10-27
 
 ### Fixed
 
@@ -277,7 +277,7 @@ The security fixes that can stop a setup that ran on 0.5.3 are under Breaking ch
 - Documented shared-IP/CDN cache mapping as a known limitation in the security model.
 - Documented localhost relay risk with default `allow_localhost=True` in the security model.
 
-[Unreleased]: https://github.com/shcherbak-ai/tethered/compare/v1.1.0...HEAD
+[1.1.1]: https://github.com/shcherbak-ai/tethered/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/shcherbak-ai/tethered/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/shcherbak-ai/tethered/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/shcherbak-ai/tethered/compare/v0.5.3...v1.0.0
