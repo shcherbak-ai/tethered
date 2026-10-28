@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://pypi.org/project/tethered/"><img src="https://img.shields.io/pypi/v/tethered?style=flat-square&labelColor=18181b&color=fb923c" alt="PyPI version"></a>
   <a href="https://pypi.org/project/tethered/"><img src="https://img.shields.io/pypi/pyversions/tethered?style=flat-square&labelColor=18181b&color=fb923c" alt="Python versions"></a>
-  <a href="https://pypi.org/project/tethered/"><img src="https://img.shields.io/pypi/dm/tethered?style=flat-square&labelColor=18181b&color=fb923c&label=downloads" alt="Downloads per month"></a>
+  <a href="https://pepy.tech/projects/tethered"><img src="https://img.shields.io/pepy/dt/tethered?style=flat-square&labelColor=18181b&color=fb923c&label=downloads" alt="Total downloads"></a>
   <a href="https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/shcherbak-ai/tethered/ci.yml?branch=main&style=flat-square&labelColor=18181b&label=CI" alt="CI"></a>
   <a href="https://github.com/shcherbak-ai/tethered/actions/workflows/ci.yml"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/SergiiShcherbak/20432f86c9102aa2b77ad9e4d4c21aa6/raw/tethered-coverage.json&style=flat-square&labelColor=18181b&color=fb923c" alt="Coverage"></a>
 </p>
