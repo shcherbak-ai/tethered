@@ -53,14 +53,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # `[tool.uv] exclude-newer` of pyproject.toml and `min-release-age` of .npmrc
 COOLDOWN_DAYS = 7
 
-_MARKDOWNLINT_CLI2_0_24 = (
-    "markdown-it and smol-toml, which markdownlint-cli2 0.23.3 pins: fixed in "
-    "markdownlint-cli2 0.24.0, uploaded on 2026-10-21, which the cooldown admits from "
-    "2026-10-28; at worst a slow lint of a Markdown file"
-)
-
 _VIRTUALENV_21_14_13 = (
-    "virtualenv 21.14.11, of pre-commit: a regression of 21.14.9 in the bash activator's "
+    "virtualenv 21.14.12, of pre-commit: a regression of 21.14.9 in the bash activator's "
     "prompt, fixed in 21.14.13, uploaded on 2026-10-22, which the cooldown admits from "
     "2026-10-29; every hook is a `language: system` one, for which pre-commit creates no "
     "virtualenv"
@@ -72,15 +66,6 @@ _VIRTUALENV_21_14_13 = (
 # time the cooldown admits the fix, from which the check fails until it is upgraded.
 # A report of a malicious package (MAL-) is never accepted.
 ACCEPTED_ADVISORIES: dict[str, tuple[str, str | None]] = {
-    **{
-        advisory: (_MARKDOWNLINT_CLI2_0_24, "2026-10-28T07:00:00Z")
-        for advisory in (
-            "GHSA-gfr2-rv44-r23c",
-            "GHSA-r4xh-jqrq-34v2",
-            "GHSA-r7fv-28h4-cvq7",
-            "GHSA-vfgh-jcmw-g37q",
-        )
-    },
     "GHSA-cx6f-vjhg-g3cc": (_VIRTUALENV_21_14_13, "2026-10-29T20:20:00Z"),
     "GHSA-238p-pmpm-9mq7": (
         "katex 0.16, which markdownlint's math parser allows (^0.16): fixed in 0.18 only; "
