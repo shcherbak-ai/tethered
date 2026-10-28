@@ -3678,22 +3678,15 @@ class TestScopeSubprocessPerformance:
     an infinite frame walk, an O(n²) env-dict construction, accidental
     re-serialization on every event, etc.  Bounds are deliberately ~100x
     the expected value on a modern laptop, so they don't flake on slow CI
-    but do trip on real algorithmic regressions.
+    but do trip on real algorithmic regressions.  A measurement is the best
+    of several rounds, and a bound is wider under a line tracer (``_bound``).
     """
 
     _ITERATIONS = 1000
 
     def _measure(self, fn, iterations: int | None = None) -> float:
-        """Return per-iteration mean wall time in microseconds."""
-        n = iterations or self._ITERATIONS
-        # Warm-up: avoid first-call import / JIT effects in timing.
-        for _ in range(min(50, n)):
-            fn()
-        start = time.perf_counter()
-        for _ in range(n):
-            fn()
-        elapsed = time.perf_counter() - start
-        return (elapsed / n) * 1_000_000
+        """Return the per-call wall time in microseconds (``_per_call_microseconds``)."""
+        return _per_call_microseconds(fn, iterations or self._ITERATIONS)
 
     def test_handle_subprocess_no_scope_is_near_zero(self):
         """The no-scope, no-cfg early-return path must stay essentially free.
@@ -3708,7 +3701,7 @@ class TestScopeSubprocessPerformance:
 
         per_us = self._measure(call)
         # Expected: ~100ns; ceiling 50µs (500x headroom for CI variance).
-        assert per_us < 50, f"_handle_subprocess no-scope path took {per_us:.2f}µs / call"
+        assert per_us < _bound(50), f"_handle_subprocess no-scope path took {per_us:.2f}µs / call"
 
     def test_find_execute_child_frame_bounded(self):
         """Frame walking is O(stack depth) and must stay bounded.
@@ -3728,7 +3721,9 @@ class TestScopeSubprocessPerformance:
 
         per_us = self._measure(call)
         # Expected: ~5µs; ceiling 500µs.
-        assert per_us < 500, f"_find_execute_child_frame from depth 8 took {per_us:.2f}µs / call"
+        assert per_us < _bound(500), (
+            f"_find_execute_child_frame from depth 8 took {per_us:.2f}µs / call"
+        )
 
     def test_build_per_launch_env_bounded(self):
         """Building the per-launch env scales linearly with os.environ size.
@@ -3753,7 +3748,7 @@ class TestScopeSubprocessPerformance:
 
         per_us = self._measure(call, iterations=500)  # heavier work, fewer iterations
         # Expected: ~30µs; ceiling 3ms.
-        assert per_us < 3000, f"_build_per_launch_env took {per_us:.2f}µs / call"
+        assert per_us < _bound(3000), f"_build_per_launch_env took {per_us:.2f}µs / call"
 
     def test_inject_scope_env_bounded(self):
         """Frame mutation is a single dict write (3.13+) or ctypes call (≤ 3.12)."""
@@ -3771,7 +3766,7 @@ class TestScopeSubprocessPerformance:
 
         per_us = self._measure(call, iterations=500)
         # Expected: ~1µs (3.13+) or ~5µs (≤ 3.12); ceiling 200µs.
-        assert per_us < 200, f"_inject_scope_env took {per_us:.2f}µs / call"
+        assert per_us < _bound(200), f"_inject_scope_env took {per_us:.2f}µs / call"
 
     def test_audit_hook_socket_event_unchanged(self):
         """The hot path (socket events) must not regress when subprocess code grows."""
@@ -3783,7 +3778,7 @@ class TestScopeSubprocessPerformance:
 
         per_us = self._measure(call, iterations=2000)
         # Expected: ~1µs; ceiling 100µs.
-        assert per_us < 100, f"_audit_hook socket path took {per_us:.2f}µs / call"
+        assert per_us < _bound(100), f"_audit_hook socket path took {per_us:.2f}µs / call"
 
 
 # ── Launch-environment tests ──────────────────────────────────────────
@@ -5415,14 +5410,36 @@ class TestLaunchEnvEstablished:
         assert os.waitstatus_to_exitcode(status) == 0
 
 
-def _mean_microseconds(fn, iterations: int = 500) -> float:
-    """Per-call mean wall time of ``fn`` in microseconds, after a warm-up."""
-    for _ in range(50):
+def _per_call_microseconds(fn, iterations: int = 500, rounds: int = 5) -> float:
+    """Per-call wall time of ``fn`` in microseconds: the best of ``rounds`` rounds, after a warm-up.
+
+    ``iterations`` calls are split between the rounds.  The best round is
+    the one in which nothing else had the CPU (another xdist worker, a busy
+    CI runner); a structural regression slows every round.
+    """
+    for _ in range(min(50, iterations)):
         fn()
-    start = time.perf_counter()
-    for _ in range(iterations):
-        fn()
-    return (time.perf_counter() - start) / iterations * 1_000_000
+    per_round = max(1, iterations // rounds)
+    best = float("inf")
+    for _ in range(rounds):
+        start = time.perf_counter()
+        for _ in range(per_round):
+            fn()
+        best = min(best, time.perf_counter() - start)
+    return best / per_round * 1_000_000
+
+
+def _bound(microseconds: float) -> float:
+    """The ceiling of a timing test, ten times wider under a line tracer.
+
+    coverage traces every line through ``sys.settrace`` before Python 3.14
+    (``sys.monitoring`` from 3.14), which makes a loop in tethered's code up
+    to six times slower: ``_build_per_launch_env`` went from about 30µs to
+    about 200µs, and a slow CI runner then crossed its 3ms ceiling.  The
+    ceilings are set against the untraced cost, and work that grows grows
+    under the tracer too.
+    """
+    return microseconds * 10 if sys.gettrace() is not None else microseconds
 
 
 class TestWhyALaunchIsExternal:
@@ -6338,9 +6355,10 @@ class TestLaunchEnvPerformance:
         monkeypatch.setattr(_core, "_inject_scope_env", _fail_if_called)
         args = _popen_args(None)
 
-        per_us = _mean_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
-        # Expected: ~20µs, dominated by classifying the executable; ceiling 2ms.
-        assert per_us < 2000, f"common-case launch handling took {per_us:.2f}µs / call"
+        per_us = _per_call_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
+        # Expected: ~80µs, dominated by classifying the executable (which reads
+        # the hook file); ceiling 2ms.
+        assert per_us < _bound(2000), f"common-case launch handling took {per_us:.2f}µs / call"
 
     def test_explicit_env_carrying_the_payload_is_bounded(self, monkeypatch):
         """One read of the mapping, no copy handed to the child, no frame mutation."""
@@ -6349,17 +6367,19 @@ class TestLaunchEnvPerformance:
         monkeypatch.setattr(_core, "_find_execute_child_frame", _fail_if_called)
         args = _popen_args({f"VAR_{i}": "x" * 40 for i in range(100)} | dict(os.environ))
 
-        per_us = _mean_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
-        # Expected: ~50µs for a ~200-variable environment; ceiling 5ms.
-        assert per_us < 5000, f"explicit-env launch handling took {per_us:.2f}µs / call"
+        per_us = _per_call_microseconds(lambda: _handle_subprocess(cfg, "subprocess.Popen", args))
+        # Expected: ~100µs for a ~200-variable environment; ceiling 5ms.
+        assert per_us < _bound(5000), f"explicit-env launch handling took {per_us:.2f}µs / call"
 
     def test_env_change_events_for_other_variables_are_near_free(self):
         """Every ``os.environ`` assignment in the process pays this."""
         tethered.activate(allow=["*.example.com"])
 
-        per_us = _mean_microseconds(lambda: _audit_hook("os.putenv", ("PATH", "/usr/bin")), 2000)
+        per_us = _per_call_microseconds(
+            lambda: _audit_hook("os.putenv", ("PATH", "/usr/bin")), 2000
+        )
         # Expected: ~0.5µs; ceiling 100µs.
-        assert per_us < 100, f"os.putenv audit dispatch took {per_us:.2f}µs / call"
+        assert per_us < _bound(100), f"os.putenv audit dispatch took {per_us:.2f}µs / call"
 
 
 def _policy_state_worker() -> dict:
