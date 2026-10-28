@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [1.1.1] — 2026-10-27
 
+### Added
+
+- Wheels for macOS on Intel (`macosx_x86_64`) and for Windows on ARM (`win_arm64`), for Python 3.11 to 3.15. Since 0.4.0, which made the C extension required, those machines have installed tethered from the source distribution, which fails without a C compiler. The test suite now runs on both as well.
+
 ### Fixed
 
 - `python -m tethered check` no longer creates files in the temporary directory. On Linux with Python 3.14.9 and later and 3.15.1 and later, asking multiprocessing for its default start method creates two short-lived files in `$TMPDIR` (`/tmp` by default) and removes them at once, to find out whether the forkserver start method can work there ([CPython issue 155717](https://github.com/python/cpython/issues/155717)). The check asked, so it created them too. It now applies the rule from multiprocessing's documentation instead (forkserver where that start method is available, macOS excepted) and writes nothing but its report. Where the temporary directory is not writable, it reports forkserver although multiprocessing would then use spawn.

@@ -73,7 +73,11 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # One runner per architecture, which builds the wheels its machine
+        # runs (cibuildwheel's default), so that the smoke test runs each
+        # wheel: Linux x86-64 and ARM64 (glibc and musl), macOS on Apple
+        # Silicon and on Intel, Windows x64 and x86, and Windows on ARM.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
 
     steps:
       # From v7, checkout refuses the commit of a fork's pull request under
