@@ -5379,10 +5379,32 @@ class TestLaunchEnvEstablished:
         assert json.loads(stdout)["active"] is True, stderr
 
     @pytest.mark.skipif(sys.platform != "win32", reason="os.spawn* raises os.spawn on Windows only")
-    def test_os_spawnv_child_is_protected_after_a_whitelist_cleanup(self, monkeypatch):
-        tethered.activate(allow=[], external_subprocess_policy="block")
-        _whitelist_cleanup(monkeypatch)
-        assert os.spawnv(os.P_WAIT, sys.executable, _spawn_argv(_EXIT_PROBE)) == 0  # nosec B606
+    def test_os_spawnv_child_is_protected_after_a_whitelist_cleanup(self, tmp_path):
+        """Run in a fresh interpreter, whose C runtime holds the standard descriptors only.
+
+        ``os.spawn*`` hands the child the handle of every descriptor of the C
+        runtime, and the ``python.exe`` of a uv virtual environment, a
+        launcher, closes those handle values after it has started the real
+        interpreter (uv 0.13).  A pytest worker holds descriptors whose
+        handles the launcher never received, so a value can be one of the
+        launcher's own: its handle on the interpreter, and ``os.spawnv``
+        returned before the child had run, or on the job that ends the
+        child, which then ended unrun with exit code 0.
+        """
+        script = tmp_path / "spawnv_after_cleanup.py"
+        script.write_text(
+            "import os, sys\n"
+            "import tethered\n"
+            'tethered.activate(allow=[], external_subprocess_policy="block")\n'
+            f"for name in set(os.environ) - {set(_minimal_child_env())!r}:\n"
+            "    del os.environ[name]\n"
+            f"sys.exit(os.spawnv(os.P_WAIT, sys.executable, {_spawn_argv(_EXIT_PROBE)!r}))\n",
+            encoding="utf-8",
+        )
+        r = subprocess.run(  # nosec B603
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+        )
+        assert r.returncode == 0, r.stderr
 
     @pytest.mark.skipif(sys.platform != "win32", reason="os.spawn* raises os.spawn on Windows only")
     def test_os_spawnve_with_a_sanitized_env_is_external(self):

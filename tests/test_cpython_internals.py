@@ -750,15 +750,22 @@ def test_every_option_the_interpreter_lists_is_one_tethered_parses():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the C runtime's joining is Windows-only")
 def test_windows_spawn_joins_its_arguments_unquoted(tmp_path):
-    """``_join_windows_argv``: the C runtime joins ``os.spawn*`` / ``os.exec*`` argv with spaces."""
-    if " " in str(tmp_path) or " " in sys.executable:
+    """``_join_windows_argv``: the C runtime joins ``os.spawn*`` / ``os.exec*`` argv with spaces.
+
+    The base interpreter is launched: the ``python.exe`` of a uv virtual
+    environment is a launcher that can lose its child under ``os.spawn*``
+    (``test_os_spawnv_child_is_protected_after_a_whitelist_cleanup``), and
+    the joining is the C runtime's, whatever program it starts.
+    """
+    python = sys._base_executable
+    if " " in str(tmp_path) or " " in python:
         pytest.skip("a path with a space would be split as well")
     out = tmp_path / "argv.json"
     script = tmp_path / "argv.py"
     script.write_text(
         f"import json, sys\nopen({str(out)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
     )
-    os.spawnv(os.P_WAIT, sys.executable, [sys.executable, str(script), "a b"])
+    os.spawnv(os.P_WAIT, python, [python, str(script), "a b"])
     assert json.loads(out.read_text()) == ["a", "b"], (
         "an argument with a space arrives as two" + _row("Windows command lines")
     )
